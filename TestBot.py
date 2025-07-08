@@ -2,7 +2,7 @@ import asyncio
 import os
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
