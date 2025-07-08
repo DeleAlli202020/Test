@@ -1,42 +1,19 @@
-# Core dependencies
 aiofiles==24.1.0
 aiogram==3.20.0.post0
 aiohttp==3.11.18
 asyncio==3.4.3
 python-dotenv==1.0.1
-
-# Data processing
 pandas==2.2.2
 numpy==1.26.4
 joblib==1.4.2
-
-# Database
 sqlalchemy==2.0.30
-
-# Telegram bot
 python-telegram-bot==21.1.1
-
-# Machine Learning
 lightgbm==4.3.0
 scikit-learn==1.5.0
-
-# Cryptocurrency trading
 ccxt==4.2.85
-
-# Sentiment analysis
 vaderSentiment==3.4.1
-
-# RSS feeds
 feedparser==6.0.11
-
-# Visualization
 matplotlib==3.8.4
-
-# Logging
 nest-asyncio==1.6.0
-
-# JSON
 json5==0.9.25
-
-# Typing
 typing-extensions==4.13.2
