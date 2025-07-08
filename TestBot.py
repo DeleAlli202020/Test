@@ -1966,17 +1966,12 @@ async def clear_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def main():
     global application
     
-    # Настройка логгирования
+    # Настройка логгера
     logging.basicConfig(
         level=logging.WARNING,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     logger = logging.getLogger(__name__)
-
-    # Проверка на дублирующий запуск
-    if 'application' in globals() and hasattr(application, 'running') and application.running:
-        logger.warning("Бот уже запущен")
-        return
 
     try:
         # Инициализация Application
@@ -1987,57 +1982,51 @@ async def main():
             .build()
         )
 
-        # Настройка JobQueue
+        # Настройка задач
         application.job_queue.run_daily(
             retrain_model_daily,
-            time=datetime.strptime("00:00", "%H:%M").time(),
+            time=datetime.time(0, 0),
             name="daily_retrain"
-        )
-
-        application.job_queue.run_repeating(
-            check_active_trades,
-            interval=300,
-            first=10,
-            name="check_trades"
         )
 
         # Регистрация обработчиков
         handlers = [
             CommandHandler("start", start),
             CommandHandler("help", help_command),
-            # Добавьте другие обработчики здесь
+            # Другие обработчики...
         ]
         
         for handler in handlers:
             application.add_handler(handler)
 
-        # Запуск бота
-        await application.initialize()
-        await application.start()
+        # Запуск бота (корректный способ)
         await application.run_polling(
             drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
+            close_loop=False,  # Важно!
+            stop_signals=None  # Отключаем обработку сигналов
         )
 
-        logger.warning("Бот запущен успешно")
-
-        while True:
-            await asyncio.sleep(3600)
-
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        try:
-            await notify_admin(f"Ошибка: {e}")
-        except Exception as notify_err:
-            logger.error(f"Ошибка уведомления: {notify_err}")
-
+        logger.error(f"Ошибка запуска: {e}")
+        await notify_admin(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        
     finally:
         try:
             if 'application' in globals():
                 await application.stop()
                 await application.shutdown()
-        except Exception as shutdown_err:
-            logger.error(f"Ошибка завершения: {shutdown_err}")
+        except Exception as e:
+            logger.error(f"Ошибка при завершении: {e}")
+
+def run_bot():
+    # Создаем новую asyncio-сессию для каждого запуска
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.close()
+
 
 if __name__ == '__main__':
     asyncio.run(main())
