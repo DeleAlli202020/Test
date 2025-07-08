@@ -1979,7 +1979,7 @@ async def main():
         return
 
     try:
-        # Создаем экземпляр Application с явной инициализацией JobQueue
+        # Создаем экземпляр Application с нужными компонентами
         application = (
             Application.builder()
             .token(TELEGRAM_TOKEN)
@@ -1989,9 +1989,10 @@ async def main():
 
         # Проверка инициализации JobQueue
         if not hasattr(application, 'job_queue') or application.job_queue is None:
-            raise RuntimeError("JobQueue не инициализирован! Убедитесь, что установлен python-telegram-bot[job-queue]")
+            logger.error("JobQueue не инициализирован!")
+            raise RuntimeError("Требуется python-telegram-bot[job-queue]")
 
-        # Настройка задач
+        # Настройка задач JobQueue
         application.job_queue.run_daily(
             retrain_model_daily,
             time=datetime.strptime("00:00", "%H:%M").time(),
@@ -2005,6 +2006,7 @@ async def main():
             name="active_trades_check"
         )
 
+        # Настройка задач для пользователей
         for user_id in load_allowed_users():
             user_settings = get_user_settings(user_id)
             application.job_queue.run_repeating(
@@ -2014,45 +2016,192 @@ async def main():
                 data=user_id
             )
 
-        # Регистрация обработчиков
-        handlers = [
+        # Регистрация обработчиков команд
+        command_handlers = [
             CommandHandler("start", start),
             CommandHandler("idea", idea),
-            # ... остальные обработчики
+            CommandHandler("setcriteria", set_criteria),
+            CommandHandler("active", active),
+            CommandHandler("history", history),
+            CommandHandler("stats", stats),
+            CommandHandler("metrics", metrics),
+            CommandHandler("add_user", add_user),
+            CommandHandler("stop", stop),
+            CommandHandler("clear_trades", clear_trades),
+            CommandHandler("setbalance", set_balance),
+            CommandHandler("help", help_command),
         ]
-        
-        for handler in handlers:
+
+        for handler in command_handlers:
             application.add_handler(handler)
 
-        # Запуск бота
+        # Обработчики callback-запросов
+        application.add_handler(CallbackQueryHandler(button))
+        application.add_handler(CallbackQueryHandler(
+            history_filter, 
+            pattern='^(filter_active|filter_completed|refresh_active)$'
+        ))
+
+        # Обработчик ошибок
+        application.add_error_handler(error_handler)
+
+        # Инициализация и запуск бота
         await application.initialize()
         await application.start()
         
-        if application.updater:
-            await application.updater.start_polling(
-                drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES,
-                close_loop=False
-            )
+        # Современный способ запуска polling (PTB 20.0+)
+        await application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
 
         logger.warning("Бот успешно запущен")
 
-        # Основной цикл
+        # Основной цикл работы
         while True:
             await asyncio.sleep(3600)
 
     except Exception as e:
-        logger.error(f"Ошибка запуска: {str(e)}", exc_info=True)
-        await notify_admin(f"Ошибка запуска: {str(e)}")
+        logger.error(f"Ошибка запуска бота: {str(e)}", exc_info=True)
+        await notify_admin(f"Критическая ошибка запуска бота: {str(e)}")
         
     finally:
         try:
-            if application.updater:
-                await application.updater.stop()
-            await application.stop()
-            await application.shutdown()
+            # Корректное завершение работы
+            if 'application' in globals() and application:
+                if hasattr(application, 'updater') and application.updater:
+                    await application.updater.stop()
+                
+                if hasattr(application, 'stop'):
+                    await application.stop()
+                
+                if hasattr(application, 'shutdown'):
+                    await application.shutdown()
+                
+            logger.warning("Бот успешно завершил работу")
+            
         except Exception as e:
-            logger.error(f"Ошибка завершения: {str(e)}", exc_info=True)
+            logger.error(f"Ошибка при завершении работы: {str(e)}", exc_info=True)
+            await notify_admin(f"Ошибка при завершении работы бота: {str(e)}")async def main():
+    global application
+    
+    # Инициализация логгера
+    logging.basicConfig(
+        level=logging.WARNING,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+
+    # Проверка на уже запущенный бот
+    if 'application' in globals() and hasattr(application, 'running') and application.running:
+        logger.warning("Бот уже запущен, пропускаем повторный запуск")
+        return
+
+    try:
+        # Создаем экземпляр Application с нужными компонентами
+        application = (
+            Application.builder()
+            .token(TELEGRAM_TOKEN)
+            .arbitrary_callback_data(True)
+            .build()
+        )
+
+        # Проверка инициализации JobQueue
+        if not hasattr(application, 'job_queue') or application.job_queue is None:
+            logger.error("JobQueue не инициализирован!")
+            raise RuntimeError("Требуется python-telegram-bot[job-queue]")
+
+        # Настройка задач JobQueue
+        application.job_queue.run_daily(
+            retrain_model_daily,
+            time=datetime.strptime("00:00", "%H:%M").time(),
+            name="daily_retraining"
+        )
+
+        application.job_queue.run_repeating(
+            check_active_trades,
+            interval=300,
+            first=10,
+            name="active_trades_check"
+        )
+
+        # Настройка задач для пользователей
+        for user_id in load_allowed_users():
+            user_settings = get_user_settings(user_id)
+            application.job_queue.run_repeating(
+                auto_search_trades,
+                interval=user_settings.get('auto_interval', 3600),
+                name=f"auto_search_{user_id}",
+                data=user_id
+            )
+
+        # Регистрация обработчиков команд
+        command_handlers = [
+            CommandHandler("start", start),
+            CommandHandler("idea", idea),
+            CommandHandler("setcriteria", set_criteria),
+            CommandHandler("active", active),
+            CommandHandler("history", history),
+            CommandHandler("stats", stats),
+            CommandHandler("metrics", metrics),
+            CommandHandler("add_user", add_user),
+            CommandHandler("stop", stop),
+            CommandHandler("clear_trades", clear_trades),
+            CommandHandler("setbalance", set_balance),
+            CommandHandler("help", help_command),
+        ]
+
+        for handler in command_handlers:
+            application.add_handler(handler)
+
+        # Обработчики callback-запросов
+        application.add_handler(CallbackQueryHandler(button))
+        application.add_handler(CallbackQueryHandler(
+            history_filter, 
+            pattern='^(filter_active|filter_completed|refresh_active)$'
+        ))
+
+        # Обработчик ошибок
+        application.add_error_handler(error_handler)
+
+        # Инициализация и запуск бота
+        await application.initialize()
+        await application.start()
+        
+        # Современный способ запуска polling (PTB 20.0+)
+        await application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
+
+        logger.warning("Бот успешно запущен")
+
+        # Основной цикл работы
+        while True:
+            await asyncio.sleep(3600)
+
+    except Exception as e:
+        logger.error(f"Ошибка запуска бота: {str(e)}", exc_info=True)
+        await notify_admin(f"Критическая ошибка запуска бота: {str(e)}")
+        
+    finally:
+        try:
+            # Корректное завершение работы
+            if 'application' in globals() and application:
+                if hasattr(application, 'updater') and application.updater:
+                    await application.updater.stop()
+                
+                if hasattr(application, 'stop'):
+                    await application.stop()
+                
+                if hasattr(application, 'shutdown'):
+                    await application.shutdown()
+                
+            logger.warning("Бот успешно завершил работу")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при завершении работы: {str(e)}", exc_info=True)
+            await notify_admin(f"Ошибка при завершении работы бота: {str(e)}")
 
 if __name__ == '__main__':
     asyncio.run(main())
