@@ -1982,10 +1982,13 @@ async def main():
             .build()
         )
 
-        # Настройка задач
+        # Правильное время для ежедневной задачи
+        time_00_00 = datetime.time(hour=0, minute=0)  # Важно использовать datetime.time!
+
+        # Настройка задач JobQueue
         application.job_queue.run_daily(
             retrain_model_daily,
-            time=datetime.time(0, 0),
+            time=time_00_00,  # Теперь передаем объект time, а не datetime
             name="daily_retrain"
         )
 
@@ -1993,22 +1996,21 @@ async def main():
         handlers = [
             CommandHandler("start", start),
             CommandHandler("help", help_command),
-            # Другие обработчики...
+            # Добавь другие обработчики здесь
         ]
         
         for handler in handlers:
             application.add_handler(handler)
 
-        # Запуск бота (корректный способ)
+        # Запуск бота
         await application.run_polling(
             drop_pending_updates=True,
-            close_loop=False,  # Важно!
-            stop_signals=None  # Отключаем обработку сигналов
+            allowed_updates=Update.ALL_TYPES
         )
 
     except Exception as e:
         logger.error(f"Ошибка запуска: {e}")
-        await notify_admin(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        await notify_admin(f"ОШИБКА: {e}")
         
     finally:
         try:
@@ -2016,17 +2018,17 @@ async def main():
                 await application.stop()
                 await application.shutdown()
         except Exception as e:
-            logger.error(f"Ошибка при завершении: {e}")
+            logger.error(f"Ошибка завершения: {e}")
 
 def run_bot():
-    # Создаем новую asyncio-сессию для каждого запуска
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass
     finally:
         loop.close()
 
-
 if __name__ == '__main__':
-    asyncio.run(main())
+    run_bot()
