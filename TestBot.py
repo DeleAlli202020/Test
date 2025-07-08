@@ -1964,58 +1964,116 @@ async def clear_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Основная функция
 async def main():
-    # Проверка, не запущен ли бот уже
     global application
-    if 'application' in globals() and application.running:
-        logger.warning("main: Бот уже запущен, пропускаем повторный запуск")
+    
+    # Инициализация логгера
+    logging.basicConfig(
+        level=logging.WARNING,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger = logging.getLogger(__name__)
+
+    # Проверка на уже запущенный бот
+    if 'application' in globals() and hasattr(application, 'running') and application.running:
+        logger.warning("Бот уже запущен, пропускаем повторный запуск")
         return
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    application.job_queue.run_daily(retrain_model_daily, time=datetime.strptime("00:00", "%H:%M").time())
-    application.job_queue.run_repeating(check_active_trades, interval=300, first=10)
-    for user_id in load_allowed_users():
-        user_settings = get_user_settings(user_id)
-        application.job_queue.run_repeating(
-            auto_search_trades,
-            interval=user_settings['auto_interval'],
-            name=f"auto_search_{user_id}",
-            data=user_id
-        )
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("idea", idea))
-    application.add_handler(CommandHandler("setcriteria", set_criteria))
-    application.add_handler(CommandHandler("active", active))
-    application.add_handler(CommandHandler("history", history))
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("metrics", metrics))
-    application.add_handler(CommandHandler("add_user", add_user))
-    application.add_handler(CommandHandler("stop", stop))
-    application.add_handler(CommandHandler("clear_trades", clear_trades))
-    application.add_handler(CommandHandler("setbalance", set_balance))
-    application.add_handler(CommandHandler("help", help_command))  # Добавляем обработчик для /help
-    application.add_handler(CallbackQueryHandler(button))
-    application.add_handler(CallbackQueryHandler(history_filter, pattern='^(filter_active|filter_completed|refresh_active)$'))
-    application.add_error_handler(error_handler)  # Добавляем глобальный обработчик ошибок
+
     try:
+        # Создаем экземпляр Application с JobQueue
+        application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+        # Настройка ежедневного переобучения модели
+        application.job_queue.run_daily(
+            retrain_model_daily,
+            time=datetime.strptime("00:00", "%H:%M").time(),
+            name="daily_retraining"
+        )
+
+        # Проверка активных сделок каждые 5 минут
+        application.job_queue.run_repeating(
+            check_active_trades,
+            interval=300,
+            first=10,
+            name="active_trades_check"
+        )
+
+        # Настройка автоматического поиска сделок для каждого пользователя
+        for user_id in load_allowed_users():
+            user_settings = get_user_settings(user_id)
+            application.job_queue.run_repeating(
+                auto_search_trades,
+                interval=user_settings.get('auto_interval', 3600),
+                name=f"auto_search_{user_id}",
+                data=user_id
+            )
+
+        # Регистрация обработчиков команд
+        command_handlers = [
+            CommandHandler("start", start),
+            CommandHandler("idea", idea),
+            CommandHandler("setcriteria", set_criteria),
+            CommandHandler("active", active),
+            CommandHandler("history", history),
+            CommandHandler("stats", stats),
+            CommandHandler("metrics", metrics),
+            CommandHandler("add_user", add_user),
+            CommandHandler("stop", stop),
+            CommandHandler("clear_trades", clear_trades),
+            CommandHandler("setbalance", set_balance),
+            CommandHandler("help", help_command),
+        ]
+
+        for handler in command_handlers:
+            application.add_handler(handler)
+
+        # Регистрация обработчиков callback-запросов
+        application.add_handler(CallbackQueryHandler(button))
+        application.add_handler(CallbackQueryHandler(
+            history_filter, 
+            pattern='^(filter_active|filter_completed|refresh_active)$'
+        ))
+
+        # Обработчик ошибок
+        application.add_error_handler(error_handler)
+
+        # Инициализация и запуск бота
         await application.initialize()
         await application.start()
-        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        logger.warning("main: Бот успешно запущен")
+        
+        if application.updater:
+            await application.updater.start_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES
+            )
+
+        logger.warning("Бот успешно запущен")
+
+        # Основной цикл работы
         while True:
             await asyncio.sleep(3600)
+
     except Exception as e:
-        logger.error(f"main: Ошибка запуска: {e}")
-        await notify_admin(f"Ошибка запуска бота: {e}")
+        logger.error(f"Ошибка запуска бота: {str(e)}", exc_info=True)
+        await notify_admin(f"Критическая ошибка запуска бота: {str(e)}")
+        
     finally:
         try:
-            await application.updater.stop()
-            await exchange.close()
-            await application.stop()
-            await application.shutdown()
-            logger.warning("main: Бот успешно завершён")
+            # Корректное завершение работы
+            if application.updater:
+                await application.updater.stop()
+            
+            if hasattr(exchange, 'close'):
+                await exchange.close()
+                
+            if application.running:
+                await application.stop()
+                await application.shutdown()
+                
+            logger.warning("Бот успешно завершил работу")
+            
         except Exception as e:
-            logger.error(f"main: Ошибка при завершении: {e}")
-            await notify_admin(f"Ошибка при завершении бота: {e}")
-
+            logger.error(f"Ошибка при завершении работы: {str(e)}", exc_info=True)
+            await notify_admin(f"Ошибка при завершении работы бота: {str(e)}")
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик всех ошибок бота."""
     logger.error(f"error_handler: Ошибка: {context.error}", exc_info=context.error)
