@@ -1996,10 +1996,23 @@ async def main():
         handlers = [
             CommandHandler("start", start),
             CommandHandler("help", help_command),
+            
         ]
         
         for handler in handlers:
             application.add_handler(handler)
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("idea", idea))
+        application.add_handler(CommandHandler("setcriteria", set_criteria))
+        application.add_handler(CommandHandler("active", active))
+        application.add_handler(CommandHandler("history", history))
+        application.add_handler(CommandHandler("stats", stats))
+        application.add_handler(CommandHandler("metrics", metrics))
+        application.add_handler(CommandHandler("add_user", add_user))
+        application.add_handler(CommandHandler("stop", stop))
+        application.add_handler(CommandHandler("clear_trades", clear_trades))
+        application.add_handler(CommandHandler("setbalance", set_balance))
+        application.add_handler(CommandHandler("help", help_command))
 
         # Запуск бота
         await application.run_polling(
