@@ -1,2 +1,2 @@
-worker: python main.py
+worker: python TestBot.py
 web: python -m http.server $PORT
