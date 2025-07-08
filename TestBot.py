@@ -1983,12 +1983,12 @@ async def main():
         )
 
         # Правильное время для ежедневной задачи
-        time_00_00 = datetime.time(hour=0, minute=0)  # Важно использовать datetime.time!
+        time_00_00 = time(hour=0, minute=0)  # Используем time с параметрами
 
         # Настройка задач JobQueue
         application.job_queue.run_daily(
             retrain_model_daily,
-            time=time_00_00,  # Теперь передаем объект time, а не datetime
+            time=time_00_00,
             name="daily_retrain"
         )
 
@@ -1996,7 +1996,6 @@ async def main():
         handlers = [
             CommandHandler("start", start),
             CommandHandler("help", help_command),
-            # Добавь другие обработчики здесь
         ]
         
         for handler in handlers:
