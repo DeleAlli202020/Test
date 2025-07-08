@@ -1,19 +1,41 @@
-aiofiles==24.1.0
-aiogram==3.20.0.post0
-aiohttp==3.11.18
+# Основные зависимости для асинхронности и HTTP
+aiohttp==3.9.3
+aiofiles==23.2.1
 asyncio==3.4.3
-python-dotenv==1.0.1
-pandas==2.2.2
-numpy==1.26.4
-joblib==1.4.2
-sqlalchemy==2.0.30
-python-telegram-bot==21.1.1
-lightgbm==4.3.0
-scikit-learn==1.5.0
-ccxt==4.2.85
+
+# Telegram Bot (используется `telegram.ext`)
+python-telegram-bot==20.3  # Стабильная версия (не 21.x, так как там breaking changes)
+
+# Работа с данными
+pandas==2.1.4
+numpy==1.24.4
+
+# База данных
+sqlalchemy==2.0.23
+
+# Машинное обучение и предобработка
+scikit-learn==1.3.2
+lightgbm==4.1.0
+joblib==1.3.2
+
+# Криптобиржи (CCXT)
+ccxt==3.1.38  # async_support работает стабильно
+
+# Анализ настроений (VADER)
 vaderSentiment==3.4.1
-feedparser==6.0.11
-matplotlib==3.8.4
-nest-asyncio==1.6.0
-json5==0.9.25
-typing-extensions==4.13.2
+
+# Парсинг RSS (новостные фиды)
+feedparser==6.0.10
+
+# Визуализация (если используете графики)
+matplotlib==3.7.4
+
+# Работа с .env
+python-dotenv==1.0.0
+
+# Логирование и обработка асинхронности
+nest-asyncio==1.5.8
+
+# Дополнительные (если нужны)
+typing-extensions==4.8.0
+pydantic==2.5.3  # Если используется валидация данных
