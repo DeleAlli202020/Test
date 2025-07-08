@@ -1,16 +1,9 @@
-# Основные
 python-telegram-bot==20.3
 aiohttp==3.8.4
 python-dotenv==1.0.0
-
-# Для данных
 pandas==1.5.3
 numpy==1.24.4
-openpyxl==3.1.2  # Для работы Excel-файлов в pandas
-
-# ML
+openpyxl==3.1.2
 scikit-learn==1.2.2
 joblib==1.2.0
-
-# Дополнительно
 ccxt==3.1.38
