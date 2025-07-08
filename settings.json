@@ -1,0 +1,15 @@
+{
+    "123456789": {
+        "auto_trade": false,
+        "interval": 300,
+        "risk_level": "low"
+    },
+    "809820681": {
+        "price_threshold": 0.3,
+        "volume_threshold": 5,
+        "rsi_threshold": 40,
+        "use_rsi": true,
+        "auto_interval": 300,
+        "balance": 990.0
+    }
+}
