@@ -1,26 +1,16 @@
-# Ядро
+# Основные
 python-telegram-bot==20.3
 aiohttp==3.8.4
 python-dotenv==1.0.0
 
-# База данных
-sqlalchemy==2.0.23
-psycopg2-binary==2.9.7
-
-# Данные
+# Для данных
 pandas==1.5.3
 numpy==1.24.4
+openpyxl==3.1.2  # Для работы Excel-файлов в pandas
+
+# ML
+scikit-learn==1.2.2
 joblib==1.2.0
 
-# ML/AI
-scikit-learn==1.2.2
-lightgbm==3.3.5
-vaderSentiment==3.4.1
-
-# Крипта
-ccxt==3.1.38
-
 # Дополнительно
-feedparser==6.0.10
-matplotlib==3.7.1
-nest-asyncio==1.5.8
+ccxt==3.1.38
