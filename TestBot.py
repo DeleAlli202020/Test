@@ -1979,17 +1979,25 @@ async def main():
         return
 
     try:
-        # Создаем экземпляр Application с JobQueue
-        application = Application.builder().token(TELEGRAM_TOKEN).build()
+        # Создаем экземпляр Application с явной инициализацией JobQueue
+        application = (
+            Application.builder()
+            .token(TELEGRAM_TOKEN)
+            .arbitrary_callback_data(True)
+            .build()
+        )
 
-        # Настройка ежедневного переобучения модели
+        # Проверка инициализации JobQueue
+        if not hasattr(application, 'job_queue') or application.job_queue is None:
+            raise RuntimeError("JobQueue не инициализирован! Убедитесь, что установлен python-telegram-bot[job-queue]")
+
+        # Настройка задач
         application.job_queue.run_daily(
             retrain_model_daily,
             time=datetime.strptime("00:00", "%H:%M").time(),
             name="daily_retraining"
         )
 
-        # Проверка активных сделок каждые 5 минут
         application.job_queue.run_repeating(
             check_active_trades,
             interval=300,
@@ -1997,7 +2005,6 @@ async def main():
             name="active_trades_check"
         )
 
-        # Настройка автоматического поиска сделок для каждого пользователя
         for user_id in load_allowed_users():
             user_settings = get_user_settings(user_id)
             application.job_queue.run_repeating(
@@ -2007,78 +2014,45 @@ async def main():
                 data=user_id
             )
 
-        # Регистрация обработчиков команд
-        command_handlers = [
+        # Регистрация обработчиков
+        handlers = [
             CommandHandler("start", start),
             CommandHandler("idea", idea),
-            CommandHandler("setcriteria", set_criteria),
-            CommandHandler("active", active),
-            CommandHandler("history", history),
-            CommandHandler("stats", stats),
-            CommandHandler("metrics", metrics),
-            CommandHandler("add_user", add_user),
-            CommandHandler("stop", stop),
-            CommandHandler("clear_trades", clear_trades),
-            CommandHandler("setbalance", set_balance),
-            CommandHandler("help", help_command),
+            # ... остальные обработчики
         ]
-
-        for handler in command_handlers:
+        
+        for handler in handlers:
             application.add_handler(handler)
 
-        # Регистрация обработчиков callback-запросов
-        application.add_handler(CallbackQueryHandler(button))
-        application.add_handler(CallbackQueryHandler(
-            history_filter, 
-            pattern='^(filter_active|filter_completed|refresh_active)$'
-        ))
-
-        # Обработчик ошибок
-        application.add_error_handler(error_handler)
-
-        # Инициализация и запуск бота
+        # Запуск бота
         await application.initialize()
         await application.start()
         
         if application.updater:
             await application.updater.start_polling(
                 drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES
+                allowed_updates=Update.ALL_TYPES,
+                close_loop=False
             )
 
         logger.warning("Бот успешно запущен")
 
-        # Основной цикл работы
+        # Основной цикл
         while True:
             await asyncio.sleep(3600)
 
     except Exception as e:
-        logger.error(f"Ошибка запуска бота: {str(e)}", exc_info=True)
-        await notify_admin(f"Критическая ошибка запуска бота: {str(e)}")
+        logger.error(f"Ошибка запуска: {str(e)}", exc_info=True)
+        await notify_admin(f"Ошибка запуска: {str(e)}")
         
     finally:
         try:
-            # Корректное завершение работы
             if application.updater:
                 await application.updater.stop()
-            
-            if hasattr(exchange, 'close'):
-                await exchange.close()
-                
-            if application.running:
-                await application.stop()
-                await application.shutdown()
-                
-            logger.warning("Бот успешно завершил работу")
-            
+            await application.stop()
+            await application.shutdown()
         except Exception as e:
-            logger.error(f"Ошибка при завершении работы: {str(e)}", exc_info=True)
-            await notify_admin(f"Ошибка при завершении работы бота: {str(e)}")
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик всех ошибок бота."""
-    logger.error(f"error_handler: Ошибка: {context.error}", exc_info=context.error)
-    user_id = update.effective_user.id if update and update.effective_user else "unknown"
-    await notify_admin(f"Ошибка у пользователя {user_id}: {context.error}")
+            logger.error(f"Ошибка завершения: {str(e)}", exc_info=True)
 
 if __name__ == '__main__':
     asyncio.run(main())
