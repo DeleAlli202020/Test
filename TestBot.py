@@ -323,6 +323,39 @@ async def get_historical_data(symbol, timeframe='15m', limit=1000):
     logger.warning(f"get_historical_data: Не удалось получить данные для {symbol}")
     return pd.DataFrame()
 
+async def set_min_probability(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
+        return
+    args = context.args
+    settings = load_settings()
+    user_settings = get_user_settings(user_id)
+    user_id_str = str(user_id)
+    try:
+        if not args:
+            min_probability = user_settings.get('min_probability', 60.0)
+            message = (
+                f"⚙️ **Текущая минимальная вероятность**: {min_probability}%\n"
+                f"Используйте: `/setminprobability <процент>`\n"
+                f"Пример: `/setminprobability 60`"
+            )
+            await update.message.reply_text(message, parse_mode='Markdown')
+            return
+        min_probability = float(args[0])
+        if min_probability < 0 or min_probability > 100:
+            await update.message.reply_text("🚫 **Вероятность должна быть от 0 до 100%.**", parse_mode='Markdown')
+            return
+        user_settings['min_probability'] = min_probability
+        settings[user_id_str] = user_settings
+        save_settings(settings)
+        await update.message.reply_text(f"✅ **Минимальная вероятность установлена**: {min_probability}%", parse_mode='Markdown')
+        logger.info(f"set_min_probability: Пользователь {user_id} установил минимальную вероятность: {min_probability}%")
+    except Exception as e:
+        logger.error(f"set_min_probability: Ошибка: {e}")
+        await update.message.reply_text(f"🚨 **Ошибка**: {e}\nФормат: `/setminprobability <процент>`", parse_mode='Markdown')
+        await notify_admin(f"Ошибка в /setminprobability: {e}")
+
 # Технические индикаторы
 def calculate_rsi(df, periods=14):
     if df.empty or len(df) < periods:
@@ -990,9 +1023,10 @@ async def auto_search_trades(context: ContextTypes.DEFAULT_TYPE):
         if not is_authorized(user_id):
             continue
         user_settings = get_user_settings(user_id)
+        min_probability = user_settings.get('min_probability', 60.0)
         model, scaler, active_features = load_model()
         if not model or not scaler or not active_features:
-            logger.error("auto_search_trades: Модель не загружена для user_id={user_id}")
+            logger.error(f"auto_search_trades: Модель не загружена для user_id={user_id}")
             await context.bot.send_message(user_id, "🚨 **Ошибка**: Модель не загружена.", parse_mode='Markdown')
             continue
         cryptos = get_top_cryptos()
@@ -1010,17 +1044,23 @@ async def auto_search_trades(context: ContextTypes.DEFAULT_TYPE):
                 is_opportunity, price_change, volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, smart_money_score, probability = await analyze_trade_opportunity(
                     model, scaler, active_features, df, price_change_1h, current_price, symbol, taker_buy_base, volume, coin_id
                 )
-                if is_opportunity:
-                    # Проверка на дублирующиеся активные сделки
+                direction = 'LONG' if probability >= min_probability else 'SHORT' if probability < (100 - min_probability) else None
+                if is_opportunity and direction:
+                    atr = calculate_atr_normalized(df).iloc[-1] * current_price
+                    if direction == 'LONG':
+                        stop_loss = current_price - max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
+                        tp1 = current_price + 6 * atr
+                        tp2 = current_price + 10 * atr
+                    else:  # SHORT
+                        stop_loss = current_price + max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
+                        tp1 = current_price - 6 * atr
+                        tp2 = current_price - 10 * atr
                     existing_trades = session.query(Trade).filter(
                         Trade.user_id == user_id,
                         Trade.symbol == symbol,
                         Trade.result.is_(None) | (Trade.result == 'TP1')
                     ).all()
                     is_duplicate = False
-                    atr = calculate_atr_normalized(df).iloc[-1] * current_price
-                    stop_loss = current_price - max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
-                    tp1 = current_price + 6 * atr
                     for trade in existing_trades:
                         entry_diff = abs(trade.entry_price - current_price) / current_price
                         sl_diff = abs(trade.stop_loss - stop_loss) / current_price
@@ -1046,136 +1086,136 @@ async def auto_search_trades(context: ContextTypes.DEFAULT_TYPE):
                         'smart_money_score': smart_money_score,
                         'probability': probability,
                         'df': df,
-                        'current_price': current_price
+                        'current_price': current_price,
+                        'direction': direction,
+                        'stop_loss': stop_loss,
+                        'tp1': tp1,
+                        'tp2': tp2
                     })
             if not opportunities:
                 logger.warning(f"auto_search_trades: Сделки не найдены для user_id={user_id}")
                 continue
-            best_opportunity = max(opportunities, key=lambda x: x['smart_money_score'])
-            if best_opportunity['probability'] == 0:
-                logger.warning(f"auto_search_trades: Пропущена сделка для {best_opportunity['symbol']} из-за нулевой вероятности")
-                continue
-            symbol = best_opportunity['symbol']
-            coin_id = best_opportunity['coin_id']
-            price_change = best_opportunity['price_change']
-            volume_change = best_opportunity['volume_change']
-            institutional_score = best_opportunity['institutional_score']
-            vwap_signal = best_opportunity['vwap_signal']
-            sentiment = best_opportunity['sentiment']
-            rsi = best_opportunity['rsi']
-            macd = best_opportunity['macd']
-            adx = best_opportunity['adx']
-            obv = best_opportunity['obv']
-            smart_money_score = best_opportunity['smart_money_score']
-            probability = best_opportunity['probability']
-            df = best_opportunity['df']
-            current_price = best_opportunity['current_price']
-            atr = calculate_atr_normalized(df).iloc[-1] * current_price
-            entry_price = current_price
-            min_stop_loss = entry_price * 0.01 if entry_price < 1 else entry_price * 0.005
-            stop_loss = entry_price - max(2 * atr, min_stop_loss)
-            tp1 = entry_price + 6 * atr
-            tp2 = entry_price + 9 * atr
-            rr_ratio = (tp1 - entry_price) / (entry_price - stop_loss) if (entry_price - stop_loss) > 0 else 3.0
-            user_settings = get_user_settings(user_id)
-            balance = user_settings.get('balance', None)
-            if balance is None:
-                logger.warning(f"auto_search_trades: Баланс не установлен для user_id={user_id}")
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text="🚫 **Баланс не установлен.**\nИспользуйте `/setbalance <сумма>` для установки баланса.",
-                    parse_mode='Markdown'
+            for opp in opportunities:
+                symbol = opp['symbol']
+                direction = opp['direction']
+                current_price = opp['current_price']
+                df = opp['df']
+                price_change = opp['price_change']
+                volume_change = opp['volume_change']
+                institutional_score = opp['institutional_score']
+                vwap_signal = opp['vwap_signal']
+                sentiment = opp['sentiment']
+                rsi = opp['rsi']
+                macd = opp['macd']
+                adx = opp['adx']
+                obv = opp['obv']
+                smart_money_score = opp['smart_money_score']
+                probability = opp['probability']
+                stop_loss = opp['stop_loss']
+                tp1 = opp['tp1']
+                tp2 = opp['tp2']
+                if (direction == 'LONG' and probability < min_probability) or (direction == 'SHORT' and probability >= (100 - min_probability)):
+                    logger.warning(f"auto_search_trades: Пропущена сделка для {symbol} из-за вероятности {probability}% (min={min_probability}%)")
+                    continue
+                rr_ratio = (tp1 - current_price) / (current_price - stop_loss) if direction == 'LONG' else (current_price - tp1) / (stop_loss - current_price)
+                balance = user_settings.get('balance', None)
+                if balance is None:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text="🚫 **Баланс не установлен.**\nИспользуйте `/setbalance <сумма>` для установки баланса.",
+                        parse_mode='Markdown'
+                    )
+                    return
+                position_size, position_size_percent = calculate_position_size(current_price, stop_loss, balance)
+                position_size = position_size if direction == 'LONG' else -position_size
+                potential_profit_tp1 = (tp1 - current_price) * position_size if direction == 'LONG' else (current_price - tp1) * abs(position_size)
+                potential_profit_tp2 = (tp2 - current_price) * position_size if direction == 'LONG' else (current_price - tp2) * abs(position_size)
+                trader_level = "Новичок"
+                tradingview_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol.replace('/', '')}&interval=15"
+                price_precision = 6 if current_price < 1 else 2
+                message = (
+                    f"📈 **Новая сделка: {symbol} {direction}** (авто)\n"
+                    f"💰 **Баланс**: ${balance:.2f}\n"
+                    f"🎯 Вход: ${current_price:.{price_precision}f}\n"
+                    f"⛔ Стоп-лосс: ${stop_loss:.{price_precision}f}\n"
+                    f"💰 TP1: ${tp1:.{price_precision}f} (+${potential_profit_tp1:.2f})\n"
+                    f"💰 TP2: ${tp2:.{price_precision}f} (+${potential_profit_tp2:.2f})\n"
+                    f"📊 RR: {rr_ratio:.1f}:1\n"
+                    f"📏 Размер: {position_size_percent:.2f}% ({abs(position_size):.6f} {coin_id})\n"
+                    f"🎲 Вероятность: {probability:.1f}%\n"
+                    f"🏛️ Институц.: {institutional_score:.1f}%\n"
+                    f"📈 VWAP: {'🟢 Бычий' if vwap_signal > 0 else '🔴 Медвежий'}\n"
+                    f"📮 Сентимент: {sentiment:.1f}%\n"
+                    f"📊 RSI: {rsi:.1f} | MACD: {'🟢' if macd > 0 else '🔴'} | ADX: {adx:.1f}\n"
+                    f"💡 Логика: Рост {price_change:.2f}%, Объём +{volume_change:.1f}%\n"
+                    f"📈 График: {tradingview_url}\n"
+                    f"💾 Сделка сохранена. Отметьте результат:"
                 )
-                return
-            position_size, position_size_percent = calculate_position_size(entry_price, stop_loss, balance)
-            potential_profit_tp1 = (tp1 - entry_price) * position_size
-            potential_profit_tp2 = (tp2 - entry_price) * position_size
-            trader_level = "Новичок"
-            tradingview_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol.replace('/', '')}&interval=15"
-            price_precision = 6 if entry_price < 1 else 2
-            message = (
-                f"📈 **Новая сделка: {symbol} LONG** (авто)\n"
-                f"💰 **Баланс**: ${balance:.2f}\n"
-                f"🎯 Вход: ${entry_price:.{price_precision}f}\n"
-                f"⛔ Стоп-лосс: ${stop_loss:.{price_precision}f}\n"
-                f"💰 TP1: ${tp1:.{price_precision}f} (+${potential_profit_tp1:.2f})\n"
-                f"💰 TP2: ${tp2:.{price_precision}f} (+${potential_profit_tp2:.2f})\n"
-                f"📊 RR: {rr_ratio:.1f}:1\n"
-                f"📏 Размер: {position_size_percent:.2f}% ({position_size:.6f} {coin_id})\n"
-                f"🎲 Вероятность: {probability:.1f}%\n"
-                f"🏛️ Институц.: {institutional_score:.1f}%\n"
-                f"📈 VWAP: {'🟢 Бычий' if vwap_signal > 0 else '🔴 Медвежий'}\n"
-                f"📮 Сентимент: {sentiment:.1f}%\n"
-                f"📊 RSI: {rsi:.1f} | MACD: {'🟢' if macd > 0 else '🔴'} | ADX: {adx:.1f}\n"
-                f"💡 Логика: Рост {price_change:.2f}%, Объём +{volume_change:.1f}%\n"
-                f"📈 График: {tradingview_url}\n"
-                f"💾 Сделка сохранена. Отметьте результат:"
-            )
-            trade = Trade(
-                user_id=user_id,
-                symbol=symbol,
-                entry_price=entry_price,
-                stop_loss=stop_loss,
-                take_profit_1=tp1,
-                take_profit_2=tp2,
-                rr_ratio=rr_ratio,
-                position_size=position_size,
-                probability=probability,
-                institutional_score=institutional_score,
-                sentiment_score=sentiment,
-                trader_level=trader_level
-            )
-            session.add(trade)
-            session.commit()
-            trade_id = trade.id
-            trade_metrics = TradeMetrics(
-                trade_id=trade_id,
-                symbol=symbol,
-                entry_price=entry_price,
-                price_after_1h=None,
-                price_after_2h=None,
-                volume_change=volume_change,
-                institutional_score=institutional_score,
-                vwap_signal=vwap_signal,
-                sentiment=sentiment,
-                rsi=rsi,
-                macd=macd,
-                adx=adx,
-                obv=obv,
-                smart_money_score=smart_money_score,
-                probability=probability,
-                success=None
-            )
-            session.add(trade_metrics)
-            session.commit()
-            asyncio.create_task(check_trade_result(symbol, entry_price, stop_loss, tp1, tp2, trade_id))
-            keyboard = [
-                [
-                    InlineKeyboardButton("✅ TP1", callback_data=f"TP1_{trade_id}"),
-                    InlineKeyboardButton("✅ TP2", callback_data=f"TP2_{trade_id}"),
-                    InlineKeyboardButton("❌ SL", callback_data=f"SL_{trade_id}")
+                trade = Trade(
+                    user_id=user_id,
+                    symbol=symbol,
+                    entry_price=current_price,
+                    stop_loss=stop_loss,
+                    take_profit_1=tp1,
+                    take_profit_2=tp2,
+                    rr_ratio=rr_ratio,
+                    position_size=position_size,
+                    probability=probability,
+                    institutional_score=institutional_score,
+                    sentiment_score=sentiment,
+                    trader_level=trader_level
+                )
+                session.add(trade)
+                session.commit()
+                trade_id = trade.id
+                trade_metrics = TradeMetrics(
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    entry_price=current_price,
+                    price_after_1h=None,
+                    price_after_2h=None,
+                    volume_change=volume_change,
+                    institutional_score=institutional_score,
+                    vwap_signal=vwap_signal,
+                    sentiment=sentiment,
+                    rsi=rsi,
+                    macd=macd,
+                    adx=adx,
+                    obv=obv,
+                    smart_money_score=smart_money_score,
+                    probability=probability,
+                    success=None
+                )
+                session.add(trade_metrics)
+                session.commit()
+                asyncio.create_task(check_trade_result(symbol, current_price, stop_loss, tp1, tp2, trade_id))
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ TP1", callback_data=f"TP1_{trade_id}"),
+                        InlineKeyboardButton("✅ TP2", callback_data=f"TP2_{trade_id}"),
+                        InlineKeyboardButton("❌ SL", callback_data=f"SL_{trade_id}"),
+                        InlineKeyboardButton("🚫 Отмена", callback_data=f"CANCEL_{trade_id}")
+                    ]
                 ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            chart_path = create_price_chart(df, symbol, price_change)
-            try:
-                if chart_path and os.path.exists(chart_path):
-                    with open(chart_path, 'rb') as photo:
-                        await context.bot.send_photo(chat_id=user_id, photo=photo, caption=message, reply_markup=reply_markup, parse_mode='Markdown')
-                    os.remove(chart_path)
-                else:
-                    await context.bot.send_message(chat_id=user_id, text=message + "\n⚠️ Не удалось создать график.", reply_markup=reply_markup, parse_mode='Markdown')
-            except Exception as e:
-                logger.error(f"auto_search_trades: Ошибка отправки для {symbol}: {str(e)}")
-                await context.bot.send_message(chat_id=user_id, text=message + f"\n⚠️ Ошибка: {str(e)}", reply_markup=reply_markup, parse_mode='Markdown')
-                await notify_admin(f"Ошибка отправки авто-сделки для {symbol}: {str(e)}")
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                chart_path = create_price_chart(df, symbol, price_change)
+                try:
+                    if chart_path and os.path.exists(chart_path):
+                        with open(chart_path, 'rb') as photo:
+                            await context.bot.send_photo(chat_id=user_id, photo=photo, caption=message, reply_markup=reply_markup, parse_mode='Markdown')
+                        os.remove(chart_path)
+                    else:
+                        await context.bot.send_message(chat_id=user_id, text=message + "\n⚠️ Не удалось создать график.", reply_markup=reply_markup, parse_mode='Markdown')
+                except Exception as e:
+                    logger.error(f"auto_search_trades: Ошибка отправки для {symbol}: {str(e)}")
+                    await context.bot.send_message(chat_id=user_id, text=message + f"\n⚠️ Ошибка: {str(e)}", reply_markup=reply_markup, parse_mode='Markdown')
+                    await notify_admin(f"Ошибка отправки авто-сделки для {symbol}: {str(e)}")
         except Exception as e:
             logger.error(f"auto_search_trades: Ошибка для user_id={user_id}: {str(e)}")
             await context.bot.send_message(chat_id=user_id, text=f"🚨 **Ошибка**: {str(e)}", parse_mode='Markdown')
             await notify_admin(f"Ошибка в auto_search_trades: {str(e)}")
         finally:
             session.close()
-
 # Обработчик кнопок
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1190,8 +1230,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     data = query.data
     if data in ('filter_active', 'filter_completed', 'refresh_active'):
-        return  # Пропускаем, так как эти запросы обрабатываются в history_filter
-    if data.startswith(("TP1_", "TP2_", "SL_")):
+        return
+    if data.startswith(("TP1_", "TP2_", "SL_", "CANCEL_")):
         try:
             result, trade_id = data.split("_")
             trade_id = int(trade_id)
@@ -1206,8 +1246,17 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not trade:
                 await query.message.reply_text("🚫 Сделка не найдена или не принадлежит вам.")
                 return
-            if trade.result:
+            if trade.result and result != 'CANCEL':
                 await query.message.reply_text(f"🚫 Сделка #{trade_id} уже отмечена как {trade.result}.")
+                return
+            if result == 'CANCEL':
+                session.delete(trade)
+                trade_metrics = session.query(TradeMetrics).filter_by(trade_id=trade_id).first()
+                if trade_metrics:
+                    session.delete(trade_metrics)
+                session.commit()
+                await query.message.reply_text(f"🚫 Сделка #{trade_id} ({trade.symbol}) отменена.")
+                logger.info(f"button: Сделка #{trade_id} отменена пользователем {user_id}")
                 return
             trade.result = result
             trade_metrics = session.query(TradeMetrics).filter_by(trade_id=trade_id).first()
@@ -1218,7 +1267,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_settings = get_user_settings(user_id)
             balance = user_settings.get('balance', 0)
             final_price = trade.stop_loss if result == 'SL' else trade.take_profit_1 if result == 'TP1' else trade.take_profit_2
-            pnl = (final_price - trade.entry_price) * trade.position_size
+            if trade.position_size > 0:  # LONG
+                pnl = (final_price - trade.entry_price) * trade.position_size
+            else:  # SHORT
+                pnl = (trade.entry_price - final_price) * abs(trade.position_size)
             balance += pnl
             user_settings['balance'] = balance
             save_user_settings(user_id, user_settings)
@@ -1243,7 +1295,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await query.message.reply_text("🚫 Неверный выбор.")
         await notify_admin(f"Неверный выбор в button для user_id={user_id}, query.data={data}")
-
 # Команда /setcriteria
 async def set_criteria(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1361,11 +1412,10 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     session = None
     try:
-        # Загрузка настроек пользователя
         user_settings = get_user_settings(user_id)
+        min_probability = user_settings.get('min_probability', 60.0)
         auto_interval = user_settings['auto_interval']
         
-        # Сброс текущей задачи автопоиска
         job_name = f"auto_search_{user_id}"
         current_jobs = context.job_queue.get_jobs_by_name(job_name)
         for job in current_jobs:
@@ -1375,7 +1425,7 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = load_model()
         if len(result) == 2:
             model, scaler = result
-            active_features = ACTIVE_FEATURES  # Используем глобальный список, если модель старая
+            active_features = ACTIVE_FEATURES
         else:
             model, scaler, active_features = result
         top_cryptos = get_top_cryptos()
@@ -1396,7 +1446,8 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_opportunity, price_change, volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, smart_money_score, probability = await analyze_trade_opportunity(
                 model, scaler, active_features, df, price_change_1h, current_price, symbol, taker_buy_base, volume, coin_id
             )
-            if is_opportunity:
+            direction = 'LONG' if probability >= min_probability else 'SHORT' if probability < (100 - min_probability) else None
+            if is_opportunity and direction:
                 opportunities.append({
                     'symbol': symbol,
                     'coin_id': coin_id,
@@ -1412,11 +1463,13 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     'smart_money_score': smart_money_score,
                     'probability': probability,
                     'current_price': current_price,
-                    'df': df
+                    'df': df,
+                    'direction': direction
                 })
-        opportunities.sort(key=lambda x: x['probability'], reverse=True)
+        opportunities.sort(key=lambda x: abs(x['probability'] - 50), reverse=True)
         for opp in opportunities:
             symbol = opp['symbol']
+            direction = opp['direction']
             current_price = opp['current_price']
             df = opp['df']
             price_change = opp['price_change']
@@ -1436,10 +1489,19 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 Trade.result.is_(None)
             ).all()
             is_duplicate = False
+            atr = calculate_atr_normalized(df).iloc[-1] * current_price
+            if direction == 'LONG':
+                stop_loss = current_price * (1 - STOP_LOSS_PCT)
+                take_profit_1 = current_price * (1 + TAKE_PROFIT_1_PCT)
+                take_profit_2 = current_price * (1 + TAKE_PROFIT_2_PCT)
+            else:  # SHORT
+                stop_loss = current_price * (1 + STOP_LOSS_PCT)
+                take_profit_1 = current_price * (1 - TAKE_PROFIT_1_PCT)
+                take_profit_2 = current_price * (1 - TAKE_PROFIT_2_PCT)
             for trade in existing_trades:
                 entry_diff = abs(trade.entry_price - current_price) / current_price
-                sl_diff = abs(trade.stop_loss - current_price * (1 - STOP_LOSS_PCT)) / current_price
-                tp1_diff = abs(trade.take_profit_1 - current_price * (1 + TAKE_PROFIT_1_PCT)) / current_price
+                sl_diff = abs(trade.stop_loss - stop_loss) / current_price
+                tp1_diff = abs(trade.take_profit_1 - take_profit_1) / current_price
                 if entry_diff < 0.005 and sl_diff < 0.01 and tp1_diff < 0.01:
                     is_duplicate = True
                     logger.info(f"idea: Пропущена сделка для {symbol}, уже есть активная сделка #{trade.id}")
@@ -1449,30 +1511,28 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"🔔 **Лучшая возможность ({symbol}) уже активна.** Пробуем другую...",
                     parse_mode='Markdown'
                 )
-                await asyncio.sleep(0.5)  # Задержка для избежания rate limits
+                await asyncio.sleep(0.5)
                 continue
-            if probability == 0:
-                logger.warning(f"idea: Пропущена сделка для {symbol} из-за нулевой вероятности")
+            if probability == 0 or (direction == 'LONG' and probability < min_probability) or (direction == 'SHORT' and probability >= (100 - min_probability)):
+                logger.warning(f"idea: Пропущена сделка для {symbol} из-за вероятности {probability}% (min={min_probability}%)")
                 continue
-            stop_loss = current_price * (1 - STOP_LOSS_PCT)
-            take_profit_1 = current_price * (1 + TAKE_PROFIT_1_PCT)
-            take_profit_2 = current_price * (1 + TAKE_PROFIT_2_PCT)
-            if stop_loss <= 0 or take_profit_1 <= current_price or take_profit_2 <= take_profit_1:
+            if stop_loss <= 0 or (direction == 'LONG' and (take_profit_1 <= current_price or take_profit_2 <= take_profit_1)) or \
+               (direction == 'SHORT' and (take_profit_1 >= current_price or take_profit_2 >= take_profit_1)):
                 logger.warning(f"idea: Некорректные параметры для {symbol}: SL={stop_loss}, TP1={take_profit_1}, TP2={take_profit_2}")
                 continue
-            rr_ratio = (take_profit_1 - current_price) / (current_price - stop_loss)
+            rr_ratio = (take_profit_1 - current_price) / (current_price - stop_loss) if direction == 'LONG' else (current_price - take_profit_1) / (stop_loss - current_price)
             user_settings = get_user_settings(user_id)
             balance = user_settings.get('balance', None)
             if balance is None:
                 await update.message.reply_text(
-                    "🚫 **Баланс не установлен.**\n"
-                    "Используйте `/setbalance <сумма>` для установки баланса.",
+                    "🚫 **Баланс не установлен.**\nИспользуйте `/setbalance <сумма>` для установки баланса.",
                     parse_mode='Markdown'
                 )
                 return
             position_size, position_size_percent = calculate_position_size(current_price, stop_loss, balance)
-            potential_profit_tp1 = (take_profit_1 - current_price) * position_size
-            potential_profit_tp2 = (take_profit_2 - current_price) * position_size
+            position_size = position_size if direction == 'LONG' else -position_size
+            potential_profit_tp1 = (take_profit_1 - current_price) * position_size if direction == 'LONG' else (current_price - take_profit_1) * abs(position_size)
+            potential_profit_tp2 = (take_profit_2 - current_price) * position_size if direction == 'LONG' else (current_price - take_profit_2) * abs(position_size)
             trade = Trade(
                 user_id=user_id,
                 symbol=symbol,
@@ -1515,14 +1575,14 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chart_path = create_price_chart(df, symbol, price_change)
             tradingview_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol.replace('/', '')}&interval=15"
             message = (
-                f"🔔 **Новая сделка: {symbol} LONG**\n"
+                f"🔔 **Новая сделка: {symbol} {direction}**\n"
                 f"💰 **Баланс**: ${balance:.2f}\n"
                 f"🎯 Вход: ${current_price:.{price_precision}f}\n"
                 f"⛔ Стоп-лосс: ${stop_loss:.{price_precision}f}\n"
                 f"💰 TP1: ${take_profit_1:.{price_precision}f} (+${potential_profit_tp1:.2f})\n"
                 f"💰 TP2: ${take_profit_2:.{price_precision}f} (+${potential_profit_tp2:.2f})\n"
                 f"📊 RR: {rr_ratio:.1f}:1\n"
-                f"📏 Размер: {position_size_percent:.2f}% ({position_size:.6f} {symbol.split('/')[0]})\n"
+                f"📏 Размер: {position_size_percent:.2f}% ({abs(position_size):.6f} {symbol.split('/')[0]})\n"
                 f"🎲 Вероятность: {probability:.1f}%\n"
                 f"🏛️ Институц.: {institutional_score:.1f}%\n"
                 f"📈 VWAP: {vwap_text}\n"
@@ -1535,7 +1595,8 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard = [
                 [InlineKeyboardButton("✅ TP1", callback_data=f"TP1_{trade.id}"),
                  InlineKeyboardButton("✅ TP2", callback_data=f"TP2_{trade.id}"),
-                 InlineKeyboardButton("❌ SL", callback_data=f"SL_{trade.id}")]
+                 InlineKeyboardButton("❌ SL", callback_data=f"SL_{trade.id}"),
+                 InlineKeyboardButton("🚫 Отмена", callback_data=f"CANCEL_{trade.id}")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             if chart_path and os.path.exists(chart_path):
@@ -1555,13 +1616,12 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=reply_markup,
                     parse_mode='Markdown'
                 )
-            logger.info(f"idea: Сделка #{trade.id} создана для {symbol}")
+            logger.info(f"idea: Сделка #{trade.id} создана для {symbol} ({direction})")
             
-            # Перезапуск задачи автопоиска с задержкой
             context.job_queue.run_repeating(
                 auto_search_trades,
                 interval=auto_interval,
-                first=auto_interval,  # Задержка перед первым запуском
+                first=auto_interval,
                 name=f"auto_search_{user_id}",
                 data=user_id
             )
@@ -1965,8 +2025,6 @@ async def clear_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Основная функция
 async def main():
     global application
-    
-    # Настройка логгера
     logging.basicConfig(
         level=logging.WARNING,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -1974,7 +2032,6 @@ async def main():
     logger = logging.getLogger(__name__)
 
     try:
-        # Инициализация Application
         application = (
             Application.builder()
             .token(TELEGRAM_TOKEN)
@@ -1982,39 +2039,35 @@ async def main():
             .build()
         )
 
-        # Правильное время для ежедневной задачи
-        time_00_00 = time(hour=0, minute=0)  # Используем time с параметрами
+        time_00_00 = time(hour=0, minute=0)
 
-        # Настройка задач JobQueue
         application.job_queue.run_daily(
             retrain_model_daily,
             time=time_00_00,
             name="daily_retrain"
         )
 
-        # Регистрация обработчиков
         handlers = [
             CommandHandler("start", start),
             CommandHandler("help", help_command),
-            
+            CommandHandler("idea", idea),
+            CommandHandler("setcriteria", set_criteria),
+            CommandHandler("active", active),
+            CommandHandler("history", history),
+            CommandHandler("stats", stats),
+            CommandHandler("metrics", metrics),
+            CommandHandler("add_user", add_user),
+            CommandHandler("stop", stop),
+            CommandHandler("clear_trades", clear_trades),
+            CommandHandler("setbalance", set_balance),
+            CommandHandler("setminprobability", set_min_probability),
+            CallbackQueryHandler(button),
+            CallbackQueryHandler(history_filter, pattern='^(filter_active|filter_completed|refresh_active)$')
         ]
-        
+
         for handler in handlers:
             application.add_handler(handler)
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("idea", idea))
-        application.add_handler(CommandHandler("setcriteria", set_criteria))
-        application.add_handler(CommandHandler("active", active))
-        application.add_handler(CommandHandler("history", history))
-        application.add_handler(CommandHandler("stats", stats))
-        application.add_handler(CommandHandler("metrics", metrics))
-        application.add_handler(CommandHandler("add_user", add_user))
-        application.add_handler(CommandHandler("stop", stop))
-        application.add_handler(CommandHandler("clear_trades", clear_trades))
-        application.add_handler(CommandHandler("setbalance", set_balance))
-        application.add_handler(CommandHandler("help", help_command))
 
-        # Запуск бота
         await application.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES
@@ -2031,16 +2084,6 @@ async def main():
                 await application.shutdown()
         except Exception as e:
             logger.error(f"Ошибка завершения: {e}")
-
-def run_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(main())
-    except KeyboardInterrupt:
-        pass
-    finally:
-        loop.close()
 
 if __name__ == '__main__':
     run_bot()
