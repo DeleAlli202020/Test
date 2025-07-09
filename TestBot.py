@@ -2087,17 +2087,24 @@ async def clear_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = None
     try:
         session = Session()
-        # Удаление всех записей из TradeMetrics
-        session.query(TradeMetrics).delete()
-        # Удаление всех записей из Trade
-        session.query(Trade).delete()
+        # Удаление только пользовательских записей из Trade
+        deleted_trades = session.query(Trade).filter_by(user_id=user_id).delete()
+        # Удаление связанных записей из TradeMetrics
+        deleted_metrics = session.query(TradeMetrics).filter(
+            TradeMetrics.trade_id.in_(
+                session.query(Trade.id).filter_by(user_id=user_id)
+            )
+        ).delete()
         session.commit()
-        await update.message.reply_text("🗑️ **База данных сделок очищена.**", parse_mode='Markdown')
-        logger.info("clear_trades: База данных успешно очищена")
+        await update.message.reply_text(
+            f"🗑️ **Удалено {deleted_trades} сделок и {deleted_metrics} метрик для вашего аккаунта.**",
+            parse_mode='Markdown'
+        )
+        logger.info(f"clear_trades: Удалено {deleted_trades} сделок и {deleted_metrics} метрик для user_id={user_id}")
     except Exception as e:
-        logger.error(f"clear_trades: Ошибка: {e}")
-        await update.message.reply_text(f"🚨 **Ошибка при очистке базы данных**: {e}", parse_mode='Markdown')
-        await notify_admin(f"Ошибка в clear_trades: {e}")
+        logger.error(f"clear_trades: Ошибка для user_id={user_id}: {e}")
+        await update.message.reply_text(f"🚨 **Ошибка при очистке сделок**: {e}", parse_mode='Markdown')
+        await notify_admin(f"Ошибка в clear_trades для user_id={user_id}: {e}")
     finally:
         if session is not None:
             session.close()
