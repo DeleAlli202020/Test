@@ -2166,4 +2166,4 @@ async def main():
             logger.error(f"Ошибка завершения: {e}")
 
 if __name__ == '__main__':
-    run_bot()
+    asyncio.run(main())
