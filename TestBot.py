@@ -1219,82 +1219,162 @@ async def auto_search_trades(context: ContextTypes.DEFAULT_TYPE):
 # Обработчик кнопок
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user_id = query.from_user.id
+    logger.info(f"button: Обработка запроса от user_id={user_id}, data={query.data}")
+
+    # Проверяем авторизацию
+    if not is_authorized(user_id):
+        try:
+            await context.bot.send_message(chat_id=user_id, text="🚫 Вы не авторизованы для использования бота.", parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"button: Ошибка отправки сообщения об авторизации user_id={user_id}: {e}")
+        return
+
+    # Подтверждаем получение запроса
     try:
         await query.answer()
     except telegram.error.BadRequest as e:
-        logger.warning(f"button: Устаревший или недействительный запрос: {e}")
-        return
-    user_id = query.from_user.id
-    if not is_authorized(user_id):
-        await query.message.reply_text("🚫 Вы не авторизованы для использования бота.")
-        return
+        logger.warning(f"button: Устаревший или недействительный запрос user_id={user_id}: {e}")
+        # Продолжаем обработку, отправим новое сообщение вместо ответа на старое
+
     data = query.data
-    if data in ('filter_active', 'filter_completed', 'refresh_active'):
-        return
-    if data.startswith(("TP1_", "TP2_", "SL_", "CANCEL_")):
+    session = None
+
+    try:
+        # Проверяем, является ли запрос фильтром истории
+        if data in ('filter_active', 'filter_completed', 'refresh_active'):
+            logger.info(f"button: Пропуск фильтра истории, data={data}")
+            return
+
+        # Обрабатываем кнопки TP1, TP2, SL, CANCEL
+        if not data.startswith(("TP1_", "TP2_", "SL_", "CANCEL_")):
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="🚫 Неверный выбор кнопки.",
+                parse_mode='Markdown'
+            )
+            logger.warning(f"button: Неверный формат data={data} для user_id={user_id}")
+            return
+
+        # Разбираем callback-данные
         try:
             result, trade_id = data.split("_")
             trade_id = int(trade_id)
         except ValueError as e:
-            logger.error(f"button: Ошибка разбора query.data={data}: {e}")
-            await query.message.reply_text("🚫 Неверный формат запроса.")
-            await notify_admin(f"Ошибка в button для user_id={user_id}, query.data={data}: {e}")
-            return
-        session = Session()
-        try:
-            trade = session.query(Trade).filter_by(id=trade_id, user_id=user_id).first()
-            if not trade:
-                await query.message.reply_text("🚫 Сделка не найдена или не принадлежит вам.")
-                return
-            if trade.result and result != 'CANCEL':
-                await query.message.reply_text(f"🚫 Сделка #{trade_id} уже отмечена как {trade.result}.")
-                return
-            if result == 'CANCEL':
-                session.delete(trade)
-                trade_metrics = session.query(TradeMetrics).filter_by(trade_id=trade_id).first()
-                if trade_metrics:
-                    session.delete(trade_metrics)
-                session.commit()
-                await query.message.reply_text(f"🚫 Сделка #{trade_id} ({trade.symbol}) отменена.")
-                logger.info(f"button: Сделка #{trade_id} отменена пользователем {user_id}")
-                return
-            trade.result = result
-            trade_metrics = session.query(TradeMetrics).filter_by(trade_id=trade_id).first()
-            if not trade_metrics:
-                await query.message.reply_text(f"🚫 Метрика для сделки #{trade_id} не найдена.")
-                return
-            trade_metrics.success = result
-            user_settings = get_user_settings(user_id)
-            balance = user_settings.get('balance', 0)
-            final_price = trade.stop_loss if result == 'SL' else trade.take_profit_1 if result == 'TP1' else trade.take_profit_2
-            if trade.position_size > 0:  # LONG
-                pnl = (final_price - trade.entry_price) * trade.position_size
-            else:  # SHORT
-                pnl = (trade.entry_price - final_price) * abs(trade.position_size)
-            balance += pnl
-            user_settings['balance'] = balance
-            save_user_settings(user_id, user_settings)
-            session.commit()
-            await query.message.reply_text(
-                f"✅ Сделка #{trade_id} отмечена как {result}. PNL: {pnl:.2f} USDT. Новый баланс: {balance:.2f} USDT."
+            logger.error(f"button: Ошибка разбора data={data} для user_id={user_id}: {e}")
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="🚫 Неверный формат запроса.",
+                parse_mode='Markdown'
             )
-            closed_trades = session.query(Trade).filter(
-                Trade.user_id == user_id,
-                Trade.result.isnot(None)
-            ).count()
-            if closed_trades >= 5:
-                asyncio.create_task(retrain_model_daily(context))
-            else:
-                logger.warning(f"button: Дообучение не запущено для user_id={user_id}, закрытых сделок: {closed_trades}")
-        except Exception as e:
-            logger.error(f"button: Ошибка при обработке сделки #{trade_id}: {e}")
-            await query.message.reply_text(f"🚫 Ошибка при обработке: {str(e)}")
-            await notify_admin(f"Ошибка в button для user_id={user_id}, trade_id={trade_id}: {e}")
-        finally:
-            session.close()
-    else:
-        await query.message.reply_text("🚫 Неверный выбор.")
-        await notify_admin(f"Неверный выбор в button для user_id={user_id}, query.data={data}")
+            await notify_admin(f"Ошибка в button для user_id={user_id}, data={data}: {e}")
+            return
+
+        # Инициализируем сессию базы данных
+        session = Session()
+        trade = session.query(Trade).filter_by(id=trade_id, user_id=user_id).first()
+
+        if not trade:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="🚫 Сделка не найдена или не принадлежит вам.",
+                parse_mode='Markdown'
+            )
+            logger.warning(f"button: Сделка #{trade_id} не найдена для user_id={user_id}")
+            return
+
+        # Проверяем, не отмечена ли сделка ранее
+        if trade.result and result != 'CANCEL':
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🚫 Сделка #{trade_id} уже отмечена как {trade.result}.",
+                parse_mode='Markdown'
+            )
+            logger.info(f"button: Сделка #{trade_id} уже имеет результат {trade.result} для user_id={user_id}")
+            return
+
+        # Обрабатываем отмену сделки
+        if result == 'CANCEL':
+            trade_metrics = session.query(TradeMetrics).filter_by(trade_id=trade_id).first()
+            if trade_metrics:
+                session.delete(trade_metrics)
+            session.delete(trade)
+            session.commit()
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🚫 Сделка #{trade_id} ({trade.symbol}) отменена.",
+                parse_mode='Markdown'
+            )
+            logger.info(f"button: Сделка #{trade_id} отменена для user_id={user_id}")
+            return
+
+        # Обрабатываем TP1, TP2, SL
+        trade_metrics = session.query(TradeMetrics).filter_by(trade_id=trade_id).first()
+        if not trade_metrics:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🚫 Метрика для сделки #{trade_id} не найдена.",
+                parse_mode='Markdown'
+            )
+            logger.error(f"button: Метрика для сделки #{trade_id} не найдена для user_id={user_id}")
+            return
+
+        # Устанавливаем результат
+        trade.result = result
+        trade_metrics.success = result
+
+        # Рассчитываем PNL и обновляем баланс
+        user_settings = get_user_settings(user_id)
+        balance = user_settings.get('balance', 0)
+        final_price = trade.stop_loss if result == 'SL' else trade.take_profit_1 if result == 'TP1' else trade.take_profit_2
+        if trade.position_size > 0:  # LONG
+            pnl = (final_price - trade.entry_price) * trade.position_size
+        else:  # SHORT
+            pnl = (trade.entry_price - final_price) * abs(trade.position_size)
+        balance += pnl
+        user_settings['balance'] = balance
+        save_user_settings(user_id, user_settings)
+
+        # Сохраняем изменения
+        session.commit()
+
+        # Отправляем подтверждение
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ Сделка #{trade_id} отмечена как {result}. PNL: {pnl:.2f} USDT. Новый баланс: {balance:.2f} USDT.",
+            parse_mode='Markdown'
+        )
+        logger.info(f"button: Сделка #{trade_id} отмечена как {result}, PNL={pnl:.2f}, новый баланс={balance:.2f} для user_id={user_id}")
+
+        # Проверяем необходимость дообучения модели
+        closed_trades = session.query(Trade).filter(
+            Trade.user_id == user_id,
+            Trade.result.isnot(None)
+        ).count()
+        if closed_trades >= 5:
+            logger.info(f"button: Запуск дообучения модели для user_id={user_id}, закрытых сделок={closed_trades}")
+            asyncio.create_task(retrain_model_daily(context))
+        else:
+            logger.info(f"button: Дообучение не запущено для user_id={user_id}, закрытых сделок={closed_trades}")
+
+    except Exception as e:
+        logger.error(f"button: Ошибка обработки для user_id={user_id}, data={data}: {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🚨 Ошибка при обработке: {str(e)}",
+                parse_mode='Markdown'
+            )
+            await notify_admin(f"Ошибка в button для user_id={user_id}, data={data}: {e}")
+        except Exception as send_error:
+            logger.error(f"button: Ошибка отправки сообщения об ошибке для user_id={user_id}: {send_error}")
+
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception as e:
+                logger.error(f"button: Ошибка закрытия сессии для user_id={user_id}: {e}")
 # Команда /setcriteria
 async def set_criteria(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
