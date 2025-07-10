@@ -850,38 +850,57 @@ def get_top_cryptos():
     
 # Smart Money анализ
 def smart_money_analysis(df, taker_buy_base, volume, coin_id):
-    if df.empty:
-        logger.warning(f"smart_money_analysis: Пустой датафрейм для {coin_id}")
-        return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-    avg_volume = df['volume'].rolling(window=6).mean().iloc[-1] if 'volume' in df.columns else 100
-    recent_volume = df['volume'].iloc[-1] if 'volume' in df.columns else volume
-    volume_change = min(recent_volume / avg_volume * 100, 100)
-    taker_buy = df['taker_buy_base'].iloc[-1] if 'taker_buy_base' in df.columns else taker_buy_base
-    institutional_score = (taker_buy / recent_volume * 100) if recent_volume > 0 else 0
-    vwap_signal = calculate_vwap_signal(df).iloc[-1]
-    sentiment = get_news_sentiment(coin_id)
-    rsi = calculate_rsi(df).iloc[-1]
-    macd = calculate_macd(df).iloc[-1]
-    adx = calculate_adx(df).iloc[-1]
-    obv = calculate_obv(df).iloc[-1]
-    bb_width = calculate_bb_width(df).iloc[-1]
-    score = (
-        0.2 * min(df['price'].pct_change().iloc[-1] * 100, 100) +
-        0.2 * volume_change +
-        0.2 * institutional_score +
-        0.15 * rsi +
-        0.1 * macd * 100 +
-        0.1 * vwap_signal +
-        0.1 * adx +
-        0.05 * bb_width * 100
-    ) / 2
-    logger.info(
-        f"smart_money_analysis: {coin_id}: price_change={df['price'].pct_change().iloc[-1] * 100:.2f}%, "
-        f"volume_change={volume_change:.2f}%, institutional={institutional_score:.2f}%, "
-        f"sentiment={sentiment:.2f}%, rsi={rsi:.2f}, macd={macd:.2f}, adx={adx:.2f}, "
-        f"obv={obv:.2f}, bb_width={bb_width:.2f}, score={score:.2f}"
-    )
-    return volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, score
+    try:
+        if df.empty or len(df) < 14:
+            logger.warning(f"smart_money_analysis: Недостаточно данных для {coin_id}, строк: {len(df)}")
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+        # Проверка наличия необходимых столбцов
+        required_columns = ['close', 'volume', 'high', 'low']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            logger.warning(f"smart_money_analysis: Отсутствуют столбцы {missing_columns} для {coin_id}")
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+        # Расчёт индикаторов
+        volume_change = df['volume'].pct_change().mean() * 100 if 'volume' in df.columns else 0.0
+        rsi = calculate_rsi(df, period=14).iloc[-1]
+        macd = calculate_macd(df, fast=12, slow=26).iloc[-1]
+        adx = calculate_adx(df, period=14).iloc[-1]
+        obv = calculate_obv(df).iloc[-1]
+        vwap_signal = calculate_vwap_signal(df).iloc[-1]
+        bb_width = calculate_bb_width(df).iloc[-1]
+
+        # Расчёт institutional_score
+        institutional_score = 50.0
+        if taker_buy_base > 0 and volume > 0:
+            buy_ratio = taker_buy_base / volume
+            institutional_score = min(100.0, max(0.0, 50.0 + (buy_ratio - 0.5) * 100))
+        
+        # Расчёт sentiment
+        sentiment = get_news_sentiment(coin_id)
+        
+        # Расчёт smart_money_score
+        smart_money_score = (institutional_score * 0.4 + sentiment * 0.3 + (rsi / 100) * 20 + (adx / 100) * 20) / 0.9
+        smart_money_score = min(100.0, max(0.0, smart_money_score))
+
+        logger.info(f"smart_money_analysis: {coin_id}, volume_change={volume_change:.2f}, rsi={rsi:.2f}, macd={macd:.4f}, adx={adx:.2f}, institutional_score={institutional_score:.2f}, smart_money_score={smart_money_score:.2f}, sentiment={sentiment:.2f}")
+        
+        return (
+            volume_change,
+            institutional_score,
+            vwap_signal,
+            sentiment,
+            rsi,
+            macd,
+            adx,
+            obv,
+            bb_width,
+            smart_money_score
+        )
+    except Exception as e:
+        logger.error(f"smart_money_analysis: Ошибка для {coin_id}: {str(e)}")
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
 # Размер позиции
 def calculate_position_size(entry_price, stop_loss, balance):
