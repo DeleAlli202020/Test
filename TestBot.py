@@ -644,7 +644,6 @@ async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
                 metrics.smart_money_score or 0
             ]
             X.append(features)
-            # Метка: 1 для успешных (TP1, TP2), 0 для неуспешных (SL)
             y.append(1 if trade.result in ['TP1', 'TP2'] else 0)
         
         X = np.array(X)
@@ -660,6 +659,7 @@ async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
             return
         
         # Разделение данных
+        from sklearn.model_selection import train_test_split
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42, stratify=y
         )
@@ -670,7 +670,7 @@ async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
         X_test_scaled = scaler.transform(X_test)
         
         # Загрузка текущей модели
-        model = load_model()[0]  # Предполагаем, что load_model возвращает (model, scaler, active_features)
+        model, _, active_features = load_model()
         if not model:
             logger.error("retrain_model_daily: Не удалось загрузить модель")
             return
@@ -687,7 +687,7 @@ async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"retrain_model_daily: Точность после дообучения: {loss_after:.4f}, сэмплов: {len(X)}")
         
         # Сохранение модели и скалера
-        save_model(model, scaler, ACTIVE_FEATURES)
+        save_model(model, scaler, active_features)
         
     except Exception as e:
         logger.error(f"retrain_model_daily: Ошибка при дообучении: {str(e)}")
@@ -1528,12 +1528,11 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
             job.schedule_removal()
             logger.info(f"idea: Задача автопоиска {job_name} сброшена для user_id={user_id}")
 
-        result = load_model()
-        if len(result) == 2:
-            model, scaler = result
-            active_features = ACTIVE_FEATURES
-        else:
-            model, scaler, active_features = result
+        model, scaler, active_features = load_model()
+        if not model or not scaler or not active_features:
+            logger.error(f"idea: Модель не загружена для user_id={user_id}")
+            await update.message.reply_text("🚨 **Ошибка**: Модель не загружена.", parse_mode='Markdown')
+            return
         top_cryptos = get_top_cryptos()
         session = Session()
         opportunities = []
@@ -1620,6 +1619,8 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
             obv = opp['obv']
             smart_money_score = opp['smart_money_score']
             probability = opp['probability']
+            
+            display_probability = probability if direction == 'LONG' else 100.0 - probability  # Для SHORT показываем вероятность успеха
             
             if (direction == 'LONG' and probability < min_probability) or (direction == 'SHORT' and (100 - probability) < min_probability):
                 logger.warning(f"idea: Пропущена сделка для {symbol} из-за вероятности {probability:.1f}% (min={min_probability}%)")
@@ -1713,7 +1714,7 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💰 TP2: ${take_profit_2:.{price_precision}f} (+${potential_profit_tp2:.2f})\n"
                 f"📊 RR: {rr_ratio:.1f}:1\n"
                 f"📏 Размер: {position_size_percent:.2f}% ({abs(position_size):.6f} {symbol.split('/')[0]})\n"
-                f"🎲 Вероятность: {probability:.1f}%\n"
+                f"🎲 Вероятность: {display_probability:.1f}%\n"
                 f"🏛️ Институц.: {institutional_score:.1f}%\n"
                 f"📈 VWAP: {vwap_text}\n"
                 f"📮 Сентимент: {sentiment:.1f}%\n"
@@ -1782,6 +1783,11 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown'
             )
             return
+        model, scaler, active_features = load_model()
+        if not model or not scaler or not active_features:
+            logger.error(f"test: Модель не загружена для user_id={user_id}")
+            await update.message.reply_text("🚨 **Ошибка**: Модель не загружена.", parse_mode='Markdown')
+            return
         session = Session()
         
         # Список символов для тестовых сделок
@@ -1803,33 +1809,33 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"⚠️ Не удалось получить данные для {symbol}.", parse_mode='Markdown')
                 continue
             
-            # Параметры для идеальной сделки
+            # Параметры для сделки
             atr = calculate_atr_normalized(df).iloc[-1] * current_price
             if direction == 'LONG':
                 stop_loss = current_price - max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
                 take_profit_1 = current_price + 6 * atr
                 take_profit_2 = current_price + 10 * atr
-                probability = 85.0
-                rsi = 65.0
-                macd = 1.0
-                adx = 30.0
-                vwap_signal = 1.0
-                sentiment = 75.0
             else:  # SHORT
                 stop_loss = current_price + max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
                 take_profit_1 = current_price - 6 * atr
                 take_profit_2 = current_price - 10 * atr
-                probability = 15.0  # 100-15=85% для SHORT
-                rsi = 35.0
-                macd = -1.0
-                adx = 30.0
-                vwap_signal = -1.0
-                sentiment = 25.0
+            
+            # Вычисление вероятности моделью
+            probability = predict_probability(model, scaler, active_features, df, coin_id, stop_loss, abs(calculate_position_size(current_price, stop_loss, balance)[0]))
+            if direction == 'SHORT':
+                display_probability = 100.0 - probability  # Для SHORT показываем вероятность успеха (падения)
+            else:
+                display_probability = probability
             
             # Остальные параметры
             price_change = 2.5 if direction == 'LONG' else -2.5
             volume_change = 40.0
             institutional_score = 80.0
+            vwap_signal = 1.0 if direction == 'LONG' else -1.0
+            sentiment = 75.0 if direction == 'LONG' else 25.0
+            rsi = 65.0 if direction == 'LONG' else 35.0
+            macd = 1.0 if direction == 'LONG' else -1.0
+            adx = 30.0
             obv = 1000000.0 if direction == 'LONG' else -1000000.0
             smart_money_score = 90.0
             
@@ -1914,7 +1920,7 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💰 TP2: ${take_profit_2:.{price_precision}f} (+${potential_profit_tp2:.2f})\n"
                 f"📊 RR: {rr_ratio:.1f}:1\n"
                 f"📏 Размер: {position_size_percent:.2f}% ({abs(position_size):.6f} {coin_id})\n"
-                f"🎲 Вероятность: {probability:.1f}%\n"
+                f"🎲 Вероятность: {display_probability:.1f}%\n"
                 f"🏛️ Институц.: {institutional_score:.1f}%\n"
                 f"📈 VWAP: {vwap_text}\n"
                 f"📮 Сентимент: {sentiment:.1f}%\n"
