@@ -613,99 +613,88 @@ def calculate_bollinger_bands(df, window=20, window_dev=2):
 
 # Дообучение модели
 async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
-    session = Session()
+    logger.info("retrain_model_daily: Начало дообучения модели")
+    session = None
     try:
-        model, scaler, active_features = load_model()
-        if not model or not scaler or not active_features:
-            logger.error("retrain_model_daily: Модель или скейлер не загружены")
-            await notify_admin("Не удалось загрузить модель для дообучения")
-            return
-        cutoff_time = datetime.utcnow() - timedelta(days=7)
-        trades = session.query(Trade).join(TradeMetrics, Trade.id == TradeMetrics.trade_id).filter(
-            Trade.timestamp >= cutoff_time,
-            TradeMetrics.success.isnot(None)
+        session = Session()
+        trades = session.query(Trade, TradeMetrics).join(
+            TradeMetrics,
+            Trade.id == TradeMetrics.trade_id
+        ).filter(
+            Trade.result.isnot(None)
         ).all()
+        
         if len(trades) < 5:
-            logger.warning(f"retrain_model_daily: Недостаточно сделок ({len(trades)} < 5) для дообучения")
-            await notify_admin(f"Недостаточно сделок ({len(trades)}) для дообучения за последние 7 дней")
+            logger.warning(f"retrain_model_daily: Недостаточно данных для дообучения ({len(trades)} сделок)")
             return
-        X_new = []
-        y_new = []
-        trade_results = []
-        pnls = []
-        for trade in trades:
-            df = await get_historical_data(trade.symbol)
-            if df.empty:
-                logger.warning(f"retrain_model_daily: Нет данных для {trade.symbol}")
-                continue
-            X, _ = prepare_training_data(df)
-            if X.empty:
-                logger.warning(f"retrain_model_daily: Пустой DataFrame для {trade.symbol}")
-                continue
-            trade_metrics = session.query(TradeMetrics).filter_by(trade_id=trade.id).first()
-            if not trade_metrics:
-                logger.warning(f"retrain_model_daily: Метрика для сделки #{trade.id} не найдена")
-                continue
-            label = 1 if trade_metrics.success in ['TP1', 'TP2'] else 0
-            if trade_metrics.success == 'SL':
-                final_price = trade.stop_loss
-            elif trade_metrics.success == 'TP1':
-                final_price = trade.take_profit_1
-            elif trade_metrics.success == 'TP2':
-                final_price = trade.take_profit_2
-            else:
-                final_price = trade.entry_price
-            pnl = (final_price - trade.entry_price) * trade.position_size
-            X_new.append(X.iloc[-1][active_features])
-            y_new.append(label)
-            trade_results.append(trade_metrics.success)
-            pnls.append(pnl)
-        if len(X_new) < 5:
-            logger.warning(f"retrain_model_daily: Недостаточно данных для дообучения ({len(X_new)} < 5)")
-            await notify_admin(f"Недостаточно данных для дообучения ({len(X_new)})")
+        
+        # Подготовка данных
+        X = []
+        y = []
+        for trade, metrics in trades:
+            features = [
+                metrics.volume_change or 0,
+                metrics.institutional_score or 0,
+                metrics.vwap_signal or 0,
+                metrics.sentiment or 0,
+                metrics.rsi or 0,
+                metrics.macd or 0,
+                metrics.adx or 0,
+                metrics.obv or 0,
+                metrics.smart_money_score or 0
+            ]
+            X.append(features)
+            # Метка: 1 для успешных (TP1, TP2), 0 для неуспешных (SL)
+            y.append(1 if trade.result in ['TP1', 'TP2'] else 0)
+        
+        X = np.array(X)
+        y = np.array(y)
+        
+        # Проверка баланса классов
+        unique, counts = np.unique(y, return_counts=True)
+        class_counts = dict(zip(unique, counts))
+        logger.info(f"retrain_model_daily: Распределение классов: {class_counts}")
+        
+        if len(class_counts) < 2 or min(counts) < 2:
+            logger.warning(f"retrain_model_daily: Несбалансированные классы: {class_counts}")
             return
-        X_new = pd.DataFrame(X_new, columns=active_features)
-        X_new_scaled = pd.DataFrame(scaler.transform(X_new), columns=active_features)
-        y_new = np.array(y_new)
-        unique_labels = np.unique(y_new)
-        if len(unique_labels) < 2:
-            logger.warning(f"retrain_model_daily: Только один класс в данных: {unique_labels}. Добавляем синтетические данные.")
-            num_synthetic = min(3, len(X_new))
-            for _ in range(num_synthetic):
-                idx = np.random.randint(0, len(X_new))
-                synthetic_X = X_new.iloc[idx].copy()
-                for col in synthetic_X.index:
-                    feature_range = X_new[col].std() or 1.0
-                    synthetic_X[col] += np.random.normal(0, feature_range * 0.01, 1)[0]
-                X_new = pd.concat([X_new, pd.DataFrame([synthetic_X], columns=active_features)], ignore_index=True)
-                y_new = np.append(y_new, 1)
-                trade_results.append('TP1')
-                pnls.append(pnls[idx] * -1 if pnls[idx] < 0 else pnls[idx])
-            X_new_scaled = pd.DataFrame(scaler.transform(X_new), columns=active_features)
-            logger.warning(f"retrain_model_daily: Добавлено {num_synthetic} синтетических сэмплов, новые метки: {np.unique(y_new)}")
-        for column in X_new.columns:
-            if X_new[column].nunique() <= 1:
-                logger.warning(f"retrain_model_daily: Признак {column} константный, добавляем шум")
-                X_new[column] = X_new[column] + np.random.normal(0, 1e-6, X_new[column].shape)
-        try:
-            y_pred_proba = model.predict_proba(X_new_scaled)
-            loss = pnl_loss(y_new, y_pred_proba, trade_results, pnls)
-            logger.warning(f"retrain_model_daily: Значение потерь до дообучения: {loss:.4f}, метки: {list(y_new)}")
-            # Устанавливаем cv=2 для StackingClassifier, если это необходимо
-            if hasattr(model, 'cv') and len(np.unique(y_new)) >= 2:
-                model.set_params(cv=min(2, len(np.unique(y_new))))
-            model.fit(X_new_scaled, y_new)
-            save_model(model, scaler, active_features)
-            logger.warning(f"retrain_model_daily: Модель дообучена на {len(X_new)} сэмплов, тестовая вероятность: {model.predict_proba(X_new_scaled.iloc[-1:])[0][1] * 100:.2f}%")
-        except Exception as e:
-            logger.error(f"retrain_model_daily: Ошибка при дообучении: {e}")
-            await notify_admin(f"Ошибка при дообучении: {e}")
+        
+        # Разделение данных
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        # Масштабирование
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # Загрузка текущей модели
+        model = load_model()[0]  # Предполагаем, что load_model возвращает (model, scaler, active_features)
+        if not model:
+            logger.error("retrain_model_daily: Не удалось загрузить модель")
             return
+        
+        # Оценка до дообучения
+        loss_before = model.score(X_test_scaled, y_test)
+        logger.info(f"retrain_model_daily: Точность до дообучения: {loss_before:.4f}")
+        
+        # Дообучение
+        model.fit(X_train_scaled, y_train)
+        
+        # Оценка после дообучения
+        loss_after = model.score(X_test_scaled, y_test)
+        logger.info(f"retrain_model_daily: Точность после дообучения: {loss_after:.4f}, сэмплов: {len(X)}")
+        
+        # Сохранение модели и скалера
+        save_model(model, scaler, ACTIVE_FEATURES)
+        
     except Exception as e:
-        logger.error(f"retrain_model_daily: Критическая ошибка: {e}")
-        await notify_admin(f"Критическая ошибка в retrain_model_daily: {e}")
+        logger.error(f"retrain_model_daily: Ошибка при дообучении: {str(e)}")
+        await notify_admin(f"Ошибка в retrain_model_daily: {str(e)}")
     finally:
-        session.close()
+        if session is not None:
+            session.close()
 
 
 
@@ -853,52 +842,82 @@ def create_price_chart(df, symbol, price_change):
         return None
 
 # Анализ торговой возможности
-async def analyze_trade_opportunity(model, scaler, active_features, df, price_change_1h, current_price, symbol, taker_buy_base, volume, coin_id):
+async def analyze_trade_opportunity(model, scaler, active_features, df, price_change_1h, current_price, symbol, taker_buy_base, volume, coin_id, direction=None):
     try:
         if df.empty:
-            logger.info(f"analyze_trade_opportunity: Пустой DataFrame для {symbol}")
-            return False, 0, 0, 50.0, 0, 0, 50.0, 0, 0, 0, 0, 0
-        # Проверка наличия необходимых столбцов
-        required_columns = ['price', 'volume', 'high', 'low', 'close']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        if missing_columns:
-            logger.warning(f"analyze_trade_opportunity: Отсутствуют столбцы для {symbol}: {missing_columns}")
-            return False, 0, 0, 50.0, 0, 0, 50.0, 0, 0, 0, 0, 0
-        price_change = ((df['price'].iloc[-1] / df['price'].iloc[-2]) - 1) * 100 if len(df) >= 2 else 0
-        volume_change = ((df['volume'].iloc[-1] / df['volume'].iloc[-2]) - 1) * 100 if len(df) >= 2 else 0
-        institutional_score = (taker_buy_base / volume * 100) if volume > 0 else 50.0
-        vwap_signal = (df['price'].iloc[-1] - df['vwap'].iloc[-1]) / df['vwap'].iloc[-1] * 100 if 'vwap' in df and len(df) >= 2 else 0
-        sentiment = get_news_sentiment(coin_id)
-        rsi = df['rsi'].iloc[-1] if 'rsi' in df else 50.0
-        macd = df['macd'].iloc[-1] if 'macd' in df else 0
-        adx = df['adx'].iloc[-1] if 'adx' in df else 0
-        obv = df['obv'].iloc[-1] if 'obv' in df else 0
-        smart_money_score = (
-            (price_change / PRICE_THRESHOLD if PRICE_THRESHOLD != 0 else 0) * 0.2 +
-            (volume_change / VOLUME_THRESHOLD if VOLUME_THRESHOLD != 0 else 0) * 0.3 +
-            (institutional_score / 100) * 0.2 +
-            (sentiment / 100) * 0.2 +
-            (rsi / 100) * 0.1
-        ) * 100
-        probability = predict_probability(model, scaler, active_features, df, coin_id, sentiment, institutional_score)
-        is_opportunity = (
-            volume_change > VOLUME_THRESHOLD * 1.5 and
-            rsi > RSI_THRESHOLD - 10 and
-            probability > 5
-        )
-        logger.info(
-            f"analyze_trade_opportunity: {symbol}: price_change={price_change:.2f}%, "
-            f"volume_change={volume_change:.2f}%, rsi={rsi:.2f}, probability={probability:.2f}%, "
-            f"is_opportunity={is_opportunity}"
-        )
+            logger.warning(f"analyze_trade_opportunity: Пустой DataFrame для {symbol}")
+            return False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        
+        # Расчёт индикаторов
+        rsi = talib.RSI(df['close'], timeperiod=14).iloc[-1] if len(df) >= 14 else 50.0
+        macd, signal, _ = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
+        macd = macd.iloc[-1] if len(df) >= 26 else 0.0
+        adx = talib.ADX(df['high'], df['low'], df['close'], timeperiod=14).iloc[-1] if len(df) >= 14 else 0.0
+        obv = talib.OBV(df['close'], df['volume']).iloc[-1] if len(df) >= 2 else 0.0
+        
+        # Специфичный анализ для LONG и SHORT
+        price_change = price_change_1h
+        volume_change = ((df['volume'].iloc[-1] - df['volume'].iloc[-2]) / df['volume'].iloc[-2] * 100) if len(df) >= 2 else 0.0
+        institutional_score = taker_buy_base / volume * 100 if volume > 0 else 50.0
+        
+        # Для LONG: бычьи сигналы
+        if direction == 'LONG':
+            is_opportunity = (
+                rsi > 50 and rsi < 70 and  # RSI в зоне роста, но не перекуплен
+                macd > signal and macd > 0 and  # Бычий MACD
+                adx > 20 and  # Сильный тренд
+                price_change > 0 and  # Положительное изменение цены
+                volume_change > 0  # Рост объёма
+            )
+            probability = min(90, 50 + (rsi - 50) + (macd * 10) + (adx / 2) + price_change)  # Упрощённая вероятность
+            vwap_signal = 1.0 if df['close'].iloc[-1] > df['close'].mean() else -1.0
+            sentiment = min(100, institutional_score + (volume_change / 2))
+        
+        # Для SHORT: медвежьи сигналы
+        elif direction == 'SHORT':
+            is_opportunity = (
+                rsi < 50 and rsi > 30 and  # RSI в зоне падения, но не перепродан
+                macd < signal and macd < 0 and  # Медвежий MACD
+                adx > 20 and  # Сильный тренд
+                price_change < 0 and  # Отрицательное изменение цены
+                volume_change > 0  # Рост объёма (на продажах)
+            )
+            probability = max(10, 50 - (50 - rsi) - (macd * 10) - (adx / 2) - price_change)  # Упрощённая вероятность
+            vwap_signal = -1.0 if df['close'].iloc[-1] < df['close'].mean() else 1.0
+            sentiment = max(0, institutional_score - (volume_change / 2))
+        
+        # Без направления: общий анализ
+        else:
+            is_opportunity = (
+                (rsi > 50 and rsi < 70) or (rsi < 50 and rsi > 30) and  # RSI в активной зоне
+                abs(macd) > abs(signal) and  # Сильный MACD
+                adx > 15  # Тренд
+            )
+            probability = 50 + (rsi - 50) + (macd * 5) + (adx / 3) if macd > 0 else 50 - (50 - rsi) - (macd * 5) - (adx / 3)
+            vwap_signal = 1.0 if df['close'].iloc[-1] > df['close'].mean() else -1.0
+            sentiment = institutional_score
+        
+        smart_money_score = min(100, institutional_score + (volume_change / 5))
+        
+        logger.info(f"analyze_trade_opportunity: {symbol}, direction={direction}, RSI={rsi:.1f}, MACD={macd:.4f}, ADX={adx:.1f}, probability={probability:.1f}%")
+        
         return (
-            is_opportunity, price_change, volume_change, institutional_score, vwap_signal,
-            sentiment, rsi, macd, adx, obv, smart_money_score, probability
+            is_opportunity,
+            price_change,
+            volume_change,
+            institutional_score,
+            vwap_signal,
+            sentiment,
+            rsi,
+            macd,
+            adx,
+            obv,
+            smart_money_score,
+            probability
         )
     except Exception as e:
         logger.error(f"analyze_trade_opportunity: Ошибка для {symbol}: {e}")
-        return False, 0, 0, 50.0, 0, 0, 50.0, 0, 0, 0, 0, 0
-
+        return False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 # Проверка результата сделки
 async def check_trade_result(symbol, entry_price, stop_loss, tp1, tp2, trade_id):
     session = Session()
@@ -1494,7 +1513,14 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_settings = get_user_settings(user_id)
         min_probability = user_settings.get('min_probability', 60.0)
-        auto_interval = user_settings['auto_interval']
+        auto_interval = user_settings.get('auto_interval', 300)
+        balance = user_settings.get('balance', None)
+        if balance is None:
+            await update.message.reply_text(
+                "🚫 **Баланс не установлен.**\nИспользуйте `/setbalance <сумма>` для установки баланса.",
+                parse_mode='Markdown'
+            )
+            return
         
         job_name = f"auto_search_{user_id}"
         current_jobs = context.job_queue.get_jobs_by_name(job_name)
@@ -1511,6 +1537,7 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
         top_cryptos = get_top_cryptos()
         session = Session()
         opportunities = []
+        
         for symbol, coin_id, price_change_1h, taker_buy_base, volume in top_cryptos:
             if not symbol.replace('/', '').isalnum():
                 logger.warning(f"idea: Некорректный символ {symbol}, пропускаем")
@@ -1523,35 +1550,59 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if current_price <= 0.0:
                 logger.warning(f"idea: Не удалось получить цену для {symbol}, пропускаем")
                 continue
-            is_opportunity, price_change, volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, smart_money_score, probability = await analyze_trade_opportunity(
-                model, scaler, active_features, df, price_change_1h, current_price, symbol, taker_buy_base, volume, coin_id
-            )
-            # Разделяем логику для LONG и SHORT
-            direction = None
-            if probability >= min_probability:
-                direction = 'LONG'
-            elif (100 - probability) >= min_probability:
-                direction = 'SHORT'
             
-            if is_opportunity and direction:
+            # Анализ для LONG
+            long_result = await analyze_trade_opportunity(
+                model, scaler, active_features, df, price_change_1h, current_price, symbol, taker_buy_base, volume, coin_id, direction='LONG'
+            )
+            if long_result[0]:  # is_opportunity
                 opportunities.append({
                     'symbol': symbol,
                     'coin_id': coin_id,
-                    'price_change': price_change,
-                    'volume_change': volume_change,
-                    'institutional_score': institutional_score,
-                    'vwap_signal': vwap_signal,
-                    'sentiment': sentiment,
-                    'rsi': rsi,
-                    'macd': macd,
-                    'adx': adx,
-                    'obv': obv,
-                    'smart_money_score': smart_money_score,
-                    'probability': probability,
+                    'price_change': long_result[1],
+                    'volume_change': long_result[2],
+                    'institutional_score': long_result[3],
+                    'vwap_signal': long_result[4],
+                    'sentiment': long_result[5],
+                    'rsi': long_result[6],
+                    'macd': long_result[7],
+                    'adx': long_result[8],
+                    'obv': long_result[9],
+                    'smart_money_score': long_result[10],
+                    'probability': long_result[11],
                     'current_price': current_price,
                     'df': df,
-                    'direction': direction
+                    'direction': 'LONG'
                 })
+            
+            # Анализ для SHORT
+            short_result = await analyze_trade_opportunity(
+                model, scaler, active_features, df, price_change_1h, current_price, symbol, taker_buy_base, volume, coin_id, direction='SHORT'
+            )
+            if short_result[0]:  # is_opportunity
+                opportunities.append({
+                    'symbol': symbol,
+                    'coin_id': coin_id,
+                    'price_change': short_result[1],
+                    'volume_change': short_result[2],
+                    'institutional_score': short_result[3],
+                    'vwap_signal': short_result[4],
+                    'sentiment': short_result[5],
+                    'rsi': short_result[6],
+                    'macd': short_result[7],
+                    'adx': short_result[8],
+                    'obv': short_result[9],
+                    'smart_money_score': short_result[10],
+                    'probability': short_result[11],
+                    'current_price': current_price,
+                    'df': df,
+                    'direction': 'SHORT'
+                })
+        
+        if not opportunities:
+            await update.message.reply_text("🔍 **Нет подходящих возможностей для торговли.**", parse_mode='Markdown')
+            return
+        
         opportunities.sort(key=lambda x: abs(x['probability'] - 50), reverse=True)
         for opp in opportunities:
             symbol = opp['symbol']
@@ -1569,21 +1620,27 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
             obv = opp['obv']
             smart_money_score = opp['smart_money_score']
             probability = opp['probability']
+            
+            if (direction == 'LONG' and probability < min_probability) or (direction == 'SHORT' and (100 - probability) < min_probability):
+                logger.warning(f"idea: Пропущена сделка для {symbol} из-за вероятности {probability:.1f}% (min={min_probability}%)")
+                continue
+            
+            atr = calculate_atr_normalized(df).iloc[-1] * current_price
+            if direction == 'LONG':
+                stop_loss = current_price - max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
+                take_profit_1 = current_price + 6 * atr
+                take_profit_2 = current_price + 10 * atr
+            else:  # SHORT
+                stop_loss = current_price + max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
+                take_profit_1 = current_price - 6 * atr
+                take_profit_2 = current_price - 10 * atr
+            
             existing_trades = session.query(Trade).filter(
                 Trade.user_id == user_id,
                 Trade.symbol == symbol,
-                Trade.result.is_(None)
+                Trade.result.is_(None) | (Trade.result == 'TP1')
             ).all()
             is_duplicate = False
-            atr = calculate_atr_normalized(df).iloc[-1] * current_price
-            if direction == 'LONG':
-                stop_loss = current_price * (1 - STOP_LOSS_PCT)
-                take_profit_1 = current_price * (1 + TAKE_PROFIT_1_PCT)
-                take_profit_2 = current_price * (1 + TAKE_PROFIT_2_PCT)
-            else:  # SHORT
-                stop_loss = current_price * (1 + STOP_LOSS_PCT)
-                take_profit_1 = current_price * (1 - TAKE_PROFIT_1_PCT)
-                take_profit_2 = current_price * (1 - TAKE_PROFIT_2_PCT)
             for trade in existing_trades:
                 entry_diff = abs(trade.entry_price - current_price) / current_price
                 sl_diff = abs(trade.stop_loss - stop_loss) / current_price
@@ -1599,26 +1656,13 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await asyncio.sleep(0.5)
                 continue
-            if probability == 0 or (direction == 'LONG' and probability < min_probability) or (direction == 'SHORT' and (100 - probability) < min_probability):
-                logger.warning(f"idea: Пропущена сделка для {symbol} из-за вероятности {probability}% (min={min_probability}%)")
-                continue
-            if stop_loss <= 0 or (direction == 'LONG' and (take_profit_1 <= current_price or take_profit_2 <= take_profit_1)) or \
-               (direction == 'SHORT' and (take_profit_1 >= current_price or take_profit_2 >= take_profit_1)):
-                logger.warning(f"idea: Некорректные параметры для {symbol}: SL={stop_loss}, TP1={take_profit_1}, TP2={take_profit_2}")
-                continue
+            
             rr_ratio = (take_profit_1 - current_price) / (current_price - stop_loss) if direction == 'LONG' else (current_price - take_profit_1) / (stop_loss - current_price)
-            user_settings = get_user_settings(user_id)
-            balance = user_settings.get('balance', None)
-            if balance is None:
-                await update.message.reply_text(
-                    "🚫 **Баланс не установлен.**\nИспользуйте `/setbalance <сумма>` для установки баланса.",
-                    parse_mode='Markdown'
-                )
-                return
             position_size, position_size_percent = calculate_position_size(current_price, stop_loss, balance)
             position_size = position_size if direction == 'LONG' else -position_size
             potential_profit_tp1 = (take_profit_1 - current_price) * position_size if direction == 'LONG' else (current_price - take_profit_1) * abs(position_size)
             potential_profit_tp2 = (take_profit_2 - current_price) * position_size if direction == 'LONG' else (current_price - take_profit_2) * abs(position_size)
+            
             trade = Trade(
                 user_id=user_id,
                 symbol=symbol,
@@ -1655,10 +1699,10 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             session.add(trade_metrics)
             session.commit()
+            
             price_precision = 6 if current_price < 1 else 2
             vwap_text = '🟢 Бычий' if vwap_signal > 0 else '🔴 Медвежий'
             macd_text = '🟢 Бычий' if macd > 0 else '🔴 Медвежий'
-            chart_path = create_price_chart(df, symbol, price_change)
             tradingview_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol.replace('/', '')}&interval=15"
             message = (
                 f"🔔 **Новая сделка: {symbol} {direction}**\n"
@@ -1685,6 +1729,7 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("🚫 Отмена", callback_data=f"CANCEL_{trade.id}")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
+            chart_path = create_price_chart(df, symbol, price_change)
             if chart_path and os.path.exists(chart_path):
                 with open(chart_path, 'rb') as photo:
                     await context.bot.send_photo(
@@ -1713,15 +1758,13 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             logger.info(f"idea: Задача автопоиска перезапущена для user_id={user_id} с интервалом {auto_interval} сек")
             return
-        await update.message.reply_text("🔍 **Нет подходящих возможностей для торговли.**", parse_mode='Markdown')
     except Exception as e:
-        logger.error(f"idea: Ошибка: {str(e)}")
+        logger.error(f"idea: Ошибка для user_id={user_id}: {str(e)}")
         await update.message.reply_text(f"🚨 **Ошибка**: {str(e)}", parse_mode='Markdown')
-        await notify_admin(f"Ошибка в idea: {str(e)}")
+        await notify_admin(f"Ошибка в idea для user_id={user_id}: {str(e)}")
     finally:
         if session is not None:
             session.close()
-
 # Новая функция test для создания идеальных LONG и SHORT сделок
 async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1741,75 +1784,60 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         session = Session()
         
-        # Параметры для идеальной LONG сделки
-        long_params = {
-            'symbol': 'BTC/USDT',
-            'coin_id': 'BTC',
-            'current_price': 50000.0,
-            'stop_loss': 49000.0,  # -2%
-            'take_profit_1': 52000.0,  # +4%
-            'take_profit_2': 54000.0,  # +8%
-            'probability': 85.0,
-            'institutional_score': 80.0,
-            'vwap_signal': 1.0,
-            'sentiment': 75.0,
-            'rsi': 65.0,
-            'macd': 1.0,
-            'adx': 30.0,
-            'obv': 1000000.0,
-            'smart_money_score': 90.0,
-            'price_change': 2.5,
-            'volume_change': 40.0,
-            'direction': 'LONG'
-        }
+        # Список символов для тестовых сделок
+        symbols = [('BTC/USDT', 'BTC'), ('ETH/USDT', 'ETH')]
+        directions = ['LONG', 'SHORT']
         
-        # Параметры для идеальной SHORT сделки
-        short_params = {
-            'symbol': 'ETH/USDT',
-            'coin_id': 'ETH',
-            'current_price': 3000.0,
-            'stop_loss': 3060.0,  # +2%
-            'take_profit_1': 2880.0,  # -4%
-            'take_profit_2': 2760.0,  # -8%
-            'probability': 15.0,  # 100-15=85% для SHORT
-            'institutional_score': 80.0,
-            'vwap_signal': -1.0,
-            'sentiment': 25.0,
-            'rsi': 35.0,
-            'macd': -1.0,
-            'adx': 30.0,
-            'obv': -1000000.0,
-            'smart_money_score': 90.0,
-            'price_change': -2.5,
-            'volume_change': 40.0,
-            'direction': 'SHORT'
-        }
-        
-        for params in [long_params, short_params]:
-            symbol = params['symbol']
-            direction = params['direction']
-            current_price = params['current_price']
-            stop_loss = params['stop_loss']
-            take_profit_1 = params['take_profit_1']
-            take_profit_2 = params['take_profit_2']
-            probability = params['probability']
-            institutional_score = params['institutional_score']
-            vwap_signal = params['vwap_signal']
-            sentiment = params['sentiment']
-            rsi = params['rsi']
-            macd = params['macd']
-            adx = params['adx']
-            obv = params['obv']
-            smart_money_score = params['smart_money_score']
-            price_change = params['price_change']
-            volume_change = params['volume_change']
-            coin_id = params['coin_id']
+        for (symbol, coin_id), direction in zip(symbols, directions):
+            # Получаем актуальную цену
+            current_price = await get_current_price(symbol)
+            if current_price <= 0.0:
+                logger.warning(f"test: Не удалось получить цену для {symbol}, пропускаем")
+                await update.message.reply_text(f"⚠️ Не удалось получить цену для {symbol}.", parse_mode='Markdown')
+                continue
+            
+            # Получаем исторические данные
+            df = await get_historical_data(symbol)
+            if df.empty:
+                logger.warning(f"test: Пустой DataFrame для {symbol}, пропускаем")
+                await update.message.reply_text(f"⚠️ Не удалось получить данные для {symbol}.", parse_mode='Markdown')
+                continue
+            
+            # Параметры для идеальной сделки
+            atr = calculate_atr_normalized(df).iloc[-1] * current_price
+            if direction == 'LONG':
+                stop_loss = current_price - max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
+                take_profit_1 = current_price + 6 * atr
+                take_profit_2 = current_price + 10 * atr
+                probability = 85.0
+                rsi = 65.0
+                macd = 1.0
+                adx = 30.0
+                vwap_signal = 1.0
+                sentiment = 75.0
+            else:  # SHORT
+                stop_loss = current_price + max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
+                take_profit_1 = current_price - 6 * atr
+                take_profit_2 = current_price - 10 * atr
+                probability = 15.0  # 100-15=85% для SHORT
+                rsi = 35.0
+                macd = -1.0
+                adx = 30.0
+                vwap_signal = -1.0
+                sentiment = 25.0
+            
+            # Остальные параметры
+            price_change = 2.5 if direction == 'LONG' else -2.5
+            volume_change = 40.0
+            institutional_score = 80.0
+            obv = 1000000.0 if direction == 'LONG' else -1000000.0
+            smart_money_score = 90.0
             
             # Проверка дублирования
             existing_trades = session.query(Trade).filter(
                 Trade.user_id == user_id,
                 Trade.symbol == symbol,
-                Trade.result.is_(None)
+                Trade.result.is_(None) | (Trade.result == 'TP1')
             ).all()
             is_duplicate = False
             for trade in existing_trades:
@@ -1915,11 +1943,10 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"test: Ошибка для user_id={user_id}: {str(e)}")
         await update.message.reply_text(f"🚨 **Ошибка**: {str(e)}", parse_mode='Markdown')
-        await notify_admin(f"Ошибка в test: {str(e)}")
+        await notify_admin(f"Ошибка в test для user_id={user_id}: {str(e)}")
     finally:
         if session is not None:
             session.close()
-
 # Команда /active
 async def active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
