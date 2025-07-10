@@ -623,7 +623,7 @@ def calculate_atr_normalized(df, window=14):
 def prepare_training_data(df):
     try:
         if df.empty or len(df) < 48:
-            logger.warning("prepare_training_data: Пустой или недостаточный датафрейм")
+            logger.warning(f"prepare_training_data: Пустой или недостаточный датафрейм, строк: {len(df)}")
             return pd.DataFrame(columns=ACTIVE_FEATURES), np.array([])
 
         # Проверка наличия необходимых столбцов
@@ -633,24 +633,17 @@ def prepare_training_data(df):
             logger.warning(f"prepare_training_data: Отсутствуют столбцы: {missing_columns}")
             return pd.DataFrame(columns=ACTIVE_FEATURES), np.array([])
 
+        # Логирование структуры DataFrame
+        logger.info(f"prepare_training_data: df_shape={df.shape}, df_columns={df.columns.tolist() if not df.empty else 'empty'}")
+
         # Получение метрик из smart_money_analysis
         coin_id = df['symbol'].iloc[0].replace('/USDT', '') if 'symbol' in df.columns else 'UNKNOWN'
-        
-        # Расчёт индикаторов для всего DataFrame
-        volume_change = df['volume'].pct_change().fillna(0) * 100
-        rsi = calculate_rsi(df, period=14)
-        macd = calculate_macd(df, fast=12, slow=26)
-        adx = calculate_adx(df, period=14)
-        obv = calculate_obv(df)
-        vwap_signal = calculate_vwap_signal(df)
-        bb_width = calculate_bb_width(df)
-        institutional_score = pd.Series([50.0] * len(df), index=df.index)
-        if 'taker_buy_base' in df.columns and 'volume' in df.columns:
-            buy_ratio = df['taker_buy_base'] / df['volume'].replace(0, np.nan)
-            institutional_score = (50.0 + (buy_ratio - 0.5) * 100).clip(0, 100).fillna(50.0)
-        sentiment = pd.Series([get_news_sentiment(coin_id)] * len(df), index=df.index)
-        smart_money_score = (institutional_score * 0.4 + sentiment * 0.3 + (rsi / 100) * 20 + (adx / 100) * 20) / 0.9
-        smart_money_score = smart_money_score.clip(0, 100)
+        volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score = smart_money_analysis(
+            df,
+            df['taker_buy_base'].iloc[-1] if 'taker_buy_base' in df.columns else 0.0,
+            df['volume'].iloc[-1] if 'volume' in df.columns else 0.0,
+            coin_id
+        )
 
         X = pd.DataFrame(index=df.index)
         X['price_change_1h'] = df['price'].pct_change(4) * 100
@@ -675,11 +668,15 @@ def prepare_training_data(df):
         X['sentiment'] = sentiment
 
         # Проверка на константные признаки
+        constant_features = []
         for column in X.columns:
             if X[column].nunique() <= 1:
                 logger.warning(f"prepare_training_data: Признак {column} константный (уникальных значений: {X[column].nunique()})")
-                # Не добавляем шум, а возвращаем пустой DataFrame, чтобы избежать искажений
-                return pd.DataFrame(columns=ACTIVE_FEATURES), np.array([])
+                constant_features.append(column)
+
+        # Если есть константные признаки, логируем, но продолжаем
+        if constant_features:
+            logger.warning(f"prepare_training_data: Обнаружены константные признаки: {constant_features}. Продолжаем обработку.")
 
         # Обработка пропусков
         X = X.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
@@ -869,39 +866,51 @@ def smart_money_analysis(df, taker_buy_base, volume, coin_id):
     try:
         if df.empty or len(df) < 14:
             logger.warning(f"smart_money_analysis: Недостаточно данных для {coin_id}, строк: {len(df)}")
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            return (pd.Series(0, index=df.index),) * 10
+
+        # Логирование входных данных
+        logger.info(f"smart_money_analysis: df_shape={df.shape}, df_columns={df.columns.tolist() if not df.empty else 'empty'}, coin_id={coin_id}, taker_buy_base={taker_buy_base}, volume={volume}")
 
         # Проверка наличия необходимых столбцов
         required_columns = ['close', 'volume', 'high', 'low']
         missing_columns = [col for col in required_columns if col not in df.columns]
         if missing_columns:
             logger.warning(f"smart_money_analysis: Отсутствуют столбцы {missing_columns} для {coin_id}")
-            return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            return (pd.Series(0, index=df.index),) * 10
 
         # Расчёт индикаторов
-        volume_change = df['volume'].pct_change().mean() * 100 if 'volume' in df.columns else 0.0
-        rsi = calculate_rsi(df, period=14).iloc[-1]
-        macd = calculate_macd(df, fast=12, slow=26).iloc[-1]
-        adx = calculate_adx(df, period=14).iloc[-1]
-        obv = calculate_obv(df).iloc[-1]
-        vwap_signal = calculate_vwap_signal(df).iloc[-1]
-        bb_width = calculate_bb_width(df).iloc[-1]
+        volume_change = df['volume'].pct_change().fillna(0) * 100
+        rsi = calculate_rsi(df, period=14)
+        macd = calculate_macd(df, fast=12, slow=26)
+        adx = calculate_adx(df, period=14)
+        obv = calculate_obv(df)
+        vwap_signal = calculate_vwap_signal(df)
+        bb_width = calculate_bb_width(df)
 
         # Расчёт institutional_score
-        institutional_score = 50.0
-        if taker_buy_base > 0 and volume > 0:
-            buy_ratio = taker_buy_base / volume
-            institutional_score = min(100.0, max(0.0, 50.0 + (buy_ratio - 0.5) * 100))
-        
+        institutional_score = pd.Series(50.0, index=df.index)
+        if 'taker_buy_base' in df.columns and 'volume' in df.columns:
+            buy_ratio = df['taker_buy_base'] / df['volume'].replace(0, np.nan)
+            institutional_score = (50.0 + (buy_ratio - 0.5) * 100).clip(0, 100).fillna(50.0)
+            logger.info(f"smart_money_analysis: {coin_id}, buy_ratio_stats={buy_ratio.describe().to_dict()}")
+        else:
+            logger.warning(f"smart_money_analysis: taker_buy_base или volume отсутствуют, institutional_score=50.0")
+
         # Расчёт sentiment
-        sentiment = get_news_sentiment(coin_id)
-        
+        sentiment = pd.Series(get_news_sentiment(coin_id), index=df.index)
+
         # Расчёт smart_money_score
         smart_money_score = (institutional_score * 0.4 + sentiment * 0.3 + (rsi / 100) * 20 + (adx / 100) * 20) / 0.9
-        smart_money_score = min(100.0, max(0.0, smart_money_score))
+        smart_money_score = smart_money_score.clip(0, 100)
 
-        logger.info(f"smart_money_analysis: {coin_id}, volume_change={volume_change:.2f}, rsi={rsi:.2f}, macd={macd:.4f}, adx={adx:.2f}, institutional_score={institutional_score:.2f}, smart_money_score={smart_money_score:.2f}, sentiment={sentiment:.2f}")
-        
+        # Проверка на константность
+        for name, series in zip(
+            ['volume_change', 'rsi', 'macd', 'vwap_signal', 'obv', 'adx', 'institutional_score', 'smart_money_score', 'sentiment', 'bb_width'],
+            [volume_change, rsi, macd, vwap_signal, obv, adx, institutional_score, smart_money_score, sentiment, bb_width]
+        ):
+            if series.nunique() <= 1:
+                logger.warning(f"smart_money_analysis: Признак {name} константный для {coin_id} (уникальных значений: {series.nunique()})")
+
         return (
             volume_change,
             institutional_score,
@@ -916,7 +925,7 @@ def smart_money_analysis(df, taker_buy_base, volume, coin_id):
         )
     except Exception as e:
         logger.error(f"smart_money_analysis: Ошибка для {coin_id}: {str(e)}")
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        return (pd.Series(0, index=df.index),) * 10
 
 # Размер позиции
 def calculate_position_size(entry_price, stop_loss, balance):
