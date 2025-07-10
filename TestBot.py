@@ -1526,7 +1526,13 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_opportunity, price_change, volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, smart_money_score, probability = await analyze_trade_opportunity(
                 model, scaler, active_features, df, price_change_1h, current_price, symbol, taker_buy_base, volume, coin_id
             )
-            direction = 'LONG' if probability >= min_probability else 'SHORT' if probability < (100 - min_probability) else None
+            # Разделяем логику для LONG и SHORT
+            direction = None
+            if probability >= min_probability:
+                direction = 'LONG'
+            elif (100 - probability) >= min_probability:
+                direction = 'SHORT'
+            
             if is_opportunity and direction:
                 opportunities.append({
                     'symbol': symbol,
@@ -1593,7 +1599,7 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await asyncio.sleep(0.5)
                 continue
-            if probability == 0 or (direction == 'LONG' and probability < min_probability) or (direction == 'SHORT' and probability >= (100 - min_probability)):
+            if probability == 0 or (direction == 'LONG' and probability < min_probability) or (direction == 'SHORT' and (100 - probability) < min_probability):
                 logger.warning(f"idea: Пропущена сделка для {symbol} из-за вероятности {probability}% (min={min_probability}%)")
                 continue
             if stop_loss <= 0 or (direction == 'LONG' and (take_profit_1 <= current_price or take_profit_2 <= take_profit_1)) or \
@@ -1715,6 +1721,205 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         if session is not None:
             session.close()
+
+# Новая функция test для создания идеальных LONG и SHORT сделок
+async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    logger.info(f"test: Команда от пользователя {user_id}")
+    if not is_authorized(user_id):
+        await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
+        return
+    session = None
+    try:
+        user_settings = get_user_settings(user_id)
+        balance = user_settings.get('balance', None)
+        if balance is None:
+            await update.message.reply_text(
+                "🚫 **Баланс не установлен.**\nИспользуйте `/setbalance <сумма>` для установки баланса.",
+                parse_mode='Markdown'
+            )
+            return
+        session = Session()
+        
+        # Параметры для идеальной LONG сделки
+        long_params = {
+            'symbol': 'BTC/USDT',
+            'coin_id': 'BTC',
+            'current_price': 50000.0,
+            'stop_loss': 49000.0,  # -2%
+            'take_profit_1': 52000.0,  # +4%
+            'take_profit_2': 54000.0,  # +8%
+            'probability': 85.0,
+            'institutional_score': 80.0,
+            'vwap_signal': 1.0,
+            'sentiment': 75.0,
+            'rsi': 65.0,
+            'macd': 1.0,
+            'adx': 30.0,
+            'obv': 1000000.0,
+            'smart_money_score': 90.0,
+            'price_change': 2.5,
+            'volume_change': 40.0,
+            'direction': 'LONG'
+        }
+        
+        # Параметры для идеальной SHORT сделки
+        short_params = {
+            'symbol': 'ETH/USDT',
+            'coin_id': 'ETH',
+            'current_price': 3000.0,
+            'stop_loss': 3060.0,  # +2%
+            'take_profit_1': 2880.0,  # -4%
+            'take_profit_2': 2760.0,  # -8%
+            'probability': 15.0,  # 100-15=85% для SHORT
+            'institutional_score': 80.0,
+            'vwap_signal': -1.0,
+            'sentiment': 25.0,
+            'rsi': 35.0,
+            'macd': -1.0,
+            'adx': 30.0,
+            'obv': -1000000.0,
+            'smart_money_score': 90.0,
+            'price_change': -2.5,
+            'volume_change': 40.0,
+            'direction': 'SHORT'
+        }
+        
+        for params in [long_params, short_params]:
+            symbol = params['symbol']
+            direction = params['direction']
+            current_price = params['current_price']
+            stop_loss = params['stop_loss']
+            take_profit_1 = params['take_profit_1']
+            take_profit_2 = params['take_profit_2']
+            probability = params['probability']
+            institutional_score = params['institutional_score']
+            vwap_signal = params['vwap_signal']
+            sentiment = params['sentiment']
+            rsi = params['rsi']
+            macd = params['macd']
+            adx = params['adx']
+            obv = params['obv']
+            smart_money_score = params['smart_money_score']
+            price_change = params['price_change']
+            volume_change = params['volume_change']
+            coin_id = params['coin_id']
+            
+            # Проверка дублирования
+            existing_trades = session.query(Trade).filter(
+                Trade.user_id == user_id,
+                Trade.symbol == symbol,
+                Trade.result.is_(None)
+            ).all()
+            is_duplicate = False
+            for trade in existing_trades:
+                entry_diff = abs(trade.entry_price - current_price) / current_price
+                sl_diff = abs(trade.stop_loss - stop_loss) / current_price
+                tp1_diff = abs(trade.take_profit_1 - take_profit_1) / current_price
+                if entry_diff < 0.005 and sl_diff < 0.01 and tp1_diff < 0.01:
+                    is_duplicate = True
+                    logger.info(f"test: Пропущена тестовая сделка для {symbol}, уже есть активная сделка #{trade.id}")
+                    break
+            if is_duplicate:
+                await update.message.reply_text(
+                    f"🔔 **Тестовая сделка ({symbol}) уже активна.** Пропускаем...",
+                    parse_mode='Markdown'
+                )
+                continue
+            
+            # Расчёт позиции
+            rr_ratio = (take_profit_1 - current_price) / (current_price - stop_loss) if direction == 'LONG' else (current_price - take_profit_1) / (stop_loss - current_price)
+            position_size, position_size_percent = calculate_position_size(current_price, stop_loss, balance)
+            position_size = position_size if direction == 'LONG' else -position_size
+            potential_profit_tp1 = (take_profit_1 - current_price) * position_size if direction == 'LONG' else (current_price - take_profit_1) * abs(position_size)
+            potential_profit_tp2 = (take_profit_2 - current_price) * position_size if direction == 'LONG' else (current_price - take_profit_2) * abs(position_size)
+            
+            # Сохранение сделки
+            trade = Trade(
+                user_id=user_id,
+                symbol=symbol,
+                entry_price=current_price,
+                stop_loss=stop_loss,
+                take_profit_1=take_profit_1,
+                take_profit_2=take_profit_2,
+                rr_ratio=rr_ratio,
+                position_size=position_size,
+                probability=probability,
+                institutional_score=institutional_score,
+                sentiment_score=sentiment,
+                trader_level="Новичок"
+            )
+            session.add(trade)
+            session.flush()
+            trade_metrics = TradeMetrics(
+                trade_id=trade.id,
+                symbol=symbol,
+                entry_price=current_price,
+                price_after_1h=None,
+                price_after_2h=None,
+                volume_change=volume_change,
+                institutional_score=institutional_score,
+                vwap_signal=vwap_signal,
+                sentiment=sentiment,
+                rsi=rsi,
+                macd=macd,
+                adx=adx,
+                obv=obv,
+                smart_money_score=smart_money_score,
+                probability=probability,
+                success=None
+            )
+            session.add(trade_metrics)
+            session.commit()
+            
+            # Формирование сообщения
+            price_precision = 6 if current_price < 1 else 2
+            vwap_text = '🟢 Бычий' if vwap_signal > 0 else '🔴 Медвежий'
+            macd_text = '🟢 Бычий' if macd > 0 else '🔴 Медвежий'
+            tradingview_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol.replace('/', '')}&interval=15"
+            message = (
+                f"🔔 **Тестовая сделка: {symbol} {direction}**\n"
+                f"💰 **Баланс**: ${balance:.2f}\n"
+                f"🎯 Вход: ${current_price:.{price_precision}f}\n"
+                f"⛔ Стоп-лосс: ${stop_loss:.{price_precision}f}\n"
+                f"💰 TP1: ${take_profit_1:.{price_precision}f} (+${potential_profit_tp1:.2f})\n"
+                f"💰 TP2: ${take_profit_2:.{price_precision}f} (+${potential_profit_tp2:.2f})\n"
+                f"📊 RR: {rr_ratio:.1f}:1\n"
+                f"📏 Размер: {position_size_percent:.2f}% ({abs(position_size):.6f} {coin_id})\n"
+                f"🎲 Вероятность: {probability:.1f}%\n"
+                f"🏛️ Институц.: {institutional_score:.1f}%\n"
+                f"📈 VWAP: {vwap_text}\n"
+                f"📮 Сентимент: {sentiment:.1f}%\n"
+                f"📊 RSI: {rsi:.1f} | MACD: {macd_text} | ADX: {adx:.1f}\n"
+                f"💡 Логика: Рост {price_change:.2f}%, Объём +{volume_change:.1f}%\n"
+                f"📈 График: {tradingview_url}\n"
+                f"💾 Тестовая сделка сохранена. Отметьте результат:"
+            )
+            keyboard = [
+                [InlineKeyboardButton("✅ TP1", callback_data=f"TP1_{trade.id}"),
+                 InlineKeyboardButton("✅ TP2", callback_data=f"TP2_{trade.id}"),
+                 InlineKeyboardButton("❌ SL", callback_data=f"SL_{trade.id}"),
+                 InlineKeyboardButton("🚫 Отмена", callback_data=f"CANCEL_{trade.id}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=message,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+            logger.info(f"test: Тестовая сделка #{trade.id} создана для {symbol} ({direction})")
+        
+        await update.message.reply_text("✅ **Тестовые сделки (LONG и SHORT) созданы.**", parse_mode='Markdown')
+    
+    except Exception as e:
+        logger.error(f"test: Ошибка для user_id={user_id}: {str(e)}")
+        await update.message.reply_text(f"🚨 **Ошибка**: {str(e)}", parse_mode='Markdown')
+        await notify_admin(f"Ошибка в test: {str(e)}")
+    finally:
+        if session is not None:
+            session.close()
+
 # Команда /active
 async def active(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -2148,6 +2353,7 @@ async def main():
             CommandHandler("clear_trades", clear_trades),
             CommandHandler("setbalance", set_balance),
             CommandHandler("setminprobability", set_min_probability),
+            CommandHandler("test", test),  # Новая команда
             CallbackQueryHandler(button),
             CallbackQueryHandler(history_filter, pattern='^(filter_active|filter_completed|refresh_active)$')
         ]
