@@ -21,6 +21,8 @@ import sys
 from dotenv import load_dotenv # type: ignore
 import telegram
 from sklearn.preprocessing import StandardScaler
+import talib
+
 
 # Настройка логирования
 logging.basicConfig(
