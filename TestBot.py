@@ -61,11 +61,12 @@ RETRY_DELAY = 5
 CACHE_TTL = 3600  # 1 час
 DEFAULT_AUTO_INTERVAL = 300  # 5 минут
 
-# Конфигурационные параметры для торговых стратегий
+
 ACTIVE_FEATURES = [
     'price_change_1h', 'price_change_2h', 'price_change_6h', 'volume_score',
     'volume_change', 'atr_normalized', 'rsi', 'macd', 'vwap_signal', 'obv',
-    'adx', 'bb_upper', 'bb_lower', 'support_level', 'resistance_level'
+    'adx', 'bb_upper', 'bb_lower', 'support_level', 'resistance_level',
+    'institutional_score', 'smart_money_score', 'sentiment'
 ]
 
 STOP_LOSS_PCT = 0.01  # 1% стоп-лосс
@@ -537,6 +538,68 @@ def pnl_loss(y_true, y_pred_proba, trade_results, pnls=None):
             weights.append(1.0)  # Нейтральный вес для неизвестных результатов
     return log_loss(y_true, y_pred_proba, sample_weight=weights)
 
+def calculate_bollinger_bands(df, window=20, num_std=2):
+    try:
+        if 'close' not in df.columns:
+            logger.warning("calculate_bollinger_bands: Столбец 'close' отсутствует в DataFrame")
+            return pd.Series(0, index=df.index), pd.Series(0, index=df.index), pd.Series(0, index=df.index)
+
+        rolling_mean = df['close'].rolling(window=window).mean()
+        rolling_std = df['close'].rolling(window=window).std()
+        
+        bb_upper = rolling_mean + (rolling_std * num_std)
+        bb_lower = rolling_mean - (rolling_std * num_std)
+        bb_width = (bb_upper - bb_lower) / rolling_mean
+
+        # Заполнение NaN
+        bb_upper = bb_upper.fillna(0)
+        bb_lower = bb_lower.fillna(0)
+        bb_width = bb_width.fillna(0)
+
+        return bb_upper, bb_lower, bb_width
+    except Exception as e:
+        logger.error(f"calculate_bollinger_bands: Ошибка: {e}")
+        return pd.Series(0, index=df.index), pd.Series(0, index=df.index), pd.Series(0, index=df.index)
+
+def calculate_support_resistance(df, window=20):
+    try:
+        if 'low' not in df.columns or 'high' not in df.columns:
+            logger.warning("calculate_support_resistance: Столбцы 'low' или 'high' отсутствуют в DataFrame")
+            return pd.Series(0, index=df.index), pd.Series(0, index=df.index)
+
+        support = df['low'].rolling(window=window).min()
+        resistance = df['high'].rolling(window=window).max()
+
+        # Заполнение NaN
+        support = support.fillna(df['low'].iloc[0] if len(df) > 0 else 0)
+        resistance = resistance.fillna(df['high'].iloc[0] if len(df) > 0 else 0)
+
+        return support, resistance
+    except Exception as e:
+        logger.error(f"calculate_support_resistance: Ошибка: {e}")
+        return pd.Series(0, index=df.index), pd.Series(0, index=df.index)
+
+def calculate_atr_normalized(df, window=14):
+    try:
+        if not all(col in df.columns for col in ['high', 'low', 'close']):
+            logger.warning("calculate_atr_normalized: Отсутствуют необходимые столбцы 'high', 'low', 'close'")
+            return pd.Series(0, index=df.index)
+
+        high_low = df['high'] - df['low']
+        high_close = (df['high'] - df['close'].shift(1)).abs()
+        low_close = (df['low'] - df['close'].shift(1)).abs()
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        atr = tr.rolling(window=window).mean()
+        atr_normalized = atr / df['close']
+
+        # Заполнение NaN
+        atr_normalized = atr_normalized.fillna(0)
+
+        return atr_normalized
+    except Exception as e:
+        logger.error(f"calculate_atr_normalized: Ошибка: {e}")
+        return pd.Series(0, index=df.index)
+
 # Подготовка данных для дообучения
 def prepare_training_data(df):
     try:
@@ -603,7 +666,7 @@ def prepare_training_data(df):
         logger.info(f"prepare_training_data: Сформирован DataFrame с {len(X)} строками, признаки: {X.columns.tolist()}")
         return X, labels
     except Exception as e:
-        logger.error(f"prepare_training_data: Ошибка: {e}")
+        logger.error(f"prepare_training_data: Ошибка: {str(e)}")
         return pd.DataFrame(columns=ACTIVE_FEATURES), np.array([])
 
 # Дообучение модели
@@ -746,7 +809,6 @@ async def predict_probability(model, scaler, active_features, df, coin_id, stop_
         logger.error(f"predict_probability: Ошибка для {coin_id}: {str(e)}")
         await notify_admin(f"Ошибка в predict_probability для {coin_id}: {str(e)}")
         return 0.0
-
 # Список криптовалют
 def get_top_cryptos():
     try:
