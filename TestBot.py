@@ -703,42 +703,46 @@ async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
 # Прогноз вероятности
 async def predict_probability(model, scaler, active_features, df, coin_id, stop_loss, position_size, direction='LONG'):
     try:
-        # Подготовка признаков
+        # Получение метрик из smart_money_analysis
+        volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score = smart_money_analysis(df, df['taker_buy_base'].iloc[-1] if 'taker_buy_base' in df.columns else 0.0, df['volume'].iloc[-1] if 'volume' in df.columns else 0.0, coin_id)
+
+        # Формирование списка признаков для модели
         features = [
-            ((df['volume'].iloc[-1] - df['volume'].iloc[-2]) / df['volume'].iloc[-2] * 100) if len(df) >= 2 else 0.0,  # volume_change
-            calculate_institutional_score(df, coin_id),  # institutional_score
-            calculate_vwap_signal(df).iloc[-1],  # vwap_signal
-            calculate_sentiment(coin_id),  # sentiment
-            calculate_rsi(df).iloc[-1] if len(df) >= 14 else 50.0,  # rsi
-            calculate_macd(df).iloc[-1] if len(df) >= 26 else 0.0,  # macd
-            calculate_adx(df).iloc[-1] if len(df) >= 14 else 0.0,  # adx
-            calculate_obv(df).iloc[-1] if len(df) >= 2 else 0.0,  # obv
-            calculate_smart_money_score(df, coin_id)  # smart_money_score
+            volume_change,  # volume_change
+            institutional_score,  # institutional_score
+            vwap_signal,  # vwap_signal
+            sentiment,  # sentiment
+            rsi,  # rsi
+            macd,  # macd
+            adx,  # adx
+            obv,  # obv
+            smart_money_score  # smart_money_score
         ]
-        
+
         # Логирование входных признаков
         logger.info(f"predict_probability: coin_id={coin_id}, direction={direction}, features={features}")
-        
+
         # Фильтрация активных признаков
-        X = np.array([features[i] for i in active_features]).reshape(1, -1)
-        
+        feature_indices = [ACTIVE_FEATURES.index(f) for f in active_features if f in ACTIVE_FEATURES]
+        X = np.array([features[i] for i in feature_indices]).reshape(1, -1)
+
         # Масштабирование
         X_scaled = scaler.transform(X)
-        
+
         # Предсказание вероятности
         probability = model.predict_proba(X_scaled)[0][1] * 100  # Вероятность положительного класса (успех)
-        
+
         # Инверсия вероятности для SHORT
         if direction == 'SHORT':
             probability = 100 - probability
-        
+
         logger.info(f"predict_probability: coin_id={coin_id}, direction={direction}, probability={probability:.1f}%")
         return max(0.0, min(100.0, probability))
-    
+
     except Exception as e:
         logger.error(f"predict_probability: Ошибка для coin_id={coin_id}: {str(e)}")
+        await notify_admin(f"Ошибка в predict_probability для coin_id={coin_id}: {str(e)}")
         return 0.0
-
 
 # Список криптовалют
 def get_top_cryptos():
