@@ -62,6 +62,7 @@ CACHE_TTL = 3600  # 1 час
 DEFAULT_AUTO_INTERVAL = 300  # 5 минут
 
 
+# Конфигурационные параметры для торговых стратегий
 ACTIVE_FEATURES = [
     'price_change_1h', 'price_change_2h', 'price_change_6h', 'volume_score',
     'volume_change', 'atr_normalized', 'rsi', 'macd', 'vwap_signal', 'obv',
@@ -616,12 +617,22 @@ def prepare_training_data(df):
 
         # Получение метрик из smart_money_analysis
         coin_id = df['symbol'].iloc[0].replace('/USDT', '') if 'symbol' in df.columns else 'UNKNOWN'
-        volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score = smart_money_analysis(
-            df,
-            df['taker_buy_base'].iloc[-1] if 'taker_buy_base' in df.columns else 0.0,
-            df['volume'].iloc[-1] if 'volume' in df.columns else 0.0,
-            coin_id
-        )
+        
+        # Расчёт индикаторов для всего DataFrame
+        volume_change = df['volume'].pct_change().fillna(0) * 100
+        rsi = calculate_rsi(df, period=14)
+        macd = calculate_macd(df, fast=12, slow=26)
+        adx = calculate_adx(df, period=14)
+        obv = calculate_obv(df)
+        vwap_signal = calculate_vwap_signal(df)
+        bb_width = calculate_bb_width(df)
+        institutional_score = pd.Series([50.0] * len(df), index=df.index)
+        if 'taker_buy_base' in df.columns and 'volume' in df.columns:
+            buy_ratio = df['taker_buy_base'] / df['volume'].replace(0, np.nan)
+            institutional_score = (50.0 + (buy_ratio - 0.5) * 100).clip(0, 100).fillna(50.0)
+        sentiment = pd.Series([get_news_sentiment(coin_id)] * len(df), index=df.index)
+        smart_money_score = (institutional_score * 0.4 + sentiment * 0.3 + (rsi / 100) * 20 + (adx / 100) * 20) / 0.9
+        smart_money_score = smart_money_score.clip(0, 100)
 
         X = pd.DataFrame(index=df.index)
         X['price_change_1h'] = df['price'].pct_change(4) * 100
@@ -635,7 +646,7 @@ def prepare_training_data(df):
         X['vwap_signal'] = vwap_signal
         X['obv'] = obv
         X['adx'] = adx
-        bb_upper, bb_lower, bb_width = calculate_bollinger_bands(df)
+        bb_upper, bb_lower, _ = calculate_bollinger_bands(df)
         X['bb_upper'] = bb_upper / df['price']
         X['bb_lower'] = bb_lower / df['price']
         support, resistance = calculate_support_resistance(df)
@@ -649,7 +660,8 @@ def prepare_training_data(df):
         for column in X.columns:
             if X[column].nunique() <= 1:
                 logger.warning(f"prepare_training_data: Признак {column} константный (уникальных значений: {X[column].nunique()})")
-                X[column] = X[column] + np.random.normal(0, 1e-6, X[column].shape)
+                # Не добавляем шум, а возвращаем пустой DataFrame, чтобы избежать искажений
+                return pd.DataFrame(columns=ACTIVE_FEATURES), np.array([])
 
         # Обработка пропусков
         X = X.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
@@ -764,20 +776,6 @@ async def predict_probability(model, scaler, active_features, df, coin_id, stop_
         if X.empty:
             logger.warning(f"predict_probability: Пустой DataFrame для {coin_id}")
             return 0.0
-
-        # Получение метрик из smart_money_analysis
-        volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score = smart_money_analysis(
-            df,
-            df['taker_buy_base'].iloc[-1] if 'taker_buy_base' in df.columns else 0.0,
-            df['volume'].iloc[-1] if 'volume' in df.columns else 0.0,
-            coin_id
-        )
-
-        # Добавление метрик из smart_money_analysis в X
-        X['institutional_score'] = institutional_score
-        X['smart_money_score'] = smart_money_score
-        X['sentiment'] = sentiment
-        X['vwap_signal'] = vwap_signal
 
         # Выбор последней строки и активных признаков
         X_last = X.iloc[-1][active_features]
