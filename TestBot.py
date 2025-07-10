@@ -704,27 +704,46 @@ async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
 async def predict_probability(model, scaler, active_features, df, coin_id, stop_loss, position_size, direction='LONG'):
     try:
         # Получение метрик из smart_money_analysis
-        volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score = smart_money_analysis(df, df['taker_buy_base'].iloc[-1] if 'taker_buy_base' in df.columns else 0.0, df['volume'].iloc[-1] if 'volume' in df.columns else 0.0, coin_id)
+        volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score = smart_money_analysis(
+            df, 
+            df['taker_buy_base'].iloc[-1] if 'taker_buy_base' in df.columns else 0.0, 
+            df['volume'].iloc[-1] if 'volume' in df.columns else 0.0, 
+            coin_id
+        )
 
-        # Формирование списка признаков для модели
-        features = [
-            volume_change,  # volume_change
-            institutional_score,  # institutional_score
-            vwap_signal,  # vwap_signal
-            sentiment,  # sentiment
-            rsi,  # rsi
-            macd,  # macd
-            adx,  # adx
-            obv,  # obv
-            smart_money_score  # smart_money_score
-        ]
+        # Формирование списка признаков, соответствующих ACTIVE_FEATURES
+        feature_map = {
+            'volume_change': volume_change,
+            'institutional_score': institutional_score,
+            'vwap_signal': vwap_signal,
+            'sentiment': sentiment,
+            'rsi': rsi,
+            'macd': macd,
+            'adx': adx,
+            'obv': obv,
+            'smart_money_score': smart_money_score
+        }
+
+        # Фильтрация только тех признаков, которые есть в ACTIVE_FEATURES и feature_map
+        features = []
+        for feature in active_features:
+            if feature in feature_map and feature in ACTIVE_FEATURES:
+                features.append(feature_map[feature])
+            else:
+                logger.warning(f"predict_probability: Признак {feature} отсутствует в feature_map или ACTIVE_FEATURES, пропущен")
+                features.append(0.0)  # Заполняем нули для отсутствующих признаков
 
         # Логирование входных признаков
         logger.info(f"predict_probability: coin_id={coin_id}, direction={direction}, features={features}")
 
-        # Фильтрация активных признаков
-        feature_indices = [ACTIVE_FEATURES.index(f) for f in active_features if f in ACTIVE_FEATURES]
-        X = np.array([features[i] for i in feature_indices]).reshape(1, -1)
+        # Проверка, что список признаков не пустой
+        if not features:
+            logger.error(f"predict_probability: Нет доступных признаков для coin_id={coin_id}")
+            await notify_admin(f"Ошибка в predict_probability: Нет доступных признаков для coin_id={coin_id}")
+            return 0.0
+
+        # Формирование массива для модели
+        X = np.array(features).reshape(1, -1)
 
         # Масштабирование
         X_scaled = scaler.transform(X)
