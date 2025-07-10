@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 import sys
 from dotenv import load_dotenv # type: ignore
 import telegram
+from sklearn.preprocessing import StandardScaler
 
 # Настройка логирования
 logging.basicConfig(
