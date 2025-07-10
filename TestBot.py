@@ -862,31 +862,25 @@ def create_price_chart(df, symbol, price_change):
 # Анализ торговой возможности
 async def analyze_trade_opportunity(model, scaler, active_features, df, price_change_1h, current_price, symbol, taker_buy_base, volume, coin_id, direction=None, balance=1000):
     try:
-        if df.empty:
-            logger.warning(f"analyze_trade_opportunity: Пустой DataFrame для {symbol}")
+        if df.empty or len(df) < 14:
+            logger.warning(f"analyze_trade_opportunity: Пустой или недостаточный DataFrame для {symbol}, строк: {len(df)}")
             return False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-        
-        # Расчёт индикаторов
-        rsi = calculate_rsi(df).iloc[-1] if len(df) >= 14 else 50.0
-        macd = calculate_macd(df).iloc[-1] if len(df) >= 26 else 0.0
-        signal = calculate_macd(df, fast=12, slow=26).ewm(span=9, adjust=False).mean().iloc[-1] if len(df) >= 26 else 0.0
-        adx = calculate_adx(df).iloc[-1] if len(df) >= 14 else 0.0
-        obv = calculate_obv(df).iloc[-1] if len(df) >= 2 else 0.0
-        
-        # Специфичный анализ для LONG и SHORT
-        price_change = price_change_1h
-        volume_change = ((df['volume'].iloc[-1] - df['volume'].iloc[-2]) / df['volume'].iloc[-2] * 100) if len(df) >= 2 else 0.0
-        institutional_score = taker_buy_base / volume * 100 if volume > 0 else 50.0
-        
+
+        # Вызов smart_money_analysis для получения всех необходимых метрик
+        volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score = smart_money_analysis(df, taker_buy_base, volume, coin_id)
+
         # Расчёт stop_loss для вероятности
         atr = calculate_atr_normalized(df).iloc[-1] * current_price
         stop_loss = current_price - max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01) if direction == 'LONG' else \
                     current_price + max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
-        
+
         # Расчёт position_size
         position_size, _ = calculate_position_size(current_price, stop_loss, balance)
-        
-        # Для LONG: бычьи сигналы
+
+        # Проверка направления и условий для торговой возможности
+        price_change = price_change_1h
+        signal = calculate_macd(df, fast=12, slow=26).ewm(span=9, adjust=False).mean().iloc[-1] if len(df) >= 26 else 0.0
+
         if direction == 'LONG':
             is_opportunity = (
                 rsi > 50 and rsi < 70 and
@@ -896,10 +890,6 @@ async def analyze_trade_opportunity(model, scaler, active_features, df, price_ch
                 volume_change > 0
             )
             probability = await predict_probability(model, scaler, active_features, df, coin_id, stop_loss, abs(position_size), direction='LONG')
-            vwap_signal = calculate_vwap_signal(df).iloc[-1]
-            sentiment = min(100, institutional_score + (volume_change / 2))
-        
-        # Для SHORT: медвежьи сигналы
         elif direction == 'SHORT':
             is_opportunity = (
                 rsi < 50 and rsi > 30 and
@@ -909,10 +899,6 @@ async def analyze_trade_opportunity(model, scaler, active_features, df, price_ch
                 volume_change > 0
             )
             probability = await predict_probability(model, scaler, active_features, df, coin_id, stop_loss, abs(position_size), direction='SHORT')
-            vwap_signal = calculate_vwap_signal(df).iloc[-1]
-            sentiment = max(0, institutional_score - (volume_change / 2))
-        
-        # Без направления: общий анализ
         else:
             is_opportunity = (
                 (rsi > 50 and rsi < 70) or (rsi < 50 and rsi > 30) and
@@ -920,13 +906,18 @@ async def analyze_trade_opportunity(model, scaler, active_features, df, price_ch
                 adx > 15
             )
             probability = await predict_probability(model, scaler, active_features, df, coin_id, stop_loss, abs(position_size), direction='LONG')
-            vwap_signal = calculate_vwap_signal(df).iloc[-1]
-            sentiment = institutional_score
-        
-        smart_money_score = min(100, institutional_score + (volume_change / 5))
-        
-        logger.info(f"analyze_trade_opportunity: {symbol}, direction={direction}, RSI={rsi:.1f}, MACD={macd:.4f}, ADX={adx:.1f}, probability={probability:.1f}%")
-        
+
+        # Корректировка sentiment на основе направления
+        sentiment = min(100, institutional_score + (volume_change / 2)) if direction == 'LONG' else \
+                    max(0, institutional_score - (volume_change / 2)) if direction == 'SHORT' else institutional_score
+
+        logger.info(
+            f"analyze_trade_opportunity: {symbol}, direction={direction}, "
+            f"RSI={rsi:.1f}, MACD={macd:.4f}, ADX={adx:.1f}, "
+            f"price_change={price_change:.2f}%, volume_change={volume_change:.2f}%, "
+            f"smart_money_score={smart_money_score:.2f}, probability={probability:.1f}%"
+        )
+
         return (
             is_opportunity,
             price_change,
@@ -943,42 +934,8 @@ async def analyze_trade_opportunity(model, scaler, active_features, df, price_ch
         )
     except Exception as e:
         logger.error(f"analyze_trade_opportunity: Ошибка для {symbol}: {e}")
+        await notify_admin(f"Ошибка в analyze_trade_opportunity для {symbol}: {e}")
         return False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-# Проверка результата сделки
-async def check_trade_result(symbol, entry_price, stop_loss, tp1, tp2, trade_id):
-    session = Session()
-    try:
-        await asyncio.sleep(3600)
-        price_1h = await get_current_price(symbol)
-        await asyncio.sleep(3600)
-        price_2h = await get_current_price(symbol)
-        success = None
-        if price_1h <= stop_loss or price_2h <= stop_loss:
-            success = 'SL'
-        elif price_2h >= tp2:
-            success = 'TP2'
-        elif price_1h >= tp1 or price_2h >= tp1:
-            success = 'TP1'
-        trade_metrics = TradeMetrics(
-            trade_id=trade_id,
-            symbol=symbol,
-            entry_price=entry_price,
-            price_after_1h=price_1h,
-            price_after_2h=price_2h,
-            success=success
-        )
-        trade = session.query(Trade).filter_by(id=trade_id).first()
-        if trade and success:
-            trade.result = success
-        session.add(trade_metrics)
-        session.commit()
-        logger.info(f"check_trade_result: Сделка #{trade_id} ({symbol}): success={success}")
-    except Exception as e:
-        logger.error(f"check_trade_result: Ошибка для {symbol}: {e}")
-        await notify_admin(f"Ошибка проверки результата для {symbol}: {e}")
-    finally:
-        session.close()
-
 # Проверка активных сделок
 from threading import Lock
 
