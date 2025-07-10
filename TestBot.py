@@ -640,9 +640,9 @@ def prepare_training_data(df):
 
         # Получение метрик из smart_money_analysis
         coin_id = df['symbol'].iloc[0].replace('/USDT', '') if 'symbol' in df.columns else 'UNKNOWN'
-        volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score = smart_money_analysis(
+        volume_change, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score = smart_money_analysis(
             df,
-            df['taker_buy_base'].iloc[-1] if 'taker_buy_base' in df.columns else 0.0,
+            0.0,  # taker_buy_volume не используется
             df['volume'].iloc[-1] if 'volume' in df.columns else 0.0,
             coin_id
         )
@@ -665,6 +665,7 @@ def prepare_training_data(df):
         support, resistance = calculate_support_resistance(df)
         X['support_level'] = support / df['price']
         X['resistance_level'] = resistance / df['price']
+        X['sentiment'] = sentiment
         X['smart_money_score'] = smart_money_score
 
         # Проверка на константные признаки
@@ -694,7 +695,6 @@ def prepare_training_data(df):
     except Exception as e:
         logger.error(f"prepare_training_data: Ошибка: {str(e)}")
         return pd.DataFrame(columns=ACTIVE_FEATURES), np.array([])
-
 # Дообучение модели
 async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
     logger.info("retrain_model_daily: Начало дообучения модели")
@@ -861,18 +861,14 @@ def get_top_cryptos():
         return [(symbol, symbol.replace('/USDT', ''), 0, 0, 0) for symbol in CRYPTO_PAIRS]
     
 # Smart Money анализ
-def smart_money_analysis(df, taker_buy_base, volume, coin_id):
+def smart_money_analysis(df, taker_buy_volume, volume, coin_id):
     try:
         if df.empty or len(df) < 14:
             logger.warning(f"smart_money_analysis: Недостаточно данных для {coin_id}, строк: {len(df)}")
-            return (pd.Series(0, index=df.index),) * 10
+            return (pd.Series(0, index=df.index),) * 9
 
         # Логирование входных данных
         logger.info(f"smart_money_analysis: df_shape={df.shape}, df_columns={df.columns.tolist() if not df.empty else 'empty'}, coin_id={coin_id}")
-        if 'taker_buy_base' in df.columns:
-            logger.info(f"smart_money_analysis: taker_buy_base_stats={df['taker_buy_base'].describe().to_dict()}")
-        else:
-            logger.warning(f"smart_money_analysis: taker_buy_base отсутствует для {coin_id}")
         if 'volume' in df.columns:
             logger.info(f"smart_money_analysis: volume_stats={df['volume'].describe().to_dict()}")
         else:
@@ -883,7 +879,7 @@ def smart_money_analysis(df, taker_buy_base, volume, coin_id):
         missing_columns = [col for col in required_columns if col not in df.columns]
         if missing_columns:
             logger.warning(f"smart_money_analysis: Отсутствуют столбцы {missing_columns} для {coin_id}")
-            return (pd.Series(0, index=df.index),) * 10
+            return (pd.Series(0, index=df.index),) * 9
 
         # Расчёт индикаторов
         volume_change = df['volume'].pct_change().fillna(0) * 100
@@ -894,35 +890,24 @@ def smart_money_analysis(df, taker_buy_base, volume, coin_id):
         vwap_signal = calculate_vwap_signal(df)
         bb_width = calculate_bb_width(df)
 
-        # Расчёт institutional_score
-        institutional_score = pd.Series(50.0, index=df.index)
-        if 'taker_buy_base' in df.columns and 'volume' in df.columns:
-            buy_ratio = df['taker_buy_base'] / df['volume'].replace(0, np.nan)
-            institutional_score = (50.0 + (buy_ratio - 0.5) * 100).clip(0, 100).fillna(50.0)
-            if buy_ratio.nunique() <= 1:
-                logger.warning(f"smart_money_analysis: buy_ratio константный для {coin_id}, уникальных значений: {buy_ratio.nunique()}")
-        else:
-            logger.warning(f"smart_money_analysis: taker_buy_base или volume отсутствуют, institutional_score=50.0")
-
-        # Расчёт sentiment (временное решение: случайные значения для вариативности)
-        sentiment = pd.Series(np.random.uniform(20, 80, len(df)), index=df.index)  # Временная заглушка
+        # Расчёт sentiment
+        sentiment = pd.Series(50.0 + (rsi - 50) * 0.5 + macd * 10, index=df.index).clip(0, 100)
         logger.info(f"smart_money_analysis: sentiment_stats={sentiment.describe().to_dict()}")
 
-        # Расчёт smart_money_score
-        smart_money_score = (institutional_score * 0.4 + sentiment * 0.3 + (rsi / 100) * 20 + (adx / 100) * 20) / 0.9
+        # Расчёт smart_money_score (без institutional_score)
+        smart_money_score = (sentiment * 0.4 + (rsi / 100) * 30 + (adx / 100) * 30) / 0.7
         smart_money_score = smart_money_score.clip(0, 100)
 
         # Проверка на константность
         for name, series in zip(
-            ['volume_change', 'institutional_score', 'vwap_signal', 'sentiment', 'rsi', 'macd', 'adx', 'obv', 'bb_width', 'smart_money_score'],
-            [volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score]
+            ['volume_change', 'vwap_signal', 'sentiment', 'rsi', 'macd', 'adx', 'obv', 'bb_width', 'smart_money_score'],
+            [volume_change, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score]
         ):
             if series.nunique() <= 1:
                 logger.warning(f"smart_money_analysis: Признак {name} константный для {coin_id} (уникальных значений: {series.nunique()})")
 
         return (
             volume_change,
-            institutional_score,
             vwap_signal,
             sentiment,
             rsi,
@@ -934,7 +919,7 @@ def smart_money_analysis(df, taker_buy_base, volume, coin_id):
         )
     except Exception as e:
         logger.error(f"smart_money_analysis: Ошибка для {coin_id}: {str(e)}")
-        return (pd.Series(0, index=df.index),) * 10
+        return (pd.Series(0, index=df.index),) * 9
 
 # Размер позиции
 def calculate_position_size(entry_price, stop_loss, balance):
