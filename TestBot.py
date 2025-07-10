@@ -850,12 +850,12 @@ async def analyze_trade_opportunity(model, scaler, active_features, df, price_ch
             logger.warning(f"analyze_trade_opportunity: Пустой DataFrame для {symbol}")
             return False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
         
-        # Расчёт индикаторов
-        rsi = talib.RSI(df['close'], timeperiod=14).iloc[-1] if len(df) >= 14 else 50.0
-        macd, signal, _ = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
-        macd = macd.iloc[-1] if len(df) >= 26 else 0.0
-        adx = talib.ADX(df['high'], df['low'], df['close'], timeperiod=14).iloc[-1] if len(df) >= 14 else 0.0
-        obv = talib.OBV(df['close'], df['volume']).iloc[-1] if len(df) >= 2 else 0.0
+        # Расчёт индикаторов (замена talib)
+        rsi = calculate_rsi(df).iloc[-1] if len(df) >= 14 else 50.0
+        macd = calculate_macd(df).iloc[-1] if len(df) >= 26 else 0.0
+        signal = calculate_macd(df, fast=12, slow=26).ewm(span=9, adjust=False).mean().iloc[-1] if len(df) >= 26 else 0.0
+        adx = calculate_adx(df).iloc[-1] if len(df) >= 14 else 0.0
+        obv = calculate_obv(df).iloc[-1] if len(df) >= 2 else 0.0
         
         # Специфичный анализ для LONG и SHORT
         price_change = price_change_1h
@@ -871,8 +871,8 @@ async def analyze_trade_opportunity(model, scaler, active_features, df, price_ch
                 price_change > 0 and  # Положительное изменение цены
                 volume_change > 0  # Рост объёма
             )
-            probability = min(90, 50 + (rsi - 50) + (macd * 10) + (adx / 2) + price_change)  # Упрощённая вероятность
-            vwap_signal = 1.0 if df['close'].iloc[-1] > df['close'].mean() else -1.0
+            probability = predict_probability(model, scaler, active_features, df, coin_id, current_price * (1 - STOP_LOSS_PCT), abs(calculate_position_size(current_price, current_price * (1 - STOP_LOSS_PCT), 1000)[0]))
+            vwap_signal = calculate_vwap_signal(df).iloc[-1]
             sentiment = min(100, institutional_score + (volume_change / 2))
         
         # Для SHORT: медвежьи сигналы
@@ -884,8 +884,8 @@ async def analyze_trade_opportunity(model, scaler, active_features, df, price_ch
                 price_change < 0 and  # Отрицательное изменение цены
                 volume_change > 0  # Рост объёма (на продажах)
             )
-            probability = max(10, 50 - (50 - rsi) - (macd * 10) - (adx / 2) - price_change)  # Упрощённая вероятность
-            vwap_signal = -1.0 if df['close'].iloc[-1] < df['close'].mean() else 1.0
+            probability = predict_probability(model, scaler, active_features, df, coin_id, current_price * (1 + STOP_LOSS_PCT), abs(calculate_position_size(current_price, current_price * (1 + STOP_LOSS_PCT), 1000)[0]))
+            vwap_signal = calculate_vwap_signal(df).iloc[-1]
             sentiment = max(0, institutional_score - (volume_change / 2))
         
         # Без направления: общий анализ
@@ -895,8 +895,8 @@ async def analyze_trade_opportunity(model, scaler, active_features, df, price_ch
                 abs(macd) > abs(signal) and  # Сильный MACD
                 adx > 15  # Тренд
             )
-            probability = 50 + (rsi - 50) + (macd * 5) + (adx / 3) if macd > 0 else 50 - (50 - rsi) - (macd * 5) - (adx / 3)
-            vwap_signal = 1.0 if df['close'].iloc[-1] > df['close'].mean() else -1.0
+            probability = predict_probability(model, scaler, active_features, df, coin_id, current_price * (1 - STOP_LOSS_PCT), abs(calculate_position_size(current_price, current_price * (1 - STOP_LOSS_PCT), 1000)[0]))
+            vwap_signal = calculate_vwap_signal(df).iloc[-1]
             sentiment = institutional_score
         
         smart_money_score = min(100, institutional_score + (volume_change / 5))
