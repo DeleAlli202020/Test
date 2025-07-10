@@ -63,12 +63,11 @@ DEFAULT_AUTO_INTERVAL = 300  # 5 минут
 
 
 # Конфигурационные параметры для торговых стратегий
-# Конфигурационные параметры для торговых стратегий
 ACTIVE_FEATURES = [
     'price_change_1h', 'price_change_2h', 'price_change_6h', 'volume_score',
     'volume_change', 'atr_normalized', 'rsi', 'macd', 'vwap_signal', 'obv',
     'adx', 'bb_upper', 'bb_lower', 'support_level', 'resistance_level',
-    'smart_money_score'  # Оставляем smart_money_score, так как он зависит от других признаков
+    'sentiment', 'smart_money_score'
 ]
 
 STOP_LOSS_PCT = 0.01  # 1% стоп-лосс
