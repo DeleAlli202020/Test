@@ -361,56 +361,66 @@ async def set_min_probability(update: Update, context: ContextTypes.DEFAULT_TYPE
         await notify_admin(f"Ошибка в /setminprobability: {e}")
 
 # Технические индикаторы
-def calculate_rsi(df, periods=14):
-    if df.empty or len(df) < periods:
-        logger.warning("calculate_rsi: Недостаточно данных")
+def calculate_rsi(df, period=14):
+    try:
+        if 'close' not in df.columns:
+            logger.warning("calculate_rsi: Столбец 'close' отсутствует")
+            return pd.Series(0, index=df.index)
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+        loss = -delta.where(delta < 0, 0).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.fillna(50)
+    except Exception as e:
+        logger.error(f"calculate_rsi: Ошибка: {str(e)}")
         return pd.Series(0, index=df.index)
-    delta = df['price'].diff()
-    gain = delta.where(delta > 0, 0).rolling(window=periods).mean()
-    loss = -delta.where(delta < 0, 0).rolling(window=periods).mean()
-    rs = gain / loss.where(loss != 0, 0.0001)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
 
 def calculate_macd(df, fast=12, slow=26):
-    if df.empty or len(df) < slow:
-        logger.warning("calculate_macd: Недостаточно данных")
+    try:
+        if 'close' not in df.columns:
+            logger.warning("calculate_macd: Столбец 'close' отсутствует")
+            return pd.Series(0, index=df.index)
+        ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
+        ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
+        macd = ema_fast - ema_slow
+        return macd.fillna(0)
+    except Exception as e:
+        logger.error(f"calculate_macd: Ошибка: {str(e)}")
         return pd.Series(0, index=df.index)
-    exp1 = df['price'].ewm(span=fast, adjust=False).mean()
-    exp2 = df['price'].ewm(span=slow, adjust=False).mean()
-    macd = (exp1 - exp2) / df['price'].iloc[-1] * 100 if not df.empty else 0
-    return macd.fillna(0)
 
-def calculate_adx(df, periods=14):
-    if df.empty or len(df) < periods:
-        logger.warning("calculate_adx: Недостаточно данных")
+def calculate_adx(df, period=14):
+    try:
+        if not all(col in df.columns for col in ['high', 'low', 'close']):
+            logger.warning("calculate_adx: Отсутствуют столбцы 'high', 'low', 'close'")
+            return pd.Series(0, index=df.index)
+        high_diff = df['high'].diff()
+        low_diff = df['low'].diff()
+        plus_dm = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0)
+        minus_dm = low_diff.where((low_diff > high_diff) & (low_diff > 0), 0)
+        tr = pd.concat([df['high'] - df['low'], 
+                        (df['high'] - df['close'].shift(1)).abs(), 
+                        (df['low'] - df['close'].shift(1)).abs()], axis=1).max(axis=1)
+        plus_di = 100 * plus_dm.rolling(window=period).mean() / tr.rolling(window=period).mean()
+        minus_di = 100 * minus_dm.rolling(window=period).mean() / tr.rolling(window=period).mean()
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+        adx = dx.rolling(window=period).mean()
+        return adx.fillna(0)
+    except Exception as e:
+        logger.error(f"calculate_adx: Ошибка: {str(e)}")
         return pd.Series(0, index=df.index)
-    high = df['high'].astype(float)
-    low = df['low'].astype(float)
-    close = df['price'].astype(float)
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.ewm(span=periods, adjust=False).mean()
-    plus_dm = high.diff()
-    minus_dm = -low.diff()
-    plus_dm[plus_dm < 0] = 0
-    minus_dm[minus_dm < 0] = 0
-    plus_di = 100 * (plus_dm.ewm(span=periods, adjust=False).mean() / atr)
-    minus_di = 100 * (minus_dm.ewm(span=periods, adjust=False).mean() / atr)
-    dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10))
-    adx = dx.ewm(span=periods, adjust=False).mean()
-    return adx.fillna(0)
 
 def calculate_obv(df):
-    if df.empty or len(df) < 2:
-        logger.warning("calculate_obv: Недостаточно данных")
+    try:
+        if not all(col in df.columns for col in ['close', 'volume']):
+            logger.warning("calculate_obv: Отсутствуют столбцы 'close', 'volume'")
+            return pd.Series(0, index=df.index)
+        direction = df['close'].diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+        obv = (direction * df['volume']).cumsum()
+        return obv.fillna(0)
+    except Exception as e:
+        logger.error(f"calculate_obv: Ошибка: {str(e)}")
         return pd.Series(0, index=df.index)
-    price_diff = df['price'].diff()
-    direction = np.sign(price_diff)
-    obv = (direction * df['volume']).cumsum()
-    return obv.fillna(0)
 
 def calculate_vwap(df):
     if df.empty:
@@ -421,23 +431,31 @@ def calculate_vwap(df):
     return vwap.fillna(0)
 
 def calculate_vwap_signal(df):
-    if df.empty:
-        logger.warning("calculate_vwap_signal: Недостаточно данных")
+    try:
+        if not all(col in df.columns for col in ['close', 'volume']):
+            logger.warning("calculate_vwap_signal: Отсутствуют столбцы 'close', 'volume'")
+            return pd.Series(0, index=df.index)
+        vwap = (df['close'] * df['volume']).cumsum() / df['volume'].cumsum()
+        vwap_signal = (df['close'] - vwap).apply(lambda x: 1 if x > 0 else -1 if x < 0 else 0)
+        return vwap_signal.fillna(0)
+    except Exception as e:
+        logger.error(f"calculate_vwap_signal: Ошибка: {str(e)}")
         return pd.Series(0, index=df.index)
-    vwap = calculate_vwap(df)
-    current_price = df['price']
-    return ((current_price - vwap) / vwap * 100).fillna(0)
 
-def calculate_bb_width(df, periods=20):
-    if df.empty or len(df) < periods:
-        logger.warning("calculate_bb_width: Недостаточно данных")
+def calculate_bb_width(df, window=20, num_std=2):
+    try:
+        if 'close' not in df.columns:
+            logger.warning("calculate_bb_width: Столбец 'close' отсутствует")
+            return pd.Series(0, index=df.index)
+        rolling_mean = df['close'].rolling(window=window).mean()
+        rolling_std = df['close'].rolling(window=window).std()
+        bb_upper = rolling_mean + (rolling_std * num_std)
+        bb_lower = rolling_mean - (rolling_std * num_std)
+        bb_width = (bb_upper - bb_lower) / rolling_mean
+        return bb_width.fillna(0)
+    except Exception as e:
+        logger.error(f"calculate_bb_width: Ошибка: {str(e)}")
         return pd.Series(0, index=df.index)
-    sma = df['price'].rolling(window=periods).mean()
-    std = df['price'].rolling(window=periods).std()
-    upper = sma + 2 * std
-    lower = sma - 2 * std
-    bb_width = (upper - lower) / sma
-    return bb_width.fillna(0)
 
 def calculate_atr_normalized(df, periods=14):
     if df.empty or len(df) < periods:
