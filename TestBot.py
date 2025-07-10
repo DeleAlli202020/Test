@@ -1868,7 +1868,7 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 take_profit_2 = current_price - 10 * atr
             
             # Вычисление вероятности моделью
-            probability = predict_probability(model, scaler, active_features, df, coin_id, stop_loss, abs(calculate_position_size(current_price, stop_loss, balance)[0]))
+            probability = await predict_probability(model, scaler, active_features, df, coin_id, stop_loss, abs(calculate_position_size(current_price, stop_loss, balance)[0]))
             if direction == 'SHORT':
                 display_probability = 100.0 - probability  # Для SHORT показываем вероятность успеха (падения)
             else:
