@@ -543,75 +543,68 @@ def prepare_training_data(df):
         if df.empty or len(df) < 48:
             logger.warning("prepare_training_data: Пустой или недостаточный датафрейм")
             return pd.DataFrame(columns=ACTIVE_FEATURES), np.array([])
+
         # Проверка наличия необходимых столбцов
         required_columns = ['price', 'volume', 'high', 'low', 'close']
         missing_columns = [col for col in required_columns if col not in df.columns]
         if missing_columns:
             logger.warning(f"prepare_training_data: Отсутствуют столбцы: {missing_columns}")
             return pd.DataFrame(columns=ACTIVE_FEATURES), np.array([])
-        
+
+        # Получение метрик из smart_money_analysis
+        coin_id = df['symbol'].iloc[0].replace('/USDT', '') if 'symbol' in df.columns else 'UNKNOWN'
+        volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score = smart_money_analysis(
+            df,
+            df['taker_buy_base'].iloc[-1] if 'taker_buy_base' in df.columns else 0.0,
+            df['volume'].iloc[-1] if 'volume' in df.columns else 0.0,
+            coin_id
+        )
+
         X = pd.DataFrame(index=df.index)
         X['price_change_1h'] = df['price'].pct_change(4) * 100
         X['price_change_2h'] = df['price'].pct_change(8) * 100
         X['price_change_6h'] = df['price'].pct_change(24) * 100
         X['volume_score'] = df['volume'] / df['volume'].rolling(window=6).mean() * 100
-        X['volume_change'] = df['volume'].pct_change() * 100
+        X['volume_change'] = volume_change
         X['atr_normalized'] = calculate_atr_normalized(df)
-        X['rsi'] = calculate_rsi(df)
-        X['macd'] = calculate_macd(df)
-        X['vwap_signal'] = calculate_vwap_signal(df)
-        X['obv'] = calculate_obv(df)
-        X['adx'] = calculate_adx(df)
+        X['rsi'] = rsi
+        X['macd'] = macd
+        X['vwap_signal'] = vwap_signal
+        X['obv'] = obv
+        X['adx'] = adx
         bb_upper, bb_lower, bb_width = calculate_bollinger_bands(df)
-        # Убедимся, что столбец 'price' существует
-        if 'price' not in df.columns:
-            logger.error("prepare_training_data: Столбец 'price' отсутствует в DataFrame")
-            return pd.DataFrame(columns=ACTIVE_FEATURES), np.array([])
         X['bb_upper'] = bb_upper / df['price']
         X['bb_lower'] = bb_lower / df['price']
         support, resistance = calculate_support_resistance(df)
         X['support_level'] = support / df['price']
         X['resistance_level'] = resistance / df['price']
+        X['institutional_score'] = institutional_score
+        X['smart_money_score'] = smart_money_score
+        X['sentiment'] = sentiment
+
         # Проверка на константные признаки
         for column in X.columns:
             if X[column].nunique() <= 1:
                 logger.warning(f"prepare_training_data: Признак {column} константный (уникальных значений: {X[column].nunique()})")
-                X[column] = X[column] + np.random.normal(0, 1e-6, X[column].shape)  # Добавляем небольшой шум
-        
-        # Проверка наличия всех признаков из ACTIVE_FEATURES
-        missing_features = [f for f in ACTIVE_FEATURES if f not in X.columns]
-        if missing_features:
-            logger.warning(f"prepare_training_data: Отсутствуют признаки: {missing_features}")
-            for feature in missing_features:
-                X[feature] = 0.0
-        
+                X[column] = X[column] + np.random.normal(0, 1e-6, X[column].shape)
+
         # Обработка пропусков
         X = X.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
-        
+
         # Создание целевой переменной
         price = df['price']
         future_prices = price.shift(-2)
         labels = ((future_prices - price) / price * 100 >= 0.5).astype(int)
-        
+
         # Удаляем последние две строки, чтобы синхронизировать с labels
-        X = X.iloc[:-2][ACTIVE_FEATURES].copy()  # Создаём копию для безопасности
+        X = X.iloc[:-2][ACTIVE_FEATURES].copy()
         labels = labels.iloc[:-2].copy()
-        
+
         logger.info(f"prepare_training_data: Сформирован DataFrame с {len(X)} строками, признаки: {X.columns.tolist()}")
         return X, labels
     except Exception as e:
         logger.error(f"prepare_training_data: Ошибка: {e}")
         return pd.DataFrame(columns=ACTIVE_FEATURES), np.array([])
-
-def calculate_bollinger_bands(df, window=20, window_dev=2):
-    if df.empty or len(df) < window:
-        return pd.Series(0, index=df.index), pd.Series(0, index=df.index), pd.Series(0, index=df.index)
-    sma = df['price'].rolling(window=window).mean()
-    std = df['price'].rolling(window=window).std()
-    upper = sma + window_dev * std
-    lower = sma - window_dev * std
-    width = (upper - lower) / sma
-    return upper.fillna(0), lower.fillna(0), width.fillna(0)
 
 # Дообучение модели
 async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
@@ -703,64 +696,55 @@ async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
 # Прогноз вероятности
 async def predict_probability(model, scaler, active_features, df, coin_id, stop_loss, position_size, direction='LONG'):
     try:
+        # Подготовка данных с использованием prepare_training_data
+        X, _ = prepare_training_data(df)
+        if X.empty:
+            logger.warning(f"predict_probability: Пустой DataFrame для {coin_id}")
+            return 0.0
+
         # Получение метрик из smart_money_analysis
         volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score = smart_money_analysis(
-            df, 
-            df['taker_buy_base'].iloc[-1] if 'taker_buy_base' in df.columns else 0.0, 
-            df['volume'].iloc[-1] if 'volume' in df.columns else 0.0, 
+            df,
+            df['taker_buy_base'].iloc[-1] if 'taker_buy_base' in df.columns else 0.0,
+            df['volume'].iloc[-1] if 'volume' in df.columns else 0.0,
             coin_id
         )
 
-        # Формирование списка признаков, соответствующих ACTIVE_FEATURES
-        feature_map = {
-            'volume_change': volume_change,
-            'institutional_score': institutional_score,
-            'vwap_signal': vwap_signal,
-            'sentiment': sentiment,
-            'rsi': rsi,
-            'macd': macd,
-            'adx': adx,
-            'obv': obv,
-            'smart_money_score': smart_money_score
-        }
+        # Добавление метрик из smart_money_analysis в X
+        X['institutional_score'] = institutional_score
+        X['smart_money_score'] = smart_money_score
+        X['sentiment'] = sentiment
+        X['vwap_signal'] = vwap_signal
 
-        # Фильтрация только тех признаков, которые есть в ACTIVE_FEATURES и feature_map
-        features = []
-        for feature in active_features:
-            if feature in feature_map and feature in ACTIVE_FEATURES:
-                features.append(feature_map[feature])
-            else:
-                logger.warning(f"predict_probability: Признак {feature} отсутствует в feature_map или ACTIVE_FEATURES, пропущен")
-                features.append(0.0)  # Заполняем нули для отсутствующих признаков
+        # Выбор последней строки и активных признаков
+        X_last = X.iloc[-1][active_features]
+        X_last_df = pd.DataFrame([X_last], columns=active_features)
 
-        # Логирование входных признаков
-        logger.info(f"predict_probability: coin_id={coin_id}, direction={direction}, features={features}")
-
-        # Проверка, что список признаков не пустой
-        if not features:
-            logger.error(f"predict_probability: Нет доступных признаков для coin_id={coin_id}")
-            await notify_admin(f"Ошибка в predict_probability: Нет доступных признаков для coin_id={coin_id}")
-            return 0.0
-
-        # Формирование массива для модели
-        X = np.array(features).reshape(1, -1)
-
-        # Масштабирование
-        X_scaled = scaler.transform(X)
+        # Масштабирование данных
+        X_last_scaled = pd.DataFrame(scaler.transform(X_last_df), columns=active_features)
 
         # Предсказание вероятности
-        probability = model.predict_proba(X_scaled)[0][1] * 100  # Вероятность положительного класса (успех)
+        probability = model.predict_proba(X_last_scaled)[0][1] * 100
+        base_probability = probability
+
+        # Корректировка вероятности с учётом rr_ratio
+        rr_ratio = 0.0
+        if stop_loss > 0 and position_size > 0:
+            current_price = df['price'].iloc[-1]
+            rr_ratio = (current_price - stop_loss) / position_size if direction == 'LONG' else (stop_loss - current_price) / abs(position_size)
+            rr_ratio = min(max(rr_ratio, -1.0), 3.0)
+        probability = min(probability * (1 + rr_ratio * 0.1), 95.0)
 
         # Инверсия вероятности для SHORT
         if direction == 'SHORT':
             probability = 100 - probability
 
-        logger.info(f"predict_probability: coin_id={coin_id}, direction={direction}, probability={probability:.1f}%")
+        logger.info(f"predict_probability: {coin_id}: base_probability={base_probability:.2f}%, скорректировано={probability:.2f}%")
         return max(0.0, min(100.0, probability))
 
     except Exception as e:
-        logger.error(f"predict_probability: Ошибка для coin_id={coin_id}: {str(e)}")
-        await notify_admin(f"Ошибка в predict_probability для coin_id={coin_id}: {str(e)}")
+        logger.error(f"predict_probability: Ошибка для {coin_id}: {str(e)}")
+        await notify_admin(f"Ошибка в predict_probability для {coin_id}: {str(e)}")
         return 0.0
 
 # Список криптовалют
