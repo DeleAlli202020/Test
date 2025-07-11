@@ -11,21 +11,25 @@ import logging
 import nest_asyncio
 import ccxt.async_support as ccxt
 import joblib
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import RobustScaler, StandardScaler
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import feedparser
 import lightgbm as lgb
 import json
 import matplotlib.pyplot as plt
 import sys
-from dotenv import load_dotenv # type: ignore
+from dotenv import load_dotenv
 import telegram
-from sklearn.preprocessing import StandardScaler
-
+from ta.volatility import BollingerBands
+from ta.momentum import RSIIndicator, MACD
+from ta.trend import ADXIndicator
+from ta.volume import OnBalanceVolumeIndicator
+from sklearn.metrics import log_loss
+from threading import Lock
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.WARNING,  # Изменяем уровень на WARNING
+    level=logging.WARNING,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     handlers=[
         logging.FileHandler('bot_prehost.txt', encoding='utf-8'),
@@ -33,7 +37,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-# Установка кодировки UTF-8 для вывода в консоль
 sys.stdout.reconfigure(encoding='utf-8')
 
 # Применение nest_asyncio
@@ -41,8 +44,7 @@ nest_asyncio.apply()
 
 # Конфигурация
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-load_dotenv(os.path.join(BASE_DIR, 'token.env')) 
+load_dotenv(os.path.join(BASE_DIR, 'token.env'))
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', 0))
 ALLOWED_USERS_PATH = os.path.join(BASE_DIR, 'allowed_users.json')
@@ -61,22 +63,18 @@ RETRY_DELAY = 5
 CACHE_TTL = 3600  # 1 час
 DEFAULT_AUTO_INTERVAL = 300  # 5 минут
 
-
-# Конфигурационные параметры для торговых стратегий
 # Конфигурационные параметры для торговых стратегий
 ACTIVE_FEATURES = [
     'price_change_1h', 'price_change_2h', 'price_change_6h', 'volume_score',
     'volume_change', 'atr_normalized', 'rsi', 'macd', 'vwap_signal', 'obv',
-    'adx', 'bb_upper', 'bb_lower', 'support_level', 'resistance_level',
-    'sentiment', 'smart_money_score'
+    'adx', 'bb_upper', 'bb_lower', 'support_level', 'resistance_level'
 ]
-
-STOP_LOSS_PCT = 0.01  # 1% стоп-лосс
-TAKE_PROFIT_1_PCT = 0.03  # 3% для первого тейк-профита
-TAKE_PROFIT_2_PCT = 0.05  # 5% для второго тейк-профита
-PRICE_THRESHOLD = 0.5  # Порог изменения цены в процентах
-VOLUME_THRESHOLD = 5.0  # Порог изменения объёма в процентах
-RSI_THRESHOLD = 40.0  # Порог RSI
+STOP_LOSS_PCT = 0.01
+TAKE_PROFIT_1_PCT = 0.03
+TAKE_PROFIT_2_PCT = 0.05
+PRICE_THRESHOLD = 0.5
+VOLUME_THRESHOLD = 5.0
+RSI_THRESHOLD = 40.0
 
 # Список криптовалют
 CRYPTO_PAIRS = [
@@ -103,7 +101,7 @@ class Trade(Base):
     sentiment_score = Column(Float)
     trader_level = Column(String)
     timestamp = Column(DateTime, default=datetime.utcnow)
-    result = Column(String, nullable=True)  # None, 'SL', 'TP1', 'TP2'
+    result = Column(String, nullable=True)
 
 class TradeMetrics(Base):
     __tablename__ = 'trade_metrics'
@@ -129,52 +127,232 @@ engine = create_engine('sqlite:///trades.db')
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
-# Инициализация биржи
-exchange = ccxt.binance({'enableRateLimit': True})
+# Класс TradingModel
+class TradingModel:
+    def __init__(self):
+        self.exchange = ccxt.binance({'enableRateLimit': True})
+        self.models = {}
+        self.scalers = {}
+        self.active_features = []
+        self.load_model()
 
+    def load_model(self):
+        try:
+            if os.path.exists(MODEL_PATH):
+                model_data = joblib.load(MODEL_PATH)
+                self.models = model_data.get('models', {})
+                self.scalers = model_data.get('scalers', {})
+                self.active_features = joblib.load(FEATURES_PATH) if os.path.exists(FEATURES_PATH) else ACTIVE_FEATURES
+                logger.info("Модель и скейлеры успешно загружены")
+            else:
+                logger.warning("Файл модели не найден")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки модели: {e}")
+            asyncio.create_task(notify_admin(f"Ошибка загрузки модели: {e}"))
+
+    def save_model(self):
+        try:
+            joblib.dump({'models': self.models, 'scalers': self.scalers}, MODEL_PATH)
+            joblib.dump(self.active_features, FEATURES_PATH)
+            logger.info("Модель и скейлеры сохранены")
+        except Exception as e:
+            logger.error(f"save_model: Не удалось сохранить модель: {e}")
+            asyncio.create_task(notify_admin(f"Не удалось сохранить модель: {e}"))
+
+    async def get_historical_data(self, symbol, timeframe='15m', limit=1000):
+        cache_file = os.path.join(DATA_CACHE_PATH, f"{symbol.replace('/', '_')}_{timeframe}_historical.pkl")
+        if os.path.exists(cache_file):
+            try:
+                cache_mtime = os.path.getmtime(cache_file)
+                if (datetime.utcnow().timestamp() - cache_mtime) < CACHE_TTL:
+                    df = pd.read_pickle(cache_file)
+                    logger.info(f"get_historical_data: Кэш для {symbol}: {len(df)} записей")
+                    return df
+            except Exception as e:
+                logger.error(f"get_historical_data: Ошибка чтения кэша для {symbol}: {e}")
+                await notify_admin(f"Ошибка чтения кэша для {symbol}: {e}")
+
+        attempt = 0
+        while attempt < MAX_RETRIES:
+            try:
+                markets = await self.exchange.load_markets()
+                if symbol not in markets:
+                    logger.warning(f"get_historical_data: Пара {symbol} не найдена")
+                    return pd.DataFrame()
+                since = int((datetime.utcnow() - timedelta(days=30)).timestamp() * 1000)
+                all_ohlcv = []
+                while len(all_ohlcv) < limit:
+                    ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=min(limit, 1000))
+                    if not ohlcv:
+                        break
+                    all_ohlcv.extend(ohlcv)
+                    since = ohlcv[-1][0] + 1
+                    await asyncio.sleep(0.1)
+                if all_ohlcv:
+                    df = pd.DataFrame(all_ohlcv[:limit], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df['price'] = df['close'].astype(float)
+                    df['taker_buy_base'] = df['volume'].astype(float) * 0.5
+                    df['symbol'] = symbol
+                    os.makedirs(DATA_CACHE_PATH, exist_ok=True)
+                    df.to_pickle(cache_file)
+                    logger.info(f"get_historical_data: Получено {len(df)} записей для {symbol}")
+                    return df
+                break
+            except Exception as e:
+                attempt += 1
+                logger.error(f"get_historical_data: Попытка {attempt}/{MAX_RETRIES} не удалась для {symbol}: {e}")
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(RETRY_DELAY)
+                else:
+                    await notify_admin(f"Не удалось получить данные для {symbol}: {e}")
+            finally:
+                await self.exchange.close()
+        logger.warning(f"get_historical_data: Не удалось получить данные для {symbol}")
+        return pd.DataFrame()
+
+    def calculate_indicators(self, df):
+        if df.empty or len(df) < 14:
+            logger.warning("calculate_indicators: Недостаточно данных")
+            return df
+        try:
+            # Волатильность
+            bb = BollingerBands(close=df['price'], window=20, window_dev=2)
+            df['bb_upper'] = bb.bollinger_hband()
+            df['bb_lower'] = bb.bollinger_lband()
+            df['bb_width'] = bb.bollinger_wband()
+
+            # Моментум
+            df['rsi'] = RSIIndicator(close=df['price'], window=14).rsi()
+            macd = MACD(close=df['price'], window_slow=26, window_fast=12, window_sign=9)
+            df['macd'] = macd.macd()
+            df['macd_signal'] = macd.macd_signal()
+
+            # Тренд
+            df['adx'] = ADXIndicator(high=df['high'], low=df['low'], close=df['price'], window=14).adx()
+
+            # Объем
+            df['obv'] = OnBalanceVolumeIndicator(close=df['price'], volume=df['volume']).on_balance_volume()
+
+            # Прочие признаки
+            df['price_change_1h'] = df['price'].pct_change(4) * 100
+            df['price_change_2h'] = df['price'].pct_change(8) * 100
+            df['price_change_6h'] = df['price'].pct_change(24) * 100
+            df['volume_score'] = df['volume'] / df['volume'].rolling(window=6).mean() * 100
+            df['volume_change'] = df['volume'].pct_change() * 100
+            df['atr_normalized'] = (df['high'] - df['low']) / df['price'] * 100
+
+            # Уровни поддержки и сопротивления
+            df['support_level'] = df['low'].rolling(window=20).min() / df['price']
+            df['resistance_level'] = df['high'].rolling(window=20).max() / df['price']
+
+            return df.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
+        except Exception as e:
+            logger.error(f"calculate_indicators: Ошибка: {e}")
+            return df
+
+    async def predict_probability(self, symbol, direction='LONG', stop_loss=None, position_size=0):
+        try:
+            df = await self.get_historical_data(symbol)
+            if df.empty:
+                logger.warning(f"predict_probability: Пустой DataFrame для {symbol}")
+                return 0.0
+            df = self.calculate_indicators(df)
+            model = self.models.get('combined')
+            scaler = self.scalers.get('combined')
+            if not model or not scaler:
+                logger.error(f"predict_probability: Модель или скейлер не загружены для {symbol}")
+                return 0.0
+            features = df[self.active_features].iloc[-1:].values
+            features_scaled = scaler.transform(features)
+            probability = model.predict_proba(features_scaled)[0][1] * 100
+            if direction == 'SHORT':
+                probability = 100 - probability
+            logger.info(f"predict_probability: {symbol}, direction={direction}, probability={probability:.1f}%")
+            return max(0.0, min(100.0, probability))
+        except Exception as e:
+            logger.error(f"predict_probability: Ошибка для {symbol}: {e}")
+            return 0.0
+
+    async def analyze_symbol(self, symbol, coin_id, price_change_1h, taker_buy_base, volume, balance):
+        try:
+            df = await self.get_historical_data(symbol)
+            if df.empty:
+                logger.warning(f"analyze_symbol: Пустой DataFrame для {symbol}")
+                return None
+            df = self.calculate_indicators(df)
+            current_price = df['price'].iloc[-1]
+            atr = df['atr_normalized'].iloc[-1] * current_price
+            stop_loss_long = current_price - max(2 * atr, current_price * STOP_LOSS_PCT)
+            take_profit_1_long = current_price + 6 * atr
+            take_profit_2_long = current_price + 10 * atr
+            stop_loss_short = current_price + max(2 * atr, current_price * STOP_LOSS_PCT)
+            take_profit_1_short = current_price - 6 * atr
+            take_profit_2_short = current_price - 10 * atr
+            long_prob = await self.predict_probability(symbol, 'LONG', stop_loss_long, abs(calculate_position_size(current_price, stop_loss_long, balance)[0]))
+            short_prob = await self.predict_probability(symbol, 'SHORT', stop_loss_short, abs(calculate_position_size(current_price, stop_loss_short, balance)[0]))
+            institutional_score = taker_buy_base / volume * 100 if volume > 0 else 50.0
+            vwap_signal = (current_price - df['price'].rolling(window=20).mean().iloc[-1]) / df['price'].rolling(window=20).mean().iloc[-1] * 100
+            sentiment = get_news_sentiment(coin_id)
+            return {
+                'symbol': symbol,
+                'coin_id': coin_id,
+                'price': current_price,
+                'price_change': price_change_1h,
+                'volume_change': ((df['volume'].iloc[-1] - df['volume'].iloc[-2]) / df['volume'].iloc[-2] * 100) if len(df) >= 2 else 0.0,
+                'institutional_score': institutional_score,
+                'vwap_signal': vwap_signal,
+                'sentiment': sentiment,
+                'rsi': df['rsi'].iloc[-1],
+                'macd': df['macd'].iloc[-1],
+                'adx': df['adx'].iloc[-1],
+                'obv': df['obv'].iloc[-1],
+                'long_prob': long_prob,
+                'short_prob': short_prob,
+                'stop_loss_long': stop_loss_long,
+                'take_profit_1_long': take_profit_1_long,
+                'take_profit_2_long': take_profit_2_long,
+                'stop_loss_short': stop_loss_short,
+                'take_profit_1_short': take_profit_1_short,
+                'take_profit_2_short': take_profit_2_short,
+                'df': df
+            }
+        except Exception as e:
+            logger.error(f"analyze_symbol: Ошибка для {symbol}: {e}")
+            return None
+
+# Инициализация модели
+trading_model = TradingModel()
+
+# Управление файлами
 def ensure_files_exist():
-    """Проверяет и создаёт необходимые файлы и директории."""
-    # Создание папки data_cache
     if not os.path.exists(DATA_CACHE_PATH):
         os.makedirs(DATA_CACHE_PATH)
         logger.info(f"Создана директория: {DATA_CACHE_PATH}")
-
-    # Создание allowed_users.json
     if not os.path.exists(ALLOWED_USERS_PATH):
         with open(ALLOWED_USERS_PATH, 'w', encoding='utf-8') as f:
-            json.dump([123456789], f)  # Добавляем ADMIN_ID по умолчанию
+            json.dump([ADMIN_ID], f)
         logger.info(f"Создан файл: {ALLOWED_USERS_PATH}")
-
-    # Создание settings.json
     if not os.path.exists(SETTINGS_PATH):
-        default_settings = {
-            "123456789": {
-                "auto_trade": False,
-                "interval": 300,
-                "risk_level": "low"
-            }
-        }
+        default_settings = {str(ADMIN_ID): {"auto_trade": False, "interval": 300, "risk_level": "low"}}
         with open(SETTINGS_PATH, 'w', encoding='utf-8') as f:
             json.dump(default_settings, f, indent=4)
         logger.info(f"Создан файл: {SETTINGS_PATH}")
 
-# Управление настройками
 def load_settings():
-    """Загружает настройки пользователей."""
     ensure_files_exist()
     with open(SETTINGS_PATH, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 def save_settings(settings):
     try:
-        with open(SETTINGS_PATH, 'w') as f:
+        with open(SETTINGS_PATH, 'w', encoding='utf-8') as f:
             json.dump(settings, f, indent=2)
         logger.info("save_settings: Настройки сохранены")
     except Exception as e:
         logger.error(f"save_settings: Ошибка сохранения: {e}")
 
 def get_user_settings(user_id: int) -> dict:
-    """Получает настройки пользователя из JSON-файла."""
     try:
         settings_file = os.path.join(BASE_DIR, 'settings.json')
         default = {
@@ -183,7 +361,8 @@ def get_user_settings(user_id: int) -> dict:
             'rsi_threshold': 40,
             'use_rsi': True,
             'auto_interval': DEFAULT_AUTO_INTERVAL,
-            'balance': 1000  # Начальный баланс по умолчанию
+            'balance': 1000,
+            'min_probability': 60.0
         }
         if os.path.exists(settings_file):
             with open(settings_file, 'r', encoding='utf-8') as f:
@@ -192,7 +371,6 @@ def get_user_settings(user_id: int) -> dict:
             merged = {**default, **user_settings}
             logger.info(f"get_user_settings: Загружены настройки для user_id={user_id}, balance={merged.get('balance', 'не указан')}")
             return merged
-        logger.info(f"get_user_settings: Файл не существует, возвращены настройки по умолчанию для user_id={user_id}")
         return default
     except Exception as e:
         logger.error(f"get_user_settings: Ошибка для user_id={user_id}: {e}")
@@ -200,7 +378,6 @@ def get_user_settings(user_id: int) -> dict:
         return default
 
 def save_user_settings(user_id: int, settings: dict):
-    """Сохраняет настройки пользователя в JSON-файл."""
     try:
         settings_file = os.path.join(BASE_DIR, 'settings.json')
         all_settings = {}
@@ -210,7 +387,6 @@ def save_user_settings(user_id: int, settings: dict):
                     all_settings = json.load(f)
             except json.JSONDecodeError as e:
                 logger.error(f"save_user_settings: Ошибка чтения JSON для user_id={user_id}: {e}")
-                all_settings = {}
         all_settings[str(user_id)] = settings
         with open(settings_file, 'w', encoding='utf-8') as f:
             json.dump(all_settings, f, indent=4, ensure_ascii=False)
@@ -219,46 +395,14 @@ def save_user_settings(user_id: int, settings: dict):
         logger.error(f"save_user_settings: Ошибка для user_id={user_id}: {e}")
         asyncio.create_task(notify_admin(f"Ошибка в save_user_settings для user_id={user_id}: {e}"))
 
-# Загрузка модели
-def load_model():
-    if os.path.exists(MODEL_PATH):
-        try:
-            data = joblib.load(MODEL_PATH)
-            models = data.get('models', {})
-            scalers = data.get('scalers', {})
-            active_features = joblib.load(FEATURES_PATH) if os.path.exists(FEATURES_PATH) else []
-            model = models.get('combined')
-            scaler = scalers.get('combined')
-            if model and scaler and active_features:
-                logger.info("load_model: Модель и скейлер загружены")
-                return model, scaler, active_features
-            logger.warning("load_model: Неполные данные модели")
-        except Exception as e:
-            logger.error(f"load_model: Не удалось загрузить модель: {e}")
-            asyncio.run(notify_admin(f"Не удалось загрузить модель: {e}"))
-    logger.warning("load_model: Модель не найдена")
-    return None, None, []
-
-# Сохранение модели
-def save_model(model, scaler, active_features):
-    try:
-        joblib.dump({'models': {'combined': model}, 'scalers': {'combined': scaler}}, MODEL_PATH)
-        joblib.dump(active_features, FEATURES_PATH)
-        logger.info("save_model: Модель и скейлер сохранены")
-    except Exception as e:
-        logger.error(f"save_model: Не удалось сохранить модель: {e}")
-        asyncio.run(notify_admin(f"Не удалось сохранить модель: {e}"))
-
-# Управление пользователями
 def load_allowed_users():
-    """Загружает список разрешённых пользователей."""
     ensure_files_exist()
     with open(ALLOWED_USERS_PATH, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 def save_allowed_users(users):
     try:
-        with open(ALLOWED_USERS_PATH, 'w') as f:
+        with open(ALLOWED_USERS_PATH, 'w', encoding='utf-8') as f:
             json.dump(users, f)
         logger.info("save_allowed_users: Список пользователей сохранён")
     except Exception as e:
@@ -267,7 +411,6 @@ def save_allowed_users(users):
 def is_authorized(user_id):
     return user_id in load_allowed_users()
 
-# Уведомления админу
 async def notify_admin(message):
     try:
         bot = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -275,213 +418,6 @@ async def notify_admin(message):
     except Exception as e:
         logger.error(f"notify_admin: Не удалось отправить уведомление: {e}")
 
-# Получение исторических данных
-async def get_historical_data(symbol, timeframe='15m', limit=1000):
-    cache_file = os.path.join(DATA_CACHE_PATH, f"{symbol.replace('/', '_')}_{timeframe}_historical.pkl")
-    if os.path.exists(cache_file):
-        try:
-            cache_mtime = os.path.getmtime(cache_file)
-            if (datetime.utcnow().timestamp() - cache_mtime) < CACHE_TTL:
-                df = pd.read_pickle(cache_file)
-                logger.info(f"get_historical_data: Кэш для {symbol}: {len(df)} записей")
-                return df
-        except Exception as e:
-            logger.error(f"get_historical_data: Ошибка чтения кэша для {symbol}: {e}")
-            await notify_admin(f"Ошибка чтения кэша для {symbol}: {e}")
-
-    attempt = 0
-    while attempt < MAX_RETRIES:
-        try:
-            markets = await exchange.load_markets()
-            if symbol not in markets:
-                logger.warning(f"get_historical_data: Пара {symbol} не найдена")
-                return pd.DataFrame()
-            since = int((datetime.utcnow() - timedelta(days=30)).timestamp() * 1000)
-            all_ohlcv = []
-            while len(all_ohlcv) < limit:
-                ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=min(limit, 1000))
-                if not ohlcv:
-                    break
-                all_ohlcv.extend(ohlcv)
-                since = ohlcv[-1][0] + 1
-                await asyncio.sleep(0.1)
-            if all_ohlcv:
-                df = pd.DataFrame(all_ohlcv[:limit], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                df['price'] = df['close'].astype(float)
-                df['taker_buy_base'] = df['volume'].astype(float) * 0.5
-                df['symbol'] = symbol
-                os.makedirs(DATA_CACHE_PATH, exist_ok=True)
-                df.to_pickle(cache_file)
-                logger.info(f"get_historical_data: Получено {len(df)} записей для {symbol}")
-                return df
-            break
-        except Exception as e:
-            attempt += 1
-            logger.error(f"get_historical_data: Попытка {attempt}/{MAX_RETRIES} не удалась для {symbol}: {e}")
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(RETRY_DELAY)
-            else:
-                await notify_admin(f"Не удалось получить данные для {symbol}: {e}")
-        finally:
-            await exchange.close()
-    logger.warning(f"get_historical_data: Не удалось получить данные для {symbol}")
-    return pd.DataFrame()
-
-async def set_min_probability(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_authorized(user_id):
-        await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
-        return
-    args = context.args
-    settings = load_settings()
-    user_settings = get_user_settings(user_id)
-    user_id_str = str(user_id)
-    try:
-        if not args:
-            min_probability = user_settings.get('min_probability', 60.0)
-            message = (
-                f"⚙️ **Текущая минимальная вероятность**: {min_probability}%\n"
-                f"Используйте: `/setminprobability <процент>`\n"
-                f"Пример: `/setminprobability 60`"
-            )
-            await update.message.reply_text(message, parse_mode='Markdown')
-            return
-        min_probability = float(args[0])
-        if min_probability < 0 or min_probability > 100:
-            await update.message.reply_text("🚫 **Вероятность должна быть от 0 до 100%.**", parse_mode='Markdown')
-            return
-        user_settings['min_probability'] = min_probability
-        settings[user_id_str] = user_settings
-        save_settings(settings)
-        await update.message.reply_text(f"✅ **Минимальная вероятность установлена**: {min_probability}%", parse_mode='Markdown')
-        logger.info(f"set_min_probability: Пользователь {user_id} установил минимальную вероятность: {min_probability}%")
-    except Exception as e:
-        logger.error(f"set_min_probability: Ошибка: {e}")
-        await update.message.reply_text(f"🚨 **Ошибка**: {e}\nФормат: `/setminprobability <процент>`", parse_mode='Markdown')
-        await notify_admin(f"Ошибка в /setminprobability: {e}")
-
-# Технические индикаторы
-def calculate_rsi(df, period=14):
-    try:
-        if 'close' not in df.columns:
-            logger.warning("calculate_rsi: Столбец 'close' отсутствует")
-            return pd.Series(0, index=df.index)
-        delta = df['close'].diff()
-        gain = delta.where(delta > 0, 0).rolling(window=period).mean()
-        loss = -delta.where(delta < 0, 0).rolling(window=period).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi.fillna(50)
-    except Exception as e:
-        logger.error(f"calculate_rsi: Ошибка: {str(e)}")
-        return pd.Series(0, index=df.index)
-
-def calculate_macd(df, fast=12, slow=26):
-    try:
-        if 'close' not in df.columns:
-            logger.warning("calculate_macd: Столбец 'close' отсутствует")
-            return pd.Series(0, index=df.index)
-        ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
-        ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
-        macd = ema_fast - ema_slow
-        return macd.fillna(0)
-    except Exception as e:
-        logger.error(f"calculate_macd: Ошибка: {str(e)}")
-        return pd.Series(0, index=df.index)
-
-def calculate_adx(df, period=14):
-    try:
-        if not all(col in df.columns for col in ['high', 'low', 'close']):
-            logger.warning("calculate_adx: Отсутствуют столбцы 'high', 'low', 'close'")
-            return pd.Series(0, index=df.index)
-        high_diff = df['high'].diff()
-        low_diff = df['low'].diff()
-        plus_dm = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0)
-        minus_dm = low_diff.where((low_diff > high_diff) & (low_diff > 0), 0)
-        tr = pd.concat([df['high'] - df['low'], 
-                        (df['high'] - df['close'].shift(1)).abs(), 
-                        (df['low'] - df['close'].shift(1)).abs()], axis=1).max(axis=1)
-        plus_di = 100 * plus_dm.rolling(window=period).mean() / tr.rolling(window=period).mean()
-        minus_di = 100 * minus_dm.rolling(window=period).mean() / tr.rolling(window=period).mean()
-        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-        adx = dx.rolling(window=period).mean()
-        return adx.fillna(0)
-    except Exception as e:
-        logger.error(f"calculate_adx: Ошибка: {str(e)}")
-        return pd.Series(0, index=df.index)
-
-def calculate_obv(df):
-    try:
-        if not all(col in df.columns for col in ['close', 'volume']):
-            logger.warning("calculate_obv: Отсутствуют столбцы 'close', 'volume'")
-            return pd.Series(0, index=df.index)
-        direction = df['close'].diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
-        obv = (direction * df['volume']).cumsum()
-        return obv.fillna(0)
-    except Exception as e:
-        logger.error(f"calculate_obv: Ошибка: {str(e)}")
-        return pd.Series(0, index=df.index)
-
-def calculate_vwap(df):
-    if df.empty:
-        logger.warning("calculate_vwap: Недостаточно данных")
-        return pd.Series(0, index=df.index)
-    typical_price = (df['high'].astype(float) + df['low'].astype(float) + df['price'].astype(float)) / 3
-    vwap = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
-    return vwap.fillna(0)
-
-def calculate_vwap_signal(df):
-    try:
-        if not all(col in df.columns for col in ['close', 'volume']):
-            logger.warning("calculate_vwap_signal: Отсутствуют столбцы 'close', 'volume'")
-            return pd.Series(0, index=df.index)
-        vwap = (df['close'] * df['volume']).cumsum() / df['volume'].cumsum()
-        vwap_signal = (df['close'] - vwap).apply(lambda x: 1 if x > 0 else -1 if x < 0 else 0)
-        return vwap_signal.fillna(0)
-    except Exception as e:
-        logger.error(f"calculate_vwap_signal: Ошибка: {str(e)}")
-        return pd.Series(0, index=df.index)
-
-def calculate_bb_width(df, window=20, num_std=2):
-    try:
-        if 'close' not in df.columns:
-            logger.warning("calculate_bb_width: Столбец 'close' отсутствует")
-            return pd.Series(0, index=df.index)
-        rolling_mean = df['close'].rolling(window=window).mean()
-        rolling_std = df['close'].rolling(window=window).std()
-        bb_upper = rolling_mean + (rolling_std * num_std)
-        bb_lower = rolling_mean - (rolling_std * num_std)
-        bb_width = (bb_upper - bb_lower) / rolling_mean
-        return bb_width.fillna(0)
-    except Exception as e:
-        logger.error(f"calculate_bb_width: Ошибка: {str(e)}")
-        return pd.Series(0, index=df.index)
-
-def calculate_atr_normalized(df, periods=14):
-    if df.empty or len(df) < periods:
-        logger.warning("calculate_atr_normalized: Недостаточно данных")
-        return pd.Series(0, index=df.index)
-    high = df['high'].astype(float)
-    low = df['low'].astype(float)
-    close = df['price'].astype(float)
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.ewm(span=periods, adjust=False).mean()
-    price = df['price']
-    return (atr / price).fillna(0)
-
-def calculate_support_resistance(df, window=20):
-    if df.empty or len(df) < window:
-        logger.warning("calculate_support_resistance: Недостаточно данных")
-        return pd.Series(0, index=df.index), pd.Series(0, index=df.index)
-    support = df['low'].rolling(window=window).min()
-    resistance = df['high'].rolling(window=window).max()
-    return support.fillna(df['price'].min()), resistance.fillna(df['price'].max())
-
-# Анализ новостей
 def get_news_sentiment(coin_id):
     cache_key = f"{coin_id}_{datetime.utcnow().strftime('%Y%m%d%H')}"
     if cache_key in SENTIMENT_CACHE:
@@ -517,12 +453,10 @@ def get_news_sentiment(coin_id):
         logger.error(f"get_news_sentiment: Ошибка для {coin_id}: {e}")
         return 0
 
-# Текущая цена
 async def get_current_price(symbol):
     try:
-        # Нормализуем символ для Binance API (например, ETH/USDT -> ETHUSDT)
         binance_symbol = symbol.replace('/', '')
-        ticker = await exchange.fetch_ticker(binance_symbol)
+        ticker = await trading_model.exchange.fetch_ticker(binance_symbol)
         current_price = float(ticker['last'])
         logger.info(f"get_current_price: Цена для {symbol}: ${current_price:.6f}")
         return current_price
@@ -530,406 +464,18 @@ async def get_current_price(symbol):
         logger.error(f"get_current_price: Ошибка для {symbol}: {e}")
         await notify_admin(f"Ошибка получения цены для {symbol}: {e}")
         return 0.0
-    
-from sklearn.metrics import log_loss
 
-def pnl_loss(y_true, y_pred_proba, trade_results, pnls=None):
-    """
-    Кастомная функция потерь для классификации, учитывающая результат сделки и PnL.
-    
-    Parameters:
-    - y_true: истинные метки (1 для роста цены, 0 для падения).
-    - y_pred_proba: предсказанные вероятности (из model.predict_proba).
-    - trade_results: список результатов сделок ('SL', 'TP1', 'TP2', None).
-    - pnls: список значений PnL (опционально, для весов пропорциональных прибыли/убытку).
-    
-    Returns:
-    - loss: взвешенная логарифмическая потеря.
-    """
-    weights = []
-    for i, result in enumerate(trade_results):
-        if result == 'SL':
-            weight = 2.0 * abs(pnls[i]) if pnls and pnls[i] is not None else 2.0
-            weights.append(weight)  # Усиленный штраф за убыточные сделки
-        elif result in ['TP1', 'TP2']:
-            weight = 0.5 * abs(pnls[i]) if pnls and pnls[i] is not None else 0.5
-            weights.append(weight)  # Меньший штраф для прибыльных сделок
-        else:
-            weights.append(1.0)  # Нейтральный вес для неизвестных результатов
-    return log_loss(y_true, y_pred_proba, sample_weight=weights)
-
-def calculate_bollinger_bands(df, window=20, num_std=2):
-    try:
-        if 'close' not in df.columns:
-            logger.warning("calculate_bollinger_bands: Столбец 'close' отсутствует в DataFrame")
-            return pd.Series(0, index=df.index), pd.Series(0, index=df.index), pd.Series(0, index=df.index)
-
-        rolling_mean = df['close'].rolling(window=window).mean()
-        rolling_std = df['close'].rolling(window=window).std()
-        
-        bb_upper = rolling_mean + (rolling_std * num_std)
-        bb_lower = rolling_mean - (rolling_std * num_std)
-        bb_width = (bb_upper - bb_lower) / rolling_mean
-
-        # Заполнение NaN
-        bb_upper = bb_upper.fillna(0)
-        bb_lower = bb_lower.fillna(0)
-        bb_width = bb_width.fillna(0)
-
-        return bb_upper, bb_lower, bb_width
-    except Exception as e:
-        logger.error(f"calculate_bollinger_bands: Ошибка: {e}")
-        return pd.Series(0, index=df.index), pd.Series(0, index=df.index), pd.Series(0, index=df.index)
-
-def calculate_support_resistance(df, window=20):
-    try:
-        if 'low' not in df.columns or 'high' not in df.columns:
-            logger.warning("calculate_support_resistance: Столбцы 'low' или 'high' отсутствуют в DataFrame")
-            return pd.Series(0, index=df.index), pd.Series(0, index=df.index)
-
-        support = df['low'].rolling(window=window).min()
-        resistance = df['high'].rolling(window=window).max()
-
-        # Заполнение NaN
-        support = support.fillna(df['low'].iloc[0] if len(df) > 0 else 0)
-        resistance = resistance.fillna(df['high'].iloc[0] if len(df) > 0 else 0)
-
-        return support, resistance
-    except Exception as e:
-        logger.error(f"calculate_support_resistance: Ошибка: {e}")
-        return pd.Series(0, index=df.index), pd.Series(0, index=df.index)
-
-def calculate_atr_normalized(df, window=14):
-    try:
-        if not all(col in df.columns for col in ['high', 'low', 'close']):
-            logger.warning("calculate_atr_normalized: Отсутствуют необходимые столбцы 'high', 'low', 'close'")
-            return pd.Series(0, index=df.index)
-
-        high_low = df['high'] - df['low']
-        high_close = (df['high'] - df['close'].shift(1)).abs()
-        low_close = (df['low'] - df['close'].shift(1)).abs()
-        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-        atr = tr.rolling(window=window).mean()
-        atr_normalized = atr / df['close']
-
-        # Заполнение NaN
-        atr_normalized = atr_normalized.fillna(0)
-
-        return atr_normalized
-    except Exception as e:
-        logger.error(f"calculate_atr_normalized: Ошибка: {e}")
-        return pd.Series(0, index=df.index)
-
-# Подготовка данных для дообучения
-def prepare_training_data(df):
-    try:
-        if df.empty or len(df) < 48:
-            logger.warning(f"prepare_training_data: Пустой или недостаточный датафрейм, строк: {len(df)}")
-            return pd.DataFrame(columns=ACTIVE_FEATURES), np.array([])
-
-        # Проверка наличия необходимых столбцов
-        required_columns = ['price', 'volume', 'high', 'low', 'close']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        if missing_columns:
-            logger.warning(f"prepare_training_data: Отсутствуют столбцы: {missing_columns}")
-            return pd.DataFrame(columns=ACTIVE_FEATURES), np.array([])
-
-        # Логирование структуры DataFrame
-        logger.info(f"prepare_training_data: df_shape={df.shape}, df_columns={df.columns.tolist() if not df.empty else 'empty'}")
-        logger.info(f"prepare_training_data: df_head=\n{df.head(5).to_dict()}")
-
-        # Получение метрик из smart_money_analysis
-        coin_id = df['symbol'].iloc[0].replace('/USDT', '') if 'symbol' in df.columns else 'UNKNOWN'
-        volume_change, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score = smart_money_analysis(
-            df,
-            0.0,  # taker_buy_volume не используется
-            df['volume'].iloc[-1] if 'volume' in df.columns else 0.0,
-            coin_id
-        )
-
-        X = pd.DataFrame(index=df.index)
-        X['price_change_1h'] = df['price'].pct_change(4) * 100
-        X['price_change_2h'] = df['price'].pct_change(8) * 100
-        X['price_change_6h'] = df['price'].pct_change(24) * 100
-        X['volume_score'] = df['volume'] / df['volume'].rolling(window=6).mean() * 100
-        X['volume_change'] = volume_change
-        X['atr_normalized'] = calculate_atr_normalized(df)
-        X['rsi'] = rsi
-        X['macd'] = macd
-        X['vwap_signal'] = vwap_signal
-        X['obv'] = obv
-        X['adx'] = adx
-        bb_upper, bb_lower, _ = calculate_bollinger_bands(df)
-        X['bb_upper'] = bb_upper / df['price']
-        X['bb_lower'] = bb_lower / df['price']
-        support, resistance = calculate_support_resistance(df)
-        X['support_level'] = support / df['price']
-        X['resistance_level'] = resistance / df['price']
-        X['sentiment'] = sentiment
-        X['smart_money_score'] = smart_money_score
-
-        # Проверка на константные признаки
-        constant_features = []
-        for column in X.columns:
-            if X[column].nunique() <= 1:
-                logger.warning(f"prepare_training_data: Признак {column} константный (уникальных значений: {X[column].nunique()})")
-                constant_features.append(column)
-
-        if constant_features:
-            logger.warning(f"prepare_training_data: Обнаружены константные признаки: {constant_features}. Продолжаем обработку.")
-
-        # Обработка пропусков
-        X = X.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
-
-        # Создание целевой переменной
-        price = df['price']
-        future_prices = price.shift(-2)
-        labels = ((future_prices - price) / price * 100 >= 0.5).astype(int)
-
-        # Удаляем последние две строки, чтобы синхронизировать с labels
-        X = X.iloc[:-2][ACTIVE_FEATURES].copy()
-        labels = labels.iloc[:-2].copy()
-
-        logger.info(f"prepare_training_data: Сформирован DataFrame с {len(X)} строками, признаки: {X.columns.tolist()}")
-        return X, labels
-    except Exception as e:
-        logger.error(f"prepare_training_data: Ошибка: {str(e)}")
-        return pd.DataFrame(columns=ACTIVE_FEATURES), np.array([])
-# Дообучение модели
-async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("retrain_model_daily: Начало дообучения модели")
-    session = None
-    try:
-        session = Session()
-        trades = session.query(Trade, TradeMetrics).join(
-            TradeMetrics,
-            Trade.id == TradeMetrics.trade_id
-        ).filter(
-            Trade.result.isnot(None)
-        ).all()
-        
-        if len(trades) < 5:
-            logger.warning(f"retrain_model_daily: Недостаточно данных для дообучения ({len(trades)} сделок)")
-            return
-        
-        # Подготовка данных
-        X = []
-        y = []
-        for trade, metrics in trades:
-            features = [
-                metrics.volume_change or 0,
-                metrics.institutional_score or 0,
-                metrics.vwap_signal or 0,
-                metrics.sentiment or 0,
-                metrics.rsi or 0,
-                metrics.macd or 0,
-                metrics.adx or 0,
-                metrics.obv or 0,
-                metrics.smart_money_score or 0
-            ]
-            X.append(features)
-            y.append(1 if trade.result in ['TP1', 'TP2'] else 0)
-        
-        X = np.array(X)
-        y = np.array(y)
-        
-        # Проверка баланса классов
-        unique, counts = np.unique(y, return_counts=True)
-        class_counts = dict(zip(unique, counts))
-        logger.info(f"retrain_model_daily: Распределение классов: {class_counts}")
-        
-        if len(class_counts) < 2 or min(counts) < 2:
-            logger.warning(f"retrain_model_daily: Несбалансированные классы: {class_counts}")
-            return
-        
-        # Разделение данных
-        from sklearn.model_selection import train_test_split
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
-        )
-        
-        # Масштабирование
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-        
-        # Загрузка текущей модели
-        model, _, active_features = load_model()
-        if not model:
-            logger.error("retrain_model_daily: Не удалось загрузить модель")
-            return
-        
-        # Оценка до дообучения
-        loss_before = model.score(X_test_scaled, y_test)
-        logger.info(f"retrain_model_daily: Точность до дообучения: {loss_before:.4f}")
-        
-        # Дообучение
-        model.fit(X_train_scaled, y_train)
-        
-        # Оценка после дообучения
-        loss_after = model.score(X_test_scaled, y_test)
-        logger.info(f"retrain_model_daily: Точность после дообучения: {loss_after:.4f}, сэмплов: {len(X)}")
-        
-        # Сохранение модели и скалера
-        save_model(model, scaler, active_features)
-        
-    except Exception as e:
-        logger.error(f"retrain_model_daily: Ошибка при дообучении: {str(e)}")
-        await notify_admin(f"Ошибка в retrain_model_daily: {str(e)}")
-    finally:
-        if session is not None:
-            session.close()
-
-
-
-# Прогноз вероятности
-async def predict_probability(model, scaler, active_features, df, coin_id, stop_loss, position_size, direction='LONG'):
-    try:
-        # Подготовка признаков
-        features = [
-            ((df['volume'].iloc[-1] - df['volume'].iloc[-2]) / df['volume'].iloc[-2] * 100) if len(df) >= 2 else 0.0,  # volume_change
-            calculate_institutional_score(df, coin_id),  # institutional_score
-            calculate_vwap_signal(df).iloc[-1],  # vwap_signal
-            calculate_sentiment(coin_id),  # sentiment
-            calculate_rsi(df).iloc[-1] if len(df) >= 14 else 50.0,  # rsi
-            calculate_macd(df).iloc[-1] if len(df) >= 26 else 0.0,  # macd
-            calculate_adx(df).iloc[-1] if len(df) >= 14 else 0.0,  # adx
-            calculate_obv(df).iloc[-1] if len(df) >= 2 else 0.0,  # obv
-            calculate_smart_money_score(df, coin_id)  # smart_money_score
-        ]
-        
-        # Фильтрация активных признаков
-        X = np.array([features[i] for i in active_features]).reshape(1, -1)
-        
-        # Масштабирование
-        X_scaled = scaler.transform(X)
-        
-        # Предсказание вероятности
-        probability = model.predict_proba(X_scaled)[0][1] * 100  # Вероятность положительного класса (успех)
-        
-        # Инверсия вероятности для SHORT
-        if direction == 'SHORT':
-            probability = 100 - probability
-        
-        return max(0.0, min(100.0, probability))
-    
-    except Exception as e:
-        logger.error(f"predict_probability: Ошибка для coin_id={coin_id}: {str(e)}")
-        return 0.0
-# Список криптовалют
-def get_top_cryptos():
-    try:
-        result = []
-        for symbol in CRYPTO_PAIRS:
-            coin_id = symbol.replace('/USDT', '')
-            try:
-                ticker = asyncio.run(exchange.fetch_ticker(symbol))
-                result.append((
-                    symbol,
-                    coin_id,
-                    float(ticker.get('percentage', 0)),
-                    float(ticker.get('baseVolume', 0) * 0.5),
-                    float(ticker.get('baseVolume', 0))
-                ))
-            except Exception as e:
-                logger.error(f"get_top_cryptos: Ошибка тикера для {symbol}: {e}")
-                result.append((symbol, coin_id, 0, 0, 0))
-        session = Session()
-        try:
-            disabled_pairs = []
-            for symbol, _, _, _, _ in result:
-                metrics = session.query(TradeMetrics).join(Trade, Trade.id == TradeMetrics.trade_id).filter(
-                    Trade.symbol == symbol,
-                    Trade.timestamp >= datetime.utcnow() - timedelta(days=30)  # Проверяем сделки за последние 30 дней
-                ).order_by(Trade.timestamp.desc()).limit(20).all()
-                if len(metrics) >= 20:
-                    wins = len([m for m in metrics if m.success in ['TP1', 'TP2']])
-                    if wins / len(metrics) < 0.6:
-                        disabled_pairs.append(symbol)
-            result = [item for item in result if item[0] not in disabled_pairs]
-            logger.info(f"get_top_cryptos: Отключены пары с винрейтом <60%: {disabled_pairs}")
-        finally:
-            session.close()
-        return result
-    except Exception as e:
-        logger.error(f"get_top_cryptos: Ошибка: {e}")
-        return [(symbol, symbol.replace('/USDT', ''), 0, 0, 0) for symbol in CRYPTO_PAIRS]
-    
-# Smart Money анализ
-def smart_money_analysis(df, taker_buy_volume, volume, coin_id):
-    try:
-        if df.empty or len(df) < 14:
-            logger.warning(f"smart_money_analysis: Недостаточно данных для {coin_id}, строк: {len(df)}")
-            return (pd.Series(0, index=df.index),) * 9
-
-        # Логирование входных данных
-        logger.info(f"smart_money_analysis: df_shape={df.shape}, df_columns={df.columns.tolist() if not df.empty else 'empty'}, coin_id={coin_id}")
-        if 'volume' in df.columns:
-            logger.info(f"smart_money_analysis: volume_stats={df['volume'].describe().to_dict()}")
-        else:
-            logger.warning(f"smart_money_analysis: volume отсутствует для {coin_id}")
-
-        # Проверка наличия необходимых столбцов
-        required_columns = ['close', 'volume', 'high', 'low']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        if missing_columns:
-            logger.warning(f"smart_money_analysis: Отсутствуют столбцы {missing_columns} для {coin_id}")
-            return (pd.Series(0, index=df.index),) * 9
-
-        # Расчёт индикаторов
-        volume_change = df['volume'].pct_change().fillna(0) * 100
-        rsi = calculate_rsi(df, period=14)
-        macd = calculate_macd(df, fast=12, slow=26)
-        adx = calculate_adx(df, period=14)
-        obv = calculate_obv(df)
-        vwap_signal = calculate_vwap_signal(df)
-        bb_width = calculate_bb_width(df)
-
-        # Расчёт sentiment
-        sentiment = pd.Series(50.0 + (rsi - 50) * 0.5 + macd * 10, index=df.index).clip(0, 100)
-        logger.info(f"smart_money_analysis: sentiment_stats={sentiment.describe().to_dict()}")
-
-        # Расчёт smart_money_score (без institutional_score)
-        smart_money_score = (sentiment * 0.4 + (rsi / 100) * 30 + (adx / 100) * 30) / 0.7
-        smart_money_score = smart_money_score.clip(0, 100)
-
-        # Проверка на константность
-        for name, series in zip(
-            ['volume_change', 'vwap_signal', 'sentiment', 'rsi', 'macd', 'adx', 'obv', 'bb_width', 'smart_money_score'],
-            [volume_change, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score]
-        ):
-            if series.nunique() <= 1:
-                logger.warning(f"smart_money_analysis: Признак {name} константный для {coin_id} (уникальных значений: {series.nunique()})")
-
-        return (
-            volume_change,
-            vwap_signal,
-            sentiment,
-            rsi,
-            macd,
-            adx,
-            obv,
-            bb_width,
-            smart_money_score
-        )
-    except Exception as e:
-        logger.error(f"smart_money_analysis: Ошибка для {coin_id}: {str(e)}")
-        return (pd.Series(0, index=df.index),) * 9
-
-# Размер позиции
 def calculate_position_size(entry_price, stop_loss, balance):
     if balance <= 0:
         logger.error(f"calculate_position_size: Некорректный баланс: {balance}")
         return 0, 0
-    risk_per_trade = 0.01  # 1% риска на сделку
-    risk_amount = balance * risk_per_trade
-    logger.info(f"calculate_position_size: Баланс={balance}, Риск={risk_amount}")
-    price_diff = max(abs(entry_price - stop_loss), entry_price * 0.001)  # Минимум 0.1%
+    risk_amount = balance * RISK_PER_TRADE
+    price_diff = max(abs(entry_price - stop_loss), entry_price * 0.001)
     position_size = risk_amount / price_diff if price_diff > 0 else 0.000018
     position_size_percent = (position_size * entry_price / balance) * 100
+    logger.info(f"calculate_position_size: Баланс={balance}, Риск={risk_amount}, Размер позиции={position_size}")
     return position_size, position_size_percent
 
-# График цен
 def create_price_chart(df, symbol, price_change):
     try:
         if df.empty:
@@ -958,82 +504,80 @@ def create_price_chart(df, symbol, price_change):
         return SCREENSHOT_PATH
     except Exception as e:
         logger.error(f"create_price_chart: Ошибка для {symbol}: {e}")
-        asyncio.run(notify_admin(f"Ошибка создания графика для {symbol}: {e}"))
+        asyncio.create_task(notify_admin(f"Ошибка создания графика для {symbol}: {e}"))
         return None
 
-# Анализ торговой возможности
-async def analyze_trade_opportunity(model, scaler, active_features, df, price_change_1h, current_price, symbol, taker_buy_base, volume, coin_id, direction=None, balance=1000):
+def get_top_cryptos():
     try:
-        if df.empty:
-            logger.warning(f"analyze_trade_opportunity: Пустой DataFrame для {symbol}")
-            return False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-        
-        # Расчёт индикаторов
-        rsi = calculate_rsi(df).iloc[-1] if len(df) >= 14 else 50.0
-        macd = calculate_macd(df).iloc[-1] if len(df) >= 26 else 0.0
-        signal = calculate_macd(df, fast=12, slow=26).ewm(span=9, adjust=False).mean().iloc[-1] if len(df) >= 26 else 0.0
-        adx = calculate_adx(df).iloc[-1] if len(df) >= 14 else 0.0
-        obv = calculate_obv(df).iloc[-1] if len(df) >= 2 else 0.0
-        
-        # Расчёт stop_loss для вероятности
-        atr = calculate_atr_normalized(df).iloc[-1] * current_price
-        stop_loss = current_price - max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01) if direction == 'LONG' else \
-                    current_price + max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
-        
-        # Расчёт position_size
-        position_size, _ = calculate_position_size(current_price, stop_loss, balance)
-        
-        # Получение вероятности от модели
-        probability = await predict_probability(model, scaler, active_features, df, coin_id, stop_loss, abs(position_size), direction)
-        
-        # Проверка условий входа
-        if direction == 'LONG':
-            is_opportunity = (
-                rsi > 50 and rsi < 70 and
-                macd > signal and macd > 0 and
-                adx > 20 and
-                price_change_1h > 0
-            )
-        elif direction == 'SHORT':
-            is_opportunity = (
-                rsi < 50 and rsi > 30 and
-                macd < signal and macd < 0 and
-                adx > 20 and
-                price_change_1h < 0
-            )
-        else:
-            is_opportunity = (
-                (rsi > 50 and rsi < 70) or (rsi < 50 and rsi > 30) and
-                abs(macd) > abs(signal) and
-                adx > 15
-            )
-        
-        # Дополнительные метрики
-        volume_change = ((df['volume'].iloc[-1] - df['volume'].iloc[-2]) / df['volume'].iloc[-2] * 100) if len(df) >= 2 else 0.0
-        institutional_score = taker_buy_base / volume * 100 if volume > 0 else 50.0
-        vwap_signal = calculate_vwap_signal(df).iloc[-1]
-        sentiment = min(100, institutional_score + (volume_change / 2)) if direction == 'LONG' else max(0, institutional_score - (volume_change / 2))
-        smart_money_score = min(100, institutional_score + (volume_change / 5))
-        
-        return (
-            is_opportunity,
-            price_change_1h,
-            volume_change,
-            institutional_score,
-            vwap_signal,
-            sentiment,
-            rsi,
-            macd,
-            adx,
-            obv,
-            smart_money_score,
-            probability
-        )
+        result = []
+        for symbol in CRYPTO_PAIRS:
+            coin_id = symbol.replace('/USDT', '')
+            try:
+                ticker = asyncio.run(trading_model.exchange.fetch_ticker(symbol))
+                result.append((
+                    symbol,
+                    coin_id,
+                    float(ticker.get('percentage', 0)),
+                    float(ticker.get('baseVolume', 0) * 0.5),
+                    float(ticker.get('baseVolume', 0))
+                ))
+            except Exception as e:
+                logger.error(f"get_top_cryptos: Ошибка тикера для {symbol}: {e}")
+                result.append((symbol, coin_id, 0, 0, 0))
+        session = Session()
+        try:
+            disabled_pairs = []
+            for symbol, _, _, _, _ in result:
+                metrics = session.query(TradeMetrics).join(Trade, Trade.id == TradeMetrics.trade_id).filter(
+                    Trade.symbol == symbol,
+                    Trade.timestamp >= datetime.utcnow() - timedelta(days=30)
+                ).order_by(Trade.timestamp.desc()).limit(20).all()
+                if len(metrics) >= 20:
+                    wins = len([m for m in metrics if m.success in ['TP1', 'TP2']])
+                    if wins / len(metrics) < 0.6:
+                        disabled_pairs.append(symbol)
+            result = [item for item in result if item[0] not in disabled_pairs]
+            logger.info(f"get_top_cryptos: Отключены пары с винрейтом <60%: {disabled_pairs}")
+        finally:
+            session.close()
+        return result
     except Exception as e:
-        logger.error(f"analyze_trade_opportunity: Ошибка для {symbol}: {e}")
-        return False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-# Проверка активных сделок
-from threading import Lock
+        logger.error(f"get_top_cryptos: Ошибка: {e}")
+        return [(symbol, symbol.replace('/USDT', ''), 0, 0, 0) for symbol in CRYPTO_PAIRS]
+
+async def check_trade_result(symbol, entry_price, stop_loss, tp1, tp2, trade_id):
+    session = Session()
+    try:
+        await asyncio.sleep(3600)
+        price_1h = await get_current_price(symbol)
+        await asyncio.sleep(3600)
+        price_2h = await get_current_price(symbol)
+        success = None
+        if price_1h <= stop_loss or price_2h <= stop_loss:
+            success = 'SL'
+        elif price_2h >= tp2:
+            success = 'TP2'
+        elif price_1h >= tp1 or price_2h >= tp1:
+            success = 'TP1'
+        trade_metrics = TradeMetrics(
+            trade_id=trade_id,
+            symbol=symbol,
+            entry_price=entry_price,
+            price_after_1h=price_1h,
+            price_after_2h=price_2h,
+            success=success
+        )
+        trade = session.query(Trade).filter_by(id=trade_id).first()
+        if trade and success:
+            trade.result = success
+        session.add(trade_metrics)
+        session.commit()
+        logger.info(f"check_trade_result: Сделка #{trade_id} ({symbol}): success={success}")
+    except Exception as e:
+        logger.error(f"check_trade_result: Ошибка для {symbol}: {e}")
+        await notify_admin(f"Ошибка проверки результата для {symbol}: {e}")
+    finally:
+        session.close()
 
 trade_lock = Lock()
 
@@ -1042,7 +586,7 @@ async def check_active_trades(context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = context.job.data
         logger.info(f"check_active_trades: Проверка активных сделок для user_id={user_id}")
-        with trade_lock:  # Блокировка для предотвращения конкурентных обновлений
+        with trade_lock:
             active_trades = session.query(Trade).filter(
                 Trade.user_id == user_id,
                 (Trade.result.is_(None) | (Trade.result == 'TP1'))
@@ -1051,7 +595,6 @@ async def check_active_trades(context: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"check_active_trades: Нет активных сделок для user_id={user_id}")
                 return
             for trade in active_trades:
-                # Проверка существования сделки
                 trade_exists = session.query(Trade).filter_by(id=trade.id).first()
                 if not trade_exists:
                     logger.warning(f"check_active_trades: Сделка #{trade.id} ({trade.symbol}) не найдена")
@@ -1066,18 +609,32 @@ async def check_active_trades(context: ContextTypes.DEFAULT_TYPE):
                 update_needed = False
                 new_result = None
                 pnl = 0
-                if current_price <= trade.stop_loss:
-                    new_result = 'SL'
-                    final_price = trade.stop_loss
-                    pnl = (final_price - trade.entry_price) * trade.position_size
-                elif trade.result is None and current_price >= trade.take_profit_1:
-                    new_result = 'TP1'
-                    final_price = trade.take_profit_1
-                    pnl = (final_price - trade.entry_price) * trade.position_size
-                elif trade.result == 'TP1' and current_price >= trade.take_profit_2:
-                    new_result = 'TP2'
-                    final_price = trade.take_profit_2
-                    pnl = (final_price - trade.entry_price) * trade.position_size
+                if trade.position_size > 0:  # LONG
+                    if current_price <= trade.stop_loss:
+                        new_result = 'SL'
+                        final_price = trade.stop_loss
+                        pnl = (final_price - trade.entry_price) * trade.position_size
+                    elif trade.result is None and current_price >= trade.take_profit_1:
+                        new_result = 'TP1'
+                        final_price = trade.take_profit_1
+                        pnl = (final_price - trade.entry_price) * trade.position_size
+                    elif trade.result == 'TP1' and current_price >= trade.take_profit_2:
+                        new_result = 'TP2'
+                        final_price = trade.take_profit_2
+                        pnl = (final_price - trade.entry_price) * trade.position_size
+                else:  # SHORT
+                    if current_price >= trade.stop_loss:
+                        new_result = 'SL'
+                        final_price = trade.stop_loss
+                        pnl = (trade.entry_price - final_price) * abs(trade.position_size)
+                    elif trade.result is None and current_price <= trade.take_profit_1:
+                        new_result = 'TP1'
+                        final_price = trade.take_profit_1
+                        pnl = (trade.entry_price - final_price) * abs(trade.position_size)
+                    elif trade.result == 'TP1' and current_price <= trade.take_profit_2:
+                        new_result = 'TP2'
+                        final_price = trade.take_profit_2
+                        pnl = (trade.entry_price - final_price) * abs(trade.position_size)
                 if new_result:
                     try:
                         trade.result = new_result
@@ -1085,11 +642,9 @@ async def check_active_trades(context: ContextTypes.DEFAULT_TYPE):
                         if trade_metrics:
                             trade_metrics.success = new_result
                         session.commit()
-                        # Обновление баланса
                         balance += pnl
                         user_settings['balance'] = balance
                         save_user_settings(user_id, user_settings)
-                        # Отправка уведомления
                         message = (
                             f"📊 **Сделка #{trade.id}** ({trade.symbol}): "
                             f"{'✅ TP1' if new_result == 'TP1' else '✅ TP2' if new_result == 'TP2' else '❌ SL'} достигнут\n"
@@ -1113,7 +668,91 @@ async def check_active_trades(context: ContextTypes.DEFAULT_TYPE):
     finally:
         session.close()
 
-# Автоматический поиск сделок
+async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("retrain_model_daily: Начало дообучения модели")
+    session = None
+    try:
+        session = Session()
+        trades = session.query(Trade, TradeMetrics).join(
+            TradeMetrics,
+            Trade.id == TradeMetrics.trade_id
+        ).filter(
+            Trade.result.isnot(None)
+        ).all()
+        
+        if len(trades) < 5:
+            logger.warning(f"retrain_model_daily: Недостаточно данных для дообучения ({len(trades)} сделок)")
+            return
+        
+        X = []
+        y = []
+        pnls = []
+        for trade, metrics in trades:
+            features = [
+                metrics.volume_change or 0,
+                metrics.institutional_score or 0,
+                metrics.vwap_signal or 0,
+                metrics.sentiment or 0,
+                metrics.rsi or 0,
+                metrics.macd or 0,
+                metrics.adx or 0,
+                metrics.obv or 0,
+                metrics.smart_money_score or 0
+            ]
+            X.append(features)
+            y.append(1 if trade.result in ['TP1', 'TP2'] else 0)
+            final_price = trade.stop_loss if trade.result == 'SL' else trade.take_profit_1 if trade.result == 'TP1' else trade.take_profit_2
+            if trade.position_size > 0:
+                pnl = (final_price - trade.entry_price) * trade.position_size
+            else:
+                pnl = (trade.entry_price - final_price) * abs(trade.position_size)
+            pnls.append(pnl)
+        
+        X = np.array(X)
+        y = np.array(y)
+        
+        unique, counts = np.unique(y, return_counts=True)
+        class_counts = dict(zip(unique, counts))
+        logger.info(f"retrain_model_daily: Распределение классов: {class_counts}")
+        
+        if len(class_counts) < 2 or min(counts) < 2:
+            logger.warning(f"retrain_model_daily: Несбалансированные классы: {class_counts}")
+            return
+        
+        from sklearn.model_selection import train_test_split
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        model = trading_model.models.get('combined')
+        if not model:
+            model = lgb.LGBMClassifier(random_state=42)
+            trading_model.models['combined'] = model
+            trading_model.scalers['combined'] = scaler
+        
+        loss_before = model.score(X_test_scaled, y_test)
+        logger.info(f"retrain_model_daily: Точность до дообучения: {loss_before:.4f}")
+        
+        model.fit(X_train_scaled, y_train, sample_weight=[2.0 if y == 0 else 0.5 if y == 1 else 1.0 for y in y_train])
+        
+        loss_after = model.score(X_test_scaled, y_test)
+        logger.info(f"retrain_model_daily: Точность после дообучения: {loss_after:.4f}, сэмплов: {len(X)}")
+        
+        trading_model.models['combined'] = model
+        trading_model.scalers['combined'] = scaler
+        trading_model.save_model()
+        
+    except Exception as e:
+        logger.error(f"retrain_model_daily: Ошибка при дообучении: {str(e)}")
+        await notify_admin(f"Ошибка в retrain_model_daily: {str(e)}")
+    finally:
+        if session is not None:
+            session.close()
+
 async def auto_search_trades(context: ContextTypes.DEFAULT_TYPE):
     settings = load_settings()
     for user_id_str in settings:
@@ -1122,81 +761,40 @@ async def auto_search_trades(context: ContextTypes.DEFAULT_TYPE):
             continue
         user_settings = get_user_settings(user_id)
         min_probability = user_settings.get('min_probability', 60.0)
-        model, scaler, active_features = load_model()
-        if not model or not scaler or not active_features:
-            logger.error(f"auto_search_trades: Модель не загружена для user_id={user_id}")
-            await context.bot.send_message(user_id, "🚨 **Ошибка**: Модель не загружена.", parse_mode='Markdown')
-            continue
+        balance = user_settings.get('balance', 1000)
         cryptos = get_top_cryptos()
         session = Session()
         try:
             opportunities = []
             for symbol, coin_id, price_change_1h, taker_buy_base, volume in cryptos:
-                df = await get_historical_data(symbol)
-                if not df.empty:
-                    df['symbol'] = symbol
-                current_price = df['price'].iloc[-1] if not df.empty else await get_current_price(symbol)
-                if current_price <= 0.0:
-                    logger.warning(f"auto_search_trades: Не удалось получить цену для {symbol}, пропускаем")
+                analysis = await trading_model.analyze_symbol(symbol, coin_id, price_change_1h, taker_buy_base, volume, balance)
+                if not analysis:
                     continue
-                is_opportunity, price_change, volume_change, institutional_score, vwap_signal, sentiment, rsi, macd, adx, obv, smart_money_score, probability = await analyze_trade_opportunity(
-                    model, scaler, active_features, df, price_change_1h, current_price, symbol, taker_buy_base, volume, coin_id
-                )
-                direction = 'LONG' if probability >= min_probability else 'SHORT' if probability < (100 - min_probability) else None
-                if is_opportunity and direction:
-                    atr = calculate_atr_normalized(df).iloc[-1] * current_price
-                    if direction == 'LONG':
-                        stop_loss = current_price - max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
-                        tp1 = current_price + 6 * atr
-                        tp2 = current_price + 10 * atr
-                    else:  # SHORT
-                        stop_loss = current_price + max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
-                        tp1 = current_price - 6 * atr
-                        tp2 = current_price - 10 * atr
-                    existing_trades = session.query(Trade).filter(
-                        Trade.user_id == user_id,
-                        Trade.symbol == symbol,
-                        Trade.result.is_(None) | (Trade.result == 'TP1')
-                    ).all()
-                    is_duplicate = False
-                    for trade in existing_trades:
-                        entry_diff = abs(trade.entry_price - current_price) / current_price
-                        sl_diff = abs(trade.stop_loss - stop_loss) / current_price
-                        tp1_diff = abs(trade.take_profit_1 - tp1) / current_price
-                        if entry_diff < 0.005 and sl_diff < 0.01 and tp1_diff < 0.01:
-                            is_duplicate = True
-                            logger.warning(f"auto_search_trades: Пропущена сделка для {symbol}, уже есть активная сделка #{trade.id}")
-                            break
-                    if is_duplicate:
-                        continue
+                if analysis['long_prob'] >= min_probability:
                     opportunities.append({
-                        'symbol': symbol,
-                        'coin_id': coin_id,
-                        'price_change': price_change,
-                        'volume_change': volume_change,
-                        'institutional_score': institutional_score,
-                        'vwap_signal': vwap_signal,
-                        'sentiment': sentiment,
-                        'rsi': rsi,
-                        'macd': macd,
-                        'adx': adx,
-                        'obv': obv,
-                        'smart_money_score': smart_money_score,
-                        'probability': probability,
-                        'df': df,
-                        'current_price': current_price,
-                        'direction': direction,
-                        'stop_loss': stop_loss,
-                        'tp1': tp1,
-                        'tp2': tp2
+                        **analysis,
+                        'direction': 'LONG',
+                        'probability': analysis['long_prob'],
+                        'stop_loss': analysis['stop_loss_long'],
+                        'take_profit_1': analysis['take_profit_1_long'],
+                        'take_profit_2': analysis['take_profit_2_long']
+                    })
+                if analysis['short_prob'] >= min_probability:
+                    opportunities.append({
+                        **analysis,
+                        'direction': 'SHORT',
+                        'probability': analysis['short_prob'],
+                        'stop_loss': analysis['stop_loss_short'],
+                        'take_profit_1': analysis['take_profit_1_short'],
+                        'take_profit_2': analysis['take_profit_2_short']
                     })
             if not opportunities:
-                logger.warning(f"auto_search_trades: Сделки не найдены для user_id={user_id}")
                 continue
+            opportunities.sort(key=lambda x: abs(x['probability'] - 50), reverse=True)
             for opp in opportunities:
                 symbol = opp['symbol']
                 direction = opp['direction']
-                current_price = opp['current_price']
+                current_price = opp['price']
                 df = opp['df']
                 price_change = opp['price_change']
                 volume_change = opp['volume_change']
@@ -1207,71 +805,53 @@ async def auto_search_trades(context: ContextTypes.DEFAULT_TYPE):
                 macd = opp['macd']
                 adx = opp['adx']
                 obv = opp['obv']
-                smart_money_score = opp['smart_money_score']
                 probability = opp['probability']
                 stop_loss = opp['stop_loss']
-                tp1 = opp['tp1']
-                tp2 = opp['tp2']
-                if (direction == 'LONG' and probability < min_probability) or (direction == 'SHORT' and probability >= (100 - min_probability)):
-                    logger.warning(f"auto_search_trades: Пропущена сделка для {symbol} из-за вероятности {probability}% (min={min_probability}%)")
+                take_profit_1 = opp['take_profit_1']
+                take_profit_2 = opp['take_profit_2']
+                if (direction == 'LONG' and probability < min_probability) or (direction == 'SHORT' and (100 - probability) < min_probability):
                     continue
-                rr_ratio = (tp1 - current_price) / (current_price - stop_loss) if direction == 'LONG' else (current_price - tp1) / (stop_loss - current_price)
-                balance = user_settings.get('balance', None)
-                if balance is None:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text="🚫 **Баланс не установлен.**\nИспользуйте `/setbalance <сумма>` для установки баланса.",
-                        parse_mode='Markdown'
-                    )
-                    return
+                existing_trades = session.query(Trade).filter(
+                    Trade.user_id == user_id,
+                    Trade.symbol == symbol,
+                    Trade.result.is_(None) | (Trade.result == 'TP1')
+                ).all()
+                is_duplicate = False
+                for trade in existing_trades:
+                    entry_diff = abs(trade.entry_price - current_price) / current_price
+                    sl_diff = abs(trade.stop_loss - stop_loss) / current_price
+                    tp1_diff = abs(trade.take_profit_1 - take_profit_1) / current_price
+                    if entry_diff < 0.005 and sl_diff < 0.01 and tp1_diff < 0.01:
+                        is_duplicate = True
+                        logger.info(f"auto_search_trades: Пропущена сделка для {symbol}, уже есть активная сделка #{trade.id}")
+                        break
+                if is_duplicate:
+                    continue
+                rr_ratio = (take_profit_1 - current_price) / (current_price - stop_loss) if direction == 'LONG' else (current_price - take_profit_1) / (stop_loss - current_price)
                 position_size, position_size_percent = calculate_position_size(current_price, stop_loss, balance)
                 position_size = position_size if direction == 'LONG' else -position_size
-                potential_profit_tp1 = (tp1 - current_price) * position_size if direction == 'LONG' else (current_price - tp1) * abs(position_size)
-                potential_profit_tp2 = (tp2 - current_price) * position_size if direction == 'LONG' else (current_price - tp2) * abs(position_size)
-                trader_level = "Новичок"
-                tradingview_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol.replace('/', '')}&interval=15"
-                price_precision = 6 if current_price < 1 else 2
-                message = (
-                    f"📈 **Новая сделка: {symbol} {direction}** (авто)\n"
-                    f"💰 **Баланс**: ${balance:.2f}\n"
-                    f"🎯 Вход: ${current_price:.{price_precision}f}\n"
-                    f"⛔ Стоп-лосс: ${stop_loss:.{price_precision}f}\n"
-                    f"💰 TP1: ${tp1:.{price_precision}f} (+${potential_profit_tp1:.2f})\n"
-                    f"💰 TP2: ${tp2:.{price_precision}f} (+${potential_profit_tp2:.2f})\n"
-                    f"📊 RR: {rr_ratio:.1f}:1\n"
-                    f"📏 Размер: {position_size_percent:.2f}% ({abs(position_size):.6f} {coin_id})\n"
-                    f"🎲 Вероятность: {probability:.1f}%\n"
-                    f"🏛️ Институц.: {institutional_score:.1f}%\n"
-                    f"📈 VWAP: {'🟢 Бычий' if vwap_signal > 0 else '🔴 Медвежий'}\n"
-                    f"📮 Сентимент: {sentiment:.1f}%\n"
-                    f"📊 RSI: {rsi:.1f} | MACD: {'🟢' if macd > 0 else '🔴'} | ADX: {adx:.1f}\n"
-                    f"💡 Логика: Рост {price_change:.2f}%, Объём +{volume_change:.1f}%\n"
-                    f"📈 График: {tradingview_url}\n"
-                    f"💾 Сделка сохранена. Отметьте результат:"
-                )
+                potential_profit_tp1 = (take_profit_1 - current_price) * position_size if direction == 'LONG' else (current_price - take_profit_1) * abs(position_size)
+                potential_profit_tp2 = (take_profit_2 - current_price) * position_size if direction == 'LONG' else (current_price - take_profit_2) * abs(position_size)
                 trade = Trade(
                     user_id=user_id,
                     symbol=symbol,
                     entry_price=current_price,
                     stop_loss=stop_loss,
-                    take_profit_1=tp1,
-                    take_profit_2=tp2,
+                    take_profit_1=take_profit_1,
+                    take_profit_2=take_profit_2,
                     rr_ratio=rr_ratio,
                     position_size=position_size,
                     probability=probability,
                     institutional_score=institutional_score,
                     sentiment_score=sentiment,
-                    trader_level=trader_level
+                    trader_level="Новичок"
                 )
                 session.add(trade)
-                session.commit()
-                trade_id = trade.id
+                session.flush()
                 trade_metrics = TradeMetrics(
-                    trade_id=trade_id,
+                    trade_id=trade.id,
                     symbol=symbol,
                     entry_price=current_price,
-                    price_after_1h=None,
-                    price_after_2h=None,
                     volume_change=volume_change,
                     institutional_score=institutional_score,
                     vwap_signal=vwap_signal,
@@ -1280,201 +860,122 @@ async def auto_search_trades(context: ContextTypes.DEFAULT_TYPE):
                     macd=macd,
                     adx=adx,
                     obv=obv,
-                    smart_money_score=smart_money_score,
-                    probability=probability,
-                    success=None
+                    smart_money_score=min(100, institutional_score + (volume_change / 5)),
+                    probability=probability
                 )
                 session.add(trade_metrics)
                 session.commit()
-                asyncio.create_task(check_trade_result(symbol, current_price, stop_loss, tp1, tp2, trade_id))
+                price_precision = 6 if current_price < 1 else 2
+                vwap_text = '🟢 Бычий' if vwap_signal > 0 else '🔴 Медвежий'
+                macd_text = '🟢 Бычий' if macd > 0 else '🔴 Медвежий'
+                tradingview_url = f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol.replace('/', '')}&interval=15"
+                message = (
+                    f"🔔 **Новая сделка: {symbol} {direction}**\n"
+                    f"💰 **Баланс**: ${balance:.2f}\n"
+                    f"🎯 Вход: ${current_price:.{price_precision}f}\n"
+                    f"⛔ Стоп-лосс: ${stop_loss:.{price_precision}f}\n"
+                    f"💰 TP1: ${take_profit_1:.{price_precision}f} (+${potential_profit_tp1:.2f})\n"
+                    f"💰 TP2: ${take_profit_2:.{price_precision}f} (+${potential_profit_tp2:.2f})\n"
+                    f"📊 RR: {rr_ratio:.1f}:1\n"
+                    f"📏 Размер: {position_size_percent:.2f}% ({abs(position_size):.6f} {symbol.split('/')[0]})\n"
+                    f"🎲 Вероятность: {probability:.1f}%\n"
+                    f"🏛️ Институц.: {institutional_score:.1f}%\n"
+                    f"📈 VWAP: {vwap_text}\n"
+                    f"📮 Сентимент: {sentiment:.1f}%\n"
+                    f"📊 RSI: {rsi:.1f} | MACD: {macd_text} | ADX: {adx:.1f}\n"
+                    f"💡 Логика: Рост {price_change:.2f}%, Объём +{volume_change:.1f}%\n"
+                    f"📈 График: {tradingview_url}\n"
+                    f"💾 Сделка сохранена. Отметьте результат:"
+                )
                 keyboard = [
-                    [
-                        InlineKeyboardButton("✅ TP1", callback_data=f"TP1_{trade_id}"),
-                        InlineKeyboardButton("✅ TP2", callback_data=f"TP2_{trade_id}"),
-                        InlineKeyboardButton("❌ SL", callback_data=f"SL_{trade_id}"),
-                        InlineKeyboardButton("🚫 Отмена", callback_data=f"CANCEL_{trade_id}")
-                    ]
+                    [InlineKeyboardButton("✅ TP1", callback_data=f"TP1_{trade.id}"),
+                     InlineKeyboardButton("✅ TP2", callback_data=f"TP2_{trade.id}"),
+                     InlineKeyboardButton("❌ SL", callback_data=f"SL_{trade.id}"),
+                     InlineKeyboardButton("🚫 Отмена", callback_data=f"CANCEL_{trade.id}")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 chart_path = create_price_chart(df, symbol, price_change)
-                try:
-                    if chart_path and os.path.exists(chart_path):
-                        with open(chart_path, 'rb') as photo:
-                            await context.bot.send_photo(chat_id=user_id, photo=photo, caption=message, reply_markup=reply_markup, parse_mode='Markdown')
-                        os.remove(chart_path)
-                    else:
-                        await context.bot.send_message(chat_id=user_id, text=message + "\n⚠️ Не удалось создать график.", reply_markup=reply_markup, parse_mode='Markdown')
-                except Exception as e:
-                    logger.error(f"auto_search_trades: Ошибка отправки для {symbol}: {str(e)}")
-                    await context.bot.send_message(chat_id=user_id, text=message + f"\n⚠️ Ошибка: {str(e)}", reply_markup=reply_markup, parse_mode='Markdown')
-                    await notify_admin(f"Ошибка отправки авто-сделки для {symbol}: {str(e)}")
-        except Exception as e:
-            logger.error(f"auto_search_trades: Ошибка для user_id={user_id}: {str(e)}")
-            await context.bot.send_message(chat_id=user_id, text=f"🚨 **Ошибка**: {str(e)}", parse_mode='Markdown')
-            await notify_admin(f"Ошибка в auto_search_trades: {str(e)}")
+                if chart_path and os.path.exists(chart_path):
+                    with open(chart_path, 'rb') as photo:
+                        await context.bot.send_photo(
+                            chat_id=user_id,
+                            photo=photo,
+                            caption=message,
+                            reply_markup=reply_markup,
+                            parse_mode='Markdown'
+                        )
+                    os.remove(chart_path)
+                else:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=message + "\n⚠️ Не удалось создать график.",
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+                logger.info(f"auto_search_trades: Сделка #{trade.id} создана для {symbol} ({direction})")
+                break
         finally:
             session.close()
-# Обработчик кнопок
+
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = query.from_user.id
-    logger.info(f"button: Обработка запроса от user_id={user_id}, data={query.data}")
-
-    # Проверяем авторизацию
-    if not is_authorized(user_id):
-        try:
-            await context.bot.send_message(chat_id=user_id, text="🚫 Вы не авторизованы для использования бота.", parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"button: Ошибка отправки сообщения об авторизации user_id={user_id}: {e}")
-        return
-
-    # Подтверждаем получение запроса
     try:
         await query.answer()
     except telegram.error.BadRequest as e:
-        logger.warning(f"button: Устаревший или недействительный запрос user_id={user_id}: {e}")
-        # Продолжаем обработку, отправим новое сообщение вместо ответа на старое
-
-    data = query.data
-    session = None
-
+        logger.warning(f"button: Устаревший или недействительный запрос: {e}")
+        return
+    user_id = query.from_user.id
+    if not is_authorized(user_id):
+        await query.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
+        return
+    session = Session()
     try:
-        # Проверяем, является ли запрос фильтром истории
-        if data in ('filter_active', 'filter_completed', 'refresh_active'):
-            logger.info(f"button: Пропуск фильтра истории, data={data}")
-            return
-
-        # Обрабатываем кнопки TP1, TP2, SL, CANCEL
-        if not data.startswith(("TP1_", "TP2_", "SL_", "CANCEL_")):
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="🚫 Неверный выбор кнопки.",
-                parse_mode='Markdown'
-            )
-            logger.warning(f"button: Неверный формат data={data} для user_id={user_id}")
-            return
-
-        # Разбираем callback-данные
-        try:
-            result, trade_id = data.split("_")
-            trade_id = int(trade_id)
-        except ValueError as e:
-            logger.error(f"button: Ошибка разбора data={data} для user_id={user_id}: {e}")
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="🚫 Неверный формат запроса.",
-                parse_mode='Markdown'
-            )
-            await notify_admin(f"Ошибка в button для user_id={user_id}, data={data}: {e}")
-            return
-
-        # Инициализируем сессию базы данных
-        session = Session()
+        action, trade_id = query.data.split('_')
+        trade_id = int(trade_id)
         trade = session.query(Trade).filter_by(id=trade_id, user_id=user_id).first()
-
         if not trade:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="🚫 Сделка не найдена или не принадлежит вам.",
-                parse_mode='Markdown'
-            )
-            logger.warning(f"button: Сделка #{trade_id} не найдена для user_id={user_id}")
+            await query.message.edit_text("🚫 **Сделка не найдена или не принадлежит вам.**", parse_mode='Markdown')
             return
-
-        # Проверяем, не отмечена ли сделка ранее
-        if trade.result and result != 'CANCEL':
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"🚫 Сделка #{trade_id} уже отмечена как {trade.result}.",
-                parse_mode='Markdown'
-            )
-            logger.info(f"button: Сделка #{trade_id} уже имеет результат {trade.result} для user_id={user_id}")
-            return
-
-        # Обрабатываем отмену сделки
-        if result == 'CANCEL':
-            trade_metrics = session.query(TradeMetrics).filter_by(trade_id=trade_id).first()
-            if trade_metrics:
-                session.delete(trade_metrics)
-            session.delete(trade)
-            session.commit()
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"🚫 Сделка #{trade_id} ({trade.symbol}) отменена.",
-                parse_mode='Markdown'
-            )
-            logger.info(f"button: Сделка #{trade_id} отменена для user_id={user_id}")
-            return
-
-        # Обрабатываем TP1, TP2, SL
-        trade_metrics = session.query(TradeMetrics).filter_by(trade_id=trade_id).first()
-        if not trade_metrics:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"🚫 Метрика для сделки #{trade_id} не найдена.",
-                parse_mode='Markdown'
-            )
-            logger.error(f"button: Метрика для сделки #{trade_id} не найдена для user_id={user_id}")
-            return
-
-        # Устанавливаем результат
-        trade.result = result
-        trade_metrics.success = result
-
-        # Рассчитываем PNL и обновляем баланс
         user_settings = get_user_settings(user_id)
         balance = user_settings.get('balance', 0)
-        final_price = trade.stop_loss if result == 'SL' else trade.take_profit_1 if result == 'TP1' else trade.take_profit_2
-        if trade.position_size > 0:  # LONG
-            pnl = (final_price - trade.entry_price) * trade.position_size
-        else:  # SHORT
-            pnl = (trade.entry_price - final_price) * abs(trade.position_size)
-        balance += pnl
-        user_settings['balance'] = balance
-        save_user_settings(user_id, user_settings)
-
-        # Сохраняем изменения
-        session.commit()
-
-        # Отправляем подтверждение
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"✅ Сделка #{trade_id} отмечена как {result}. PNL: {pnl:.2f} USDT. Новый баланс: {balance:.2f} USDT.",
-            parse_mode='Markdown'
-        )
-        logger.info(f"button: Сделка #{trade_id} отмечена как {result}, PNL={pnl:.2f}, новый баланс={balance:.2f} для user_id={user_id}")
-
-        # Проверяем необходимость дообучения модели
-        closed_trades = session.query(Trade).filter(
-            Trade.user_id == user_id,
-            Trade.result.isnot(None)
-        ).count()
-        if closed_trades >= 5:
-            logger.info(f"button: Запуск дообучения модели для user_id={user_id}, закрытых сделок={closed_trades}")
-            asyncio.create_task(retrain_model_daily(context))
-        else:
-            logger.info(f"button: Дообучение не запущено для user_id={user_id}, закрытых сделок={closed_trades}")
-
-    except Exception as e:
-        logger.error(f"button: Ошибка обработки для user_id={user_id}, data={data}: {e}")
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"🚨 Ошибка при обработке: {str(e)}",
-                parse_mode='Markdown'
+        price_precision = 6 if trade.entry_price < 1 else 2
+        if action in ['TP1', 'TP2', 'SL']:
+            final_price = trade.take_profit_1 if action == 'TP1' else trade.take_profit_2 if action == 'TP2' else trade.stop_loss
+            if trade.position_size > 0:
+                pnl = (final_price - trade.entry_price) * trade.position_size
+            else:
+                pnl = (trade.entry_price - final_price) * abs(trade.position_size)
+            trade.result = action
+            trade_metrics = session.query(TradeMetrics).filter_by(trade_id=trade.id).first()
+            if trade_metrics:
+                trade_metrics.success = action
+            balance += pnl
+            user_settings['balance'] = balance
+            save_user_settings(user_id, user_settings)
+            session.commit()
+            message = (
+                f"📊 **Сделка #{trade.id}** ({trade.symbol}): "
+                f"{'✅ TP1' if action == 'TP1' else '✅ TP2' if action == 'TP2' else '❌ SL'} достигнут\n"
+                f"🎯 Вход: ${trade.entry_price:.{price_precision}f} | Выход: ${final_price:.{price_precision}f}\n"
+                f"💸 PNL: {pnl:.2f} USDT\n"
+                f"💰 Новый баланс: ${balance:.2f}"
             )
-            await notify_admin(f"Ошибка в button для user_id={user_id}, data={data}: {e}")
-        except Exception as send_error:
-            logger.error(f"button: Ошибка отправки сообщения об ошибке для user_id={user_id}: {send_error}")
-
+            await query.message.edit_text(message, parse_mode='Markdown')
+            logger.info(f"button: Сделка #{trade.id} ({trade.symbol}) обновлена: {action}, PNL={pnl:.2f}")
+        elif action == 'CANCEL':
+            session.delete(trade)
+            session.query(TradeMetrics).filter_by(trade_id=trade.id).delete()
+            session.commit()
+            await query.message.edit_text(f"🗑️ **Сделка #{trade.id}** ({trade.symbol}) отменена.", parse_mode='Markdown')
+            logger.info(f"button: Сделка #{trade.id} ({trade.symbol}) отменена")
+    except Exception as e:
+        logger.error(f"button: Ошибка для user_id={user_id}: {e}")
+        await query.message.reply_text(f"🚨 **Ошибка**: {e}", parse_mode='Markdown')
+        await notify_admin(f"Ошибка в button для user_id={user_id}: {e}")
     finally:
-        if session is not None:
-            try:
-                session.close()
-            except Exception as e:
-                logger.error(f"button: Ошибка закрытия сессии для user_id={user_id}: {e}")
-# Команда /setcriteria
-async def set_criteria(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        session.close()
+
+async def set_min_probability(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
@@ -1485,46 +986,66 @@ async def set_criteria(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id_str = str(user_id)
     try:
         if not args:
+            min_probability = user_settings.get('min_probability', 60.0)
             message = (
-                f"⚙️ **Текущие настройки**:\n"
-                f"📈 Цена: {user_settings['price_threshold']}% | Объём: {user_settings['volume_threshold']}% | RSI: {user_settings['rsi_threshold']} ({'вкл' if user_settings['use_rsi'] else 'выкл'})\n"
-                f"⏱ Авто-поиск: каждые {user_settings['auto_interval']//60} мин\n"
+                f"⚙️ **Текущая минимальная вероятность**: {min_probability}%\n"
+                f"Используйте: `/setminprobability <процент>`\n"
+                f"Пример: `/setminprobability 60`"
+            )
+            await update.message.reply_text(message, parse_mode='Markdown')
+            return
+        min_probability = float(args[0])
+        if min_probability < 0 or min_probability > 100:
+            await update.message.reply_text("🚫 **Вероятность должна быть от 0 до 100%.**", parse_mode='Markdown')
+            return
+        user_settings['min_probability'] = min_probability
+        settings[user_id_str] = user_settings
+        save_settings(settings)
+        await update.message.reply_text(f"✅ **Минимальная вероятность установлена**: {min_probability}%", parse_mode='Markdown')
+        logger.info(f"set_min_probability: Пользователь {user_id} установил минимальную вероятность: {min_probability}%")
+    except Exception as e:
+        logger.error(f"set_min_probability: Ошибка: {e}")
+        await update.message.reply_text(f"🚨 **Ошибка**: {e}\nФормат: `/setminprobability <процент>`", parse_mode='Markdown')
+        await notify_admin(f"Ошибка в /setminprobability: {e}")
+
+async def set_criteria(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
+        return
+    args = context.args
+    user_settings = get_user_settings(user_id)
+    try:
+        if len(args) < 3:
+            message = (
+                f"⚙️ **Текущие критерии**:\n"
+                f"📊 Рост: {user_settings['price_threshold']}% | Объём: {user_settings['volume_threshold']}% | RSI: {user_settings['rsi_threshold']} ({'вкл' if user_settings['use_rsi'] else 'выкл'})\n"
+                f"⏱ Интервал: {user_settings['auto_interval']//60} мин\n"
                 f"Используйте: `/setcriteria <volume> <price> <rsi> [rsi_off] [interval_minutes]`\n"
-                f"Пример: `/setcriteria 5 0.3 40 rsi_off 10`"
+                f"Пример: `/setcriteria 5 0.3 40 rsi_off 5`"
             )
             await update.message.reply_text(message, parse_mode='Markdown')
             return
         volume_threshold = float(args[0])
         price_threshold = float(args[1])
-        rsi_threshold = float(args[2]) if len(args) >= 3 else user_settings['rsi_threshold']
+        rsi_threshold = float(args[2])
         use_rsi = 'rsi_off' not in args
-        auto_interval = int(float(args[args.index(args[-1])]) * 60) if len(args) >= 4 and args[-1].replace('.', '').isdigit() else user_settings['auto_interval']
+        interval_minutes = int(args[args.index('interval_minutes') + 1]) if 'interval_minutes' in args else user_settings['auto_interval'] // 60
         user_settings.update({
-            'price_threshold': price_threshold,
             'volume_threshold': volume_threshold,
+            'price_threshold': price_threshold,
             'rsi_threshold': rsi_threshold,
             'use_rsi': use_rsi,
-            'auto_interval': auto_interval
+            'auto_interval': interval_minutes * 60
         })
-        settings[user_id_str] = user_settings
-        save_settings(settings)
-        message = (
-            f"✅ **Настройки обновлены**:\n"
-            f"📈 Цена: {price_threshold}% | Объём: {volume_threshold}% | RSI: {rsi_threshold} ({'вкл' if use_rsi else 'выкл'})\n"
-            f"⏱ Авто-поиск: каждые {auto_interval//60} мин"
+        save_user_settings(user_id, user_settings)
+        await update.message.reply_text(
+            f"✅ **Критерии обновлены**:\n"
+            f"📊 Рост: {price_threshold}% | Объём: {volume_threshold}% | RSI: {rsi_threshold} ({'вкл' if use_rsi else 'выкл'})\n"
+            f"⏱ Интервал: {interval_minutes} мин",
+            parse_mode='Markdown'
         )
-        await update.message.reply_text(message, parse_mode='Markdown')
-        logger.info(f"set_criteria: Пользователь {user_id} обновил настройки: {user_settings}")
-        # Перезапуск задачи авто-поиска
-        job = context.job_queue.get_jobs_by_name(f"auto_search_{user_id}")
-        if job:
-            job[0].schedule_removal()
-        context.job_queue.run_repeating(
-            auto_search_trades,
-            interval=user_settings['auto_interval'],
-            name=f"auto_search_{user_id}",
-            data=user_id
-        )
+        logger.info(f"set_criteria: Пользователь {user_id} обновил критерии: {user_settings}")
     except Exception as e:
         logger.error(f"set_criteria: Ошибка: {e}")
         await update.message.reply_text(f"🚨 **Ошибка**: {e}\nФормат: `/setcriteria <volume> <price> <rsi> [rsi_off] [interval_minutes]`", parse_mode='Markdown')
@@ -1561,7 +1082,6 @@ async def set_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🚨 **Ошибка**: {e}\nФормат: `/setbalance <сумма>`", parse_mode='Markdown')
         await notify_admin(f"Ошибка в /setbalance: {e}")
 
-# Команда /add_user
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("🚫 **Только админ может добавлять пользователей!**", parse_mode='Markdown')
@@ -1581,121 +1101,87 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🚨 **Ошибка**: {e}", parse_mode='Markdown')
         await notify_admin(f"Ошибка в /add_user: {e}")
 
-# Команда /idea
 async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"idea: Команда от пользователя {user_id}")
     if not is_authorized(user_id):
         await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
         return
-    session = None
+    session = Session()
     try:
+        # Загрузка настроек пользователя
         user_settings = get_user_settings(user_id)
-        min_probability = user_settings.get('min_probability', 60.0)
-        auto_interval = user_settings.get('auto_interval', 300)
         balance = user_settings.get('balance', None)
+        min_probability = user_settings.get('min_probability', 60.0)
+        auto_interval = user_settings.get('auto_interval', DEFAULT_AUTO_INTERVAL)
+
+        # Проверка наличия баланса
         if balance is None:
             await update.message.reply_text(
                 "🚫 **Баланс не установлен.**\nИспользуйте `/setbalance <сумма>` для установки баланса.",
                 parse_mode='Markdown'
             )
             return
-        
-        # Сброс существующих задач автопоиска
+
+        # Сброс текущих задач автопоиска
         job_name = f"auto_search_{user_id}"
         current_jobs = context.job_queue.get_jobs_by_name(job_name)
         for job in current_jobs:
             job.schedule_removal()
             logger.info(f"idea: Задача автопоиска {job_name} сброшена для user_id={user_id}")
 
-        # Загрузка модели
-        model, scaler, active_features = load_model()
-        if not model or not scaler or not active_features:
-            logger.error(f"idea: Модель не загружена для user_id={user_id}")
-            await update.message.reply_text("🚨 **Ошибка**: Модель не загружена.", parse_mode='Markdown')
-            return
-        
-        # Получение топовых криптовалют
+        # Получение списка криптовалют
         top_cryptos = get_top_cryptos()
-        session = Session()
+        if not top_cryptos:
+            await update.message.reply_text("🔍 **Нет доступных данных по криптовалютам.**", parse_mode='Markdown')
+            return
+
         opportunities = []
-        
-        # Анализ возможностей для каждой криптовалюты
+        # Анализ каждой криптовалютной пары
         for symbol, coin_id, price_change_1h, taker_buy_base, volume in top_cryptos:
             if not symbol.replace('/', '').isalnum():
                 logger.warning(f"idea: Некорректный символ {symbol}, пропускаем")
                 continue
-            df = await get_historical_data(symbol)
-            if df.empty or len(df) < 14:
-                logger.warning(f"idea: Недостаточно данных для {symbol}, строк: {len(df)}")
+            analysis = await trading_model.analyze_symbol(symbol, coin_id, price_change_1h, taker_buy_base, volume, balance)
+            if not analysis:
+                logger.warning(f"idea: Анализ для {symbol} не удался, пропускаем")
                 continue
-            current_price = await get_current_price(symbol)
-            if current_price <= 0.0:
-                logger.warning(f"idea: Не удалось получить цену для {symbol}, пропускаем")
-                continue
-            
-            # Анализ для LONG
-            long_result = await analyze_trade_opportunity(
-                model, scaler, active_features, df, price_change_1h, current_price, symbol, 
-                taker_buy_base, volume, coin_id, direction='LONG', balance=balance
-            )
-            if long_result[0]:  # is_opportunity
+            # Добавление LONG и SHORT возможностей
+            if analysis['long_prob'] >= min_probability:
                 opportunities.append({
-                    'symbol': symbol,
-                    'coin_id': coin_id,
-                    'price_change': long_result[1],
-                    'volume_change': long_result[2],
-                    'institutional_score': long_result[3],
-                    'vwap_signal': long_result[4],
-                    'sentiment': long_result[5],
-                    'rsi': long_result[6],
-                    'macd': long_result[7],
-                    'adx': long_result[8],
-                    'obv': long_result[9],
-                    'smart_money_score': long_result[10],
-                    'probability': long_result[11],
-                    'current_price': current_price,
-                    'df': df,
-                    'direction': 'LONG'
+                    **analysis,
+                    'direction': 'LONG',
+                    'probability': analysis['long_prob'],
+                    'stop_loss': analysis['stop_loss_long'],
+                    'take_profit_1': analysis['take_profit_1_long'],
+                    'take_profit_2': analysis['take_profit_2_long']
                 })
-            
-            # Анализ для SHORT
-            short_result = await analyze_trade_opportunity(
-                model, scaler, active_features, df, price_change_1h, current_price, symbol, 
-                taker_buy_base, volume, coin_id, direction='SHORT', balance=balance
-            )
-            if short_result[0]:  # is_opportunity
+            if analysis['short_prob'] >= min_probability:
                 opportunities.append({
-                    'symbol': symbol,
-                    'coin_id': coin_id,
-                    'price_change': short_result[1],
-                    'volume_change': short_result[2],
-                    'institutional_score': short_result[3],
-                    'vwap_signal': short_result[4],
-                    'sentiment': short_result[5],
-                    'rsi': short_result[6],
-                    'macd': short_result[7],
-                    'adx': short_result[8],
-                    'obv': short_result[9],
-                    'smart_money_score': short_result[10],
-                    'probability': short_result[11],
-                    'current_price': current_price,
-                    'df': df,
-                    'direction': 'SHORT'
+                    **analysis,
+                    'direction': 'SHORT',
+                    'probability': analysis['short_prob'],
+                    'stop_loss': analysis['stop_loss_short'],
+                    'take_profit_1': analysis['take_profit_1_short'],
+                    'take_profit_2': analysis['take_profit_2_short']
                 })
-        
+
+        # Если нет подходящих возможностей
         if not opportunities:
-            await update.message.reply_text("🔍 **Нет подходящих возможностей для торговли.**", parse_mode='Markdown')
+            await update.message.reply_text(
+                f"🔍 **Нет подходящих возможностей для торговли.**\nТекущая минимальная вероятность: {min_probability}%",
+                parse_mode='Markdown'
+            )
             return
-        
-        # Сортировка возможностей по вероятности (ближе к 50% — менее экстремальные)
+
+        # Сортировка возможностей по вероятности (чем дальше от 50%, тем лучше)
         opportunities.sort(key=lambda x: abs(x['probability'] - 50), reverse=True)
-        
+
         # Обработка лучшей возможности
         for opp in opportunities:
             symbol = opp['symbol']
             direction = opp['direction']
-            current_price = opp['current_price']
+            current_price = opp['price']
             df = opp['df']
             price_change = opp['price_change']
             volume_change = opp['volume_change']
@@ -1706,29 +1192,18 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
             macd = opp['macd']
             adx = opp['adx']
             obv = opp['obv']
-            smart_money_score = opp['smart_money_score']
             probability = opp['probability']
-            
-            # Корректировка отображаемой вероятности для SHORT
+            stop_loss = opp['stop_loss']
+            take_profit_1 = opp['take_profit_1']
+            take_profit_2 = opp['take_profit_2']
             display_probability = probability if direction == 'LONG' else 100.0 - probability
-            
+
             # Проверка минимальной вероятности
             if (direction == 'LONG' and probability < min_probability) or (direction == 'SHORT' and (100 - probability) < min_probability):
-                logger.warning(f"idea: Пропущена сделка для {symbol} из-за вероятности {probability:.1f}% (min={min_probability}%)")
+                logger.info(f"idea: Пропущена возможность для {symbol} ({direction}), вероятность {display_probability:.1f}% ниже {min_probability}%")
                 continue
-            
-            # Расчёт параметров сделки
-            atr = calculate_atr_normalized(df).iloc[-1] * current_price
-            if direction == 'LONG':
-                stop_loss = current_price - max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
-                take_profit_1 = current_price + 6 * atr
-                take_profit_2 = current_price + 10 * atr
-            else:  # SHORT
-                stop_loss = current_price + max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
-                take_profit_1 = current_price - 6 * atr
-                take_profit_2 = current_price - 10 * atr
-            
-            # Проверка дублирования сделок
+
+            # Проверка на дубликаты активных сделок
             existing_trades = session.query(Trade).filter(
                 Trade.user_id == user_id,
                 Trade.symbol == symbol,
@@ -1745,20 +1220,20 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
             if is_duplicate:
                 await update.message.reply_text(
-                    f"🔔 **Лучшая возможность ({symbol}) уже активна.** Пробуем другую...",
+                    f"🔔 **Возможность ({symbol}) уже активна.** Пробуем другую...",
                     parse_mode='Markdown'
                 )
                 await asyncio.sleep(0.5)
                 continue
-            
-            # Расчёт позиции и прибыли
+
+            # Расчет параметров сделки
             rr_ratio = (take_profit_1 - current_price) / (current_price - stop_loss) if direction == 'LONG' else (current_price - take_profit_1) / (stop_loss - current_price)
             position_size, position_size_percent = calculate_position_size(current_price, stop_loss, balance)
             position_size = position_size if direction == 'LONG' else -position_size
             potential_profit_tp1 = (take_profit_1 - current_price) * position_size if direction == 'LONG' else (current_price - take_profit_1) * abs(position_size)
             potential_profit_tp2 = (take_profit_2 - current_price) * position_size if direction == 'LONG' else (current_price - take_profit_2) * abs(position_size)
-            
-            # Сохранение сделки
+
+            # Сохранение сделки в базу данных
             trade = Trade(
                 user_id=user_id,
                 symbol=symbol,
@@ -1775,12 +1250,12 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             session.add(trade)
             session.flush()
+
+            # Сохранение метрик сделки
             trade_metrics = TradeMetrics(
                 trade_id=trade.id,
                 symbol=symbol,
                 entry_price=current_price,
-                price_after_1h=None,
-                price_after_2h=None,
                 volume_change=volume_change,
                 institutional_score=institutional_score,
                 vwap_signal=vwap_signal,
@@ -1789,13 +1264,12 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 macd=macd,
                 adx=adx,
                 obv=obv,
-                smart_money_score=smart_money_score,
-                probability=probability,
-                success=None
+                smart_money_score=min(100, institutional_score + (volume_change / 5)),
+                probability=probability
             )
             session.add(trade_metrics)
             session.commit()
-            
+
             # Формирование сообщения
             price_precision = 6 if current_price < 1 else 2
             vwap_text = '🟢 Бычий' if vwap_signal > 0 else '🔴 Медвежий'
@@ -1819,6 +1293,8 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📈 График: {tradingview_url}\n"
                 f"💾 Сделка сохранена. Отметьте результат:"
             )
+
+            # Создание кнопок управления
             keyboard = [
                 [InlineKeyboardButton("✅ TP1", callback_data=f"TP1_{trade.id}"),
                  InlineKeyboardButton("✅ TP2", callback_data=f"TP2_{trade.id}"),
@@ -1826,8 +1302,8 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("🚫 Отмена", callback_data=f"CANCEL_{trade.id}")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            # Отправка сообщения с графиком (если доступен)
+
+            # Отправка сообщения с графиком
             chart_path = create_price_chart(df, symbol, price_change)
             if chart_path and os.path.exists(chart_path):
                 with open(chart_path, 'rb') as photo:
@@ -1846,8 +1322,9 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=reply_markup,
                     parse_mode='Markdown'
                 )
+
             logger.info(f"idea: Сделка #{trade.id} создана для {symbol} ({direction})")
-            
+
             # Запуск задачи автопоиска
             context.job_queue.run_repeating(
                 auto_search_trades,
@@ -1857,16 +1334,17 @@ async def idea(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data=user_id
             )
             logger.info(f"idea: Задача автопоиска перезапущена для user_id={user_id} с интервалом {auto_interval} сек")
-            return  # Выходим после первой успешной сделки
-    
+
+            # Запуск проверки результата сделки
+            asyncio.create_task(check_trade_result(symbol, current_price, stop_loss, take_profit_1, take_profit_2, trade.id))
+            return  # Останавливаемся после первой подходящей сделки
     except Exception as e:
         logger.error(f"idea: Ошибка для user_id={user_id}: {str(e)}")
         await update.message.reply_text(f"🚨 **Ошибка**: {str(e)}", parse_mode='Markdown')
         await notify_admin(f"Ошибка в idea для user_id={user_id}: {str(e)}")
     finally:
-        if session is not None:
-            session.close()
-# Новая функция test для создания идеальных LONG и SHORT сделок
+        session.close()
+
 async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"test: Команда от пользователя {user_id}")
@@ -1883,51 +1361,32 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown'
             )
             return
-        model, scaler, active_features = load_model()
-        if not model or not scaler or not active_features:
-            logger.error(f"test: Модель не загружена для user_id={user_id}")
-            await update.message.reply_text("🚨 **Ошибка**: Модель не загружена.", parse_mode='Markdown')
-            return
         session = Session()
-        
-        # Список символов для тестовых сделок
         symbols = [('BTC/USDT', 'BTC'), ('ETH/USDT', 'ETH')]
         directions = ['LONG', 'SHORT']
-        
         for (symbol, coin_id), direction in zip(symbols, directions):
-            # Получаем актуальную цену
             current_price = await get_current_price(symbol)
             if current_price <= 0.0:
                 logger.warning(f"test: Не удалось получить цену для {symbol}, пропускаем")
                 await update.message.reply_text(f"⚠️ Не удалось получить цену для {symbol}.", parse_mode='Markdown')
                 continue
-            
-            # Получаем исторические данные
-            df = await get_historical_data(symbol)
+            df = await trading_model.get_historical_data(symbol)
             if df.empty:
                 logger.warning(f"test: Пустой DataFrame для {symbol}, пропускаем")
                 await update.message.reply_text(f"⚠️ Не удалось получить данные для {symbol}.", parse_mode='Markdown')
                 continue
-            
-            # Параметры для сделки
-            atr = calculate_atr_normalized(df).iloc[-1] * current_price
+            df = trading_model.calculate_indicators(df)
+            atr = df['atr_normalized'].iloc[-1] * current_price
             if direction == 'LONG':
                 stop_loss = current_price - max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
                 take_profit_1 = current_price + 6 * atr
                 take_profit_2 = current_price + 10 * atr
-            else:  # SHORT
+            else:
                 stop_loss = current_price + max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
                 take_profit_1 = current_price - 6 * atr
                 take_profit_2 = current_price - 10 * atr
-            
-            # Вычисление вероятности моделью
-            probability = await predict_probability(model, scaler, active_features, df, coin_id, stop_loss, abs(calculate_position_size(current_price, stop_loss, balance)[0]))
-            if direction == 'SHORT':
-                display_probability = 100.0 - probability  # Для SHORT показываем вероятность успеха (падения)
-            else:
-                display_probability = probability
-            
-            # Остальные параметры
+            probability = await trading_model.predict_probability(symbol, direction, stop_loss, abs(calculate_position_size(current_price, stop_loss, balance)[0]))
+            display_probability = probability if direction == 'LONG' else 100.0 - probability
             price_change = 2.5 if direction == 'LONG' else -2.5
             volume_change = 40.0
             institutional_score = 80.0
@@ -1938,8 +1397,6 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
             adx = 30.0
             obv = 1000000.0 if direction == 'LONG' else -1000000.0
             smart_money_score = 90.0
-            
-            # Проверка дублирования
             existing_trades = session.query(Trade).filter(
                 Trade.user_id == user_id,
                 Trade.symbol == symbol,
@@ -1960,15 +1417,11 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode='Markdown'
                 )
                 continue
-            
-            # Расчёт позиции
             rr_ratio = (take_profit_1 - current_price) / (current_price - stop_loss) if direction == 'LONG' else (current_price - take_profit_1) / (stop_loss - current_price)
             position_size, position_size_percent = calculate_position_size(current_price, stop_loss, balance)
             position_size = position_size if direction == 'LONG' else -position_size
             potential_profit_tp1 = (take_profit_1 - current_price) * position_size if direction == 'LONG' else (current_price - take_profit_1) * abs(position_size)
             potential_profit_tp2 = (take_profit_2 - current_price) * position_size if direction == 'LONG' else (current_price - take_profit_2) * abs(position_size)
-            
-            # Сохранение сделки
             trade = Trade(
                 user_id=user_id,
                 symbol=symbol,
@@ -1989,8 +1442,6 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 trade_id=trade.id,
                 symbol=symbol,
                 entry_price=current_price,
-                price_after_1h=None,
-                price_after_2h=None,
                 volume_change=volume_change,
                 institutional_score=institutional_score,
                 vwap_signal=vwap_signal,
@@ -2000,13 +1451,10 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 adx=adx,
                 obv=obv,
                 smart_money_score=smart_money_score,
-                probability=probability,
-                success=None
+                probability=probability
             )
             session.add(trade_metrics)
             session.commit()
-            
-            # Формирование сообщения
             price_precision = 6 if current_price < 1 else 2
             vwap_text = '🟢 Бычий' if vwap_signal > 0 else '🔴 Медвежий'
             macd_text = '🟢 Бычий' if macd > 0 else '🔴 Медвежий'
@@ -2036,16 +1484,26 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("🚫 Отмена", callback_data=f"CANCEL_{trade.id}")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=message,
-                reply_markup=reply_markup,
-                parse_mode='Markdown'
-            )
+            chart_path = create_price_chart(df, symbol, price_change)
+            if chart_path and os.path.exists(chart_path):
+                with open(chart_path, 'rb') as photo:
+                    await context.bot.send_photo(
+                        chat_id=user_id,
+                        photo=photo,
+                        caption=message,
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+                os.remove(chart_path)
+            else:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=message + "\n⚠️ Не удалось создать график.",
+                    reply_markup=reply_markup,
+                    parse_mode='Markdown'
+                )
             logger.info(f"test: Тестовая сделка #{trade.id} создана для {symbol} ({direction})")
-        
-        await update.message.reply_text("✅ **Тестовые сделки (LONG и SHORT) созданы.**", parse_mode='Markdown')
-    
+            asyncio.create_task(check_trade_result(symbol, current_price, stop_loss, take_profit_1, take_profit_2, trade.id))
     except Exception as e:
         logger.error(f"test: Ошибка для user_id={user_id}: {str(e)}")
         await update.message.reply_text(f"🚨 **Ошибка**: {str(e)}", parse_mode='Markdown')
@@ -2053,463 +1511,122 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         if session is not None:
             session.close()
-# Команда /active
-async def active(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_authorized(user_id):
-        await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
-        return
-    session = Session()
-    try:
-        active_trades = session.query(Trade).filter(
-            Trade.user_id == user_id,
-            Trade.result.is_(None) | (Trade.result == 'TP1')
-        ).order_by(Trade.timestamp.desc()).limit(5).all()
-        if not active_trades:
-            await update.message.reply_text("📊 **Активные сделки**: Нет активных сделок.", parse_mode='Markdown')
-            return
-        message = "📊 **Активные сделки**:\n"
-        for trade in active_trades:
-            price_precision = 6 if trade.entry_price < 1 else 2
-            current_price = await get_current_price(trade.symbol)
-            status = '🟡 Ожидает' if trade.result is None else '✅ TP1 достигнут'
-            message += (
-                f"#{trade.id}: *{trade.symbol} LONG*\n"
-                f"🎯 Вход: ${trade.entry_price:.{price_precision}f} | Текущая: ${current_price:.{price_precision}f}\n"
-                f"⛔ SL: ${trade.stop_loss:.{price_precision}f} | 💰 TP1: ${trade.take_profit_1:.{price_precision}f} | 💰 TP2: ${trade.take_profit_2:.{price_precision}f}\n"
-                f"📊 Статус: {status}\n"
-                f"⏰ Время: {trade.timestamp.strftime('%Y-%m-%d %H:%M')}\n\n"
-            )
-        keyboard = [[InlineKeyboardButton("🔄 Обновить", callback_data="refresh_active")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"active: Ошибка: {e}")
-        await update.message.reply_text(f"🚨 **Ошибка**: {e}", parse_mode='Markdown')
-        await notify_admin(f"Ошибка в /active: {e}")
-    finally:
-        session.close()
 
-# Команда /history
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_authorized(user_id):
-        await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
-        return
-    session = Session()
-    try:
-        trades = session.query(Trade).filter_by(user_id=user_id).order_by(Trade.timestamp.desc()).limit(5).all()
-        if not trades:
-            await update.message.reply_text("📜 **История сделок**: Нет сделок.", parse_mode='Markdown')
-            return
-        message = "📜 **История сделок**:\n"
-        for trade in trades:
-            price_precision = 6 if trade.entry_price < 1 else 2
-            status = '🟡 Активна' if trade.result is None or trade.result == 'TP1' else ('✅ TP2' if trade.result == 'TP2' else '❌ SL')
-            message += (
-                f"#{trade.id}: *{trade.symbol} LONG*\n"
-                f"🎯 Вход: ${trade.entry_price:.{price_precision}f}\n"
-                f"⛔ SL: ${trade.stop_loss:.{price_precision}f} | 💰 TP1: ${trade.take_profit_1:.{price_precision}f} | 💰 TP2: ${trade.take_profit_2:.{price_precision}f}\n"
-                f"📊 Статус: {status}\n"
-                f"⏰ Время: {trade.timestamp.strftime('%Y-%m-%d %H:%M')}\n\n"
-            )
-        keyboard = [
-            [InlineKeyboardButton("🟡 Активные", callback_data="filter_active")],
-            [InlineKeyboardButton("✅ Завершённые", callback_data="filter_completed")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"history: Ошибка: {e}")
-        await update.message.reply_text(f"🚨 **Ошибка**: {e}", parse_mode='Markdown')
-        await notify_admin(f"Ошибка в /history: {e}")
-    finally:
-        session.close()
-
-# Обработчик фильтров истории
-async def history_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    try:
-        await query.answer()
-    except telegram.error.BadRequest as e:
-        logger.warning(f"history_filter: Устаревший или недействительный запрос: {e}")
-        return
-    user_id = query.from_user.id
-    if not is_authorized(user_id):
-        await query.message.reply_text("🚫 Вы не авторизованы для использования бота.", parse_mode='Markdown')
-        return
-    session = Session()
-    try:
-        if query.data == 'filter_active':
-            trades = session.query(Trade).filter(
-                Trade.user_id == user_id,
-                (Trade.result.is_(None) | (Trade.result == 'TP1'))
-            ).order_by(Trade.timestamp.desc()).limit(10).all()
-            if not trades:
-                text = "📊 **Активные сделки**: Нет активных сделок."
-                reply_markup = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🟡 Активные", callback_data='filter_active'),
-                     InlineKeyboardButton("✅ Завершённые", callback_data='filter_completed'),
-                     InlineKeyboardButton("🔄 Обновить", callback_data='refresh_active')]
-                ])
-                await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-                return
-            text = "📊 **Активные сделки**:\n"
-            for trade in trades:
-                price_precision = 6 if trade.entry_price < 1 else 2
-                status = '🟡 Ожидает' if trade.result is None else '✅ TP1 достигнут'
-                current_price = await get_current_price(trade.symbol)
-                text += (
-                    f"#{trade.id}: *{trade.symbol} LONG*\n"
-                    f"🎯 Вход: ${trade.entry_price:.{price_precision}f} | Текущая: ${current_price:.{price_precision}f}\n"
-                    f"⛔ SL: ${trade.stop_loss:.{price_precision}f} | 💰 TP1: ${trade.take_profit_1:.{price_precision}f} | 💰 TP2: ${trade.take_profit_2:.{price_precision}f}\n"
-                    f"📊 Статус: {status}\n"
-                    f"⏰ Время: {trade.timestamp.strftime('%Y-%m-%d %H:%M')}\n\n"
-                )
-            reply_markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🟡 Активные", callback_data='filter_active'),
-                 InlineKeyboardButton("✅ Завершённые", callback_data='filter_completed'),
-                 InlineKeyboardButton("🔄 Обновить", callback_data='refresh_active')]
-            ])
-            if len(text) > 4000:  # Ограничение Telegram на длину сообщения
-                text = text[:3900] + "...\n(Список усечён из-за ограничений Telegram)"
-            await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-        elif query.data == 'filter_completed':
-            trades = session.query(Trade).filter(
-                Trade.user_id == user_id,
-                Trade.result.isnot(None)
-            ).order_by(Trade.timestamp.desc()).limit(10).all()
-            if not trades:
-                text = "📜 **Завершённые сделки**: Нет завершённых сделок."
-                reply_markup = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🟡 Активные", callback_data='filter_active'),
-                     InlineKeyboardButton("✅ Завершённые", callback_data='filter_completed'),
-                     InlineKeyboardButton("🔄 Обновить", callback_data='refresh_active')]
-                ])
-                await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-                return
-            text = "📜 **Последние 10 завершённых сделок**:\n"
-            for trade in trades:
-                trade_metrics = session.query(TradeMetrics).filter_by(trade_id=trade.id).first()
-                result = trade_metrics.success if trade_metrics else trade.result
-                final_price = trade.stop_loss if result == 'SL' else trade.take_profit_1 if result == 'TP1' else trade.take_profit_2
-                if trade.position_size > 0:  # Покупка (long)
-                    pnl = (final_price - trade.entry_price) * trade.position_size
-                else:  # Продажа (short)
-                    pnl = (trade.entry_price - final_price) * abs(trade.position_size)
-                price_precision = 6 if trade.entry_price < 1 else 2
-                text += (
-                    f"#{trade.id}: *{trade.symbol} {'LONG' if trade.position_size > 0 else 'SHORT'}*\n"
-                    f"🎯 Вход: ${trade.entry_price:.{price_precision}f} | Выход: ${final_price:.{price_precision}f}\n"
-                    f"📊 Результат: {'✅ TP1' if result == 'TP1' else '✅ TP2' if result == 'TP2' else '❌ SL'}\n"
-                    f"💸 PNL: {pnl:.2f} USDT\n"
-                    f"⏰ Время: {trade.timestamp.strftime('%Y-%m-%d %H:%M')}\n\n"
-                )
-            reply_markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🟡 Активные", callback_data='filter_active'),
-                 InlineKeyboardButton("✅ Завершённые", callback_data='filter_completed'),
-                 InlineKeyboardButton("🔄 Обновить", callback_data='refresh_active')]
-            ])
-            if len(text) > 4000:
-                text = text[:3900] + "...\n(Список усечён из-за ограничений Telegram)"
-            await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-        elif query.data == 'refresh_active':
-            trades = session.query(Trade).filter(
-                Trade.user_id == user_id,
-                (Trade.result.is_(None) | (Trade.result == 'TP1'))
-            ).order_by(Trade.timestamp.desc()).limit(10).all()
-            if not trades:
-                text = "📊 **Активные сделки**: Нет активных сделок."
-                reply_markup = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🟡 Активные", callback_data='filter_active'),
-                     InlineKeyboardButton("✅ Завершённые", callback_data='filter_completed'),
-                     InlineKeyboardButton("🔄 Обновить", callback_data='refresh_active')]
-                ])
-                await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-                return
-            text = "📊 **Активные сделки**:\n"
-            for trade in trades:
-                price_precision = 6 if trade.entry_price < 1 else 2
-                status = '🟡 Ожидает' if trade.result is None else '✅ TP1 достигнут'
-                current_price = await get_current_price(trade.symbol)
-                text += (
-                    f"#{trade.id}: *{trade.symbol} LONG*\n"
-                    f"🎯 Вход: ${trade.entry_price:.{price_precision}f} | Текущая: ${current_price:.{price_precision}f}\n"
-                    f"⛔ SL: ${trade.stop_loss:.{price_precision}f} | 💰 TP1: ${trade.take_profit_1:.{price_precision}f} | 💰 TP2: ${trade.take_profit_2:.{price_precision}f}\n"
-                    f"📊 Статус: {status}\n"
-                    f"⏰ Время: {trade.timestamp.strftime('%Y-%m-%d %H:%M')}\n\n"
-                )
-            reply_markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🟡 Активные", callback_data='filter_active'),
-                 InlineKeyboardButton("✅ Завершённые", callback_data='filter_completed'),
-                 InlineKeyboardButton("🔄 Обновить", callback_data='refresh_active')]
-            ])
-            if len(text) > 4000:
-                text = text[:3900] + "...\n(Список усечён из-за ограничений Telegram)"
-            await query.message.edit_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"history_filter: Ошибка для user_id={user_id}: {e}")
-        await query.message.reply_text(f"🚫 **Ошибка**: {str(e)}", parse_mode='Markdown')
-        await notify_admin(f"Ошибка в history_filter для user_id={user_id}: {e}")
-    finally:
-        session.close()
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_authorized(user_id):
-        await update.message.reply_text("🚫 Вы не авторизованы для использования бота.")
-        return
-    help_text = (
-        "📚 *Руководство по использованию торгового бота*\n\n"
-        "Бот помогает находить торговые возможности и управлять сделками. Доступные команды:\n"
-        "- `/start` - Запускает бота и отображает приветственное сообщение.\n"
-        "- `/idea` - Ищет торговые сигналы для всех доступных монет и предлагает сделки с вероятностью успеха.\n"
-        "- `/setcriteria` - Устанавливает критерии для автопоиска (интервал, минимальная вероятность).\n"
-        "- `/active` - Показывает активные сделки с кнопками для отметки результатов (TP1, TP2, SL).\n"
-        "- `/history` - Отображает историю сделок (активные или последние 10 завершённых).\n"
-        "- `/stats` - Показывает статистику: общее количество сделок, процент успешных, общий PNL.\n"
-        "- `/metrics` - Показывает метрики модели (значение потерь, вероятность на тестовых данных).\n"
-        "- `/add_user` - (Только для админа) Добавляет нового пользователя.\n"
-        "- `/stop` - Останавливает автопоиск сделок.\n"
-        "- `/clear_trades` - Очищает все сделки пользователя.\n"
-        "- `/setbalance <сумма>` - Устанавливает начальный баланс.\n"
-        "- `/help` - Показывает это руководство.\n\n"
-        "🔔 *Автопоиск*: Бот автоматически ищет сделки с заданным интервалом (настраивается через `/setcriteria`).\n"
-        "📊 *Дообучение*: Модель дообучается ежедневно или после 5 закрытых сделок.\n"
-        "⚠️ *Ошибки*: Все ошибки отправляются администратору для анализа.\n"
-        "📈 *PNL*: Рассчитывается как `(выходная_цена - входная_цена) * размер_позиции`.\n"
-        "Свяжитесь с админом для поддержки!"
-    )
-    try:
-        await update.message.reply_text(help_text, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"help_command: Ошибка для user_id={user_id}: {e}")
-        await update.message.reply_text("🚫 Ошибка при отображении помощи.")
-        await notify_admin(f"Ошибка в help_command для user_id={user_id}: {e}")
-
-# Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    logger.info(f"start: Команда от пользователя {user_id}")
+    
+    # Проверка авторизации
     if not is_authorized(user_id):
-        await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
-        return
-    user_settings = get_user_settings(user_id)
-    balance = user_settings.get('balance', None)
-    await update.message.reply_text(
-        f"👋 **Добро пожаловать в крипто-бота!**\n"
-        f"💰 **Баланс**: {balance if balance is not None else 'Не установлен'}\n"
-        f"📈 **Пары**: {', '.join(CRYPTO_PAIRS)}\n"
-        f"⚙️ **Текущие критерии**:\n"
-        f"  📊 Рост > {user_settings['price_threshold']}% | Объём > {user_settings['volume_threshold']}% | RSI > {user_settings['rsi_threshold']} ({'вкл' if user_settings['use_rsi'] else 'выкл'})\n"
-        f"  ⏱ Авто-поиск: каждые {user_settings['auto_interval']//60} мин\n"
-        f"📚 **Команды**:\n"
-        f"  `/setbalance <сумма>` - Установить баланс\n"
-        f"  `/idea [volume price rsi | rsi_off]` - Торговая идея\n"
-        f"  `/setcriteria <volume> <price> <rsi> [rsi_off] [interval_minutes]` - Настроить критерии\n"
-        f"  `/active` - Активные сделки\n"
-        f"  `/history` - История сделок\n"
-        f"  `/stats` - Статистика\n"
-        f"  `/metrics` - Метрики\n"
-        f"  `/add_user <user_id>` - Добавить пользователя (админ)\n"
-        f"  `/stop` - Остановить бота (админ)\n"
-        f"  `/clear_trades` - Очистить базу сделок",
-        parse_mode='Markdown'
-    )
-
-
-# Команда /stop
-async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("🚫 **У вас нет прав.**", parse_mode='Markdown')
-        return
-    logger.info("stop: Остановка бота")
-    await update.message.reply_text("🛑 **Бот останавливается...**", parse_mode='Markdown')
-    try:
-        await context.application.stop()
-        await context.application.shutdown()
-        os._exit(0)
-    except Exception as e:
-        logger.error(f"stop: Ошибка: {e}")
-        await update.message.reply_text(f"🚨 **Ошибка**: {e}", parse_mode='Markdown')
-        await notify_admin(f"Ошибка при остановке: {e}")
-
-# Команда /stats
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_authorized(user_id):
-        await update.message.reply_text("🚫 Вы не авторизованы для использования бота.")
-        return
-    session = Session()
-    try:
-        trades = session.query(Trade).filter(Trade.user_id == user_id, Trade.result.isnot(None)).all()
-        if not trades:
-            await update.message.reply_text("Нет завершённых сделок.")
-            return
-        total_trades = len(trades)
-        successful_trades = sum(1 for trade in trades if trade.result in ['TP1', 'TP2'])
-        success_rate = (successful_trades / total_trades) * 100 if total_trades > 0 else 0
-        total_pnl = 0
-        for trade in trades:
-            trade_metrics = session.query(TradeMetrics).filter_by(trade_id=trade.id).first()
-            if trade_metrics:
-                final_price = trade.stop_loss if trade_metrics.success == 'SL' else trade.take_profit_1 if trade_metrics.success == 'TP1' else trade.take_profit_2
-                # Учитываем направление сделки (покупка/продажа)
-                if trade.position_size > 0:  # Покупка (long)
-                    pnl = (final_price - trade.entry_price) * trade.position_size
-                else:  # Продажа (short)
-                    pnl = (trade.entry_price - final_price) * abs(trade.position_size)
-                total_pnl += pnl
-                logger.warning(f"stats: Сделка #{trade.id}, PNL={pnl:.2f}, final_price={final_price:.2f}, entry_price={trade.entry_price:.2f}, position_size={trade.position_size}")
-        user_settings = get_user_settings(user_id)
-        balance = user_settings.get('balance', 0)
-        text = (
-            f"📊 Статистика:\n"
-            f"Всего сделок: {total_trades}\n"
-            f"Успешных сделок: {successful_trades} ({success_rate:.2f}%)\n"
-            f"Общий PNL: {total_pnl:.2f} USDT\n"
-            f"Текущий баланс: {balance:.2f} USDT"
-        )
-        await update.message.reply_text(text)
-    except Exception as e:
-        logger.error(f"stats: Ошибка для user_id={user_id}: {e}")
-        await update.message.reply_text(f"🚫 Ошибка: {str(e)}")
-        await notify_admin(f"Ошибка в stats для user_id={user_id}: {e}")
-    finally:
-        session.close()
-
-# Команда /metrics
-async def metrics(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_authorized(user_id):
-        await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
-        return
-    session = Session()
-    try:
-        metrics = session.query(TradeMetrics).join(Trade, Trade.id == TradeMetrics.trade_id).filter(Trade.user_id == user_id).all()
-        total_trades = len(metrics)
-        wins = len([m for m in metrics if m.success in ['TP1', 'TP2']])
-        win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-        avg_rr = sum([t.rr_ratio for t in session.query(Trade).filter_by(user_id=user_id).all()]) / total_trades if total_trades > 0 else 0
-        message = (
-            f"📊 **Метрики**\n"
-            f"🔢 Всего сделок: {total_trades}\n"
-            f"🏆 Процент выигрышей: {win_rate:.2f}%\n"
-            f"📈 Средний RR: {avg_rr:.1f}:1\n"
-            f"📋 Последние (до 5):\n"
-        )
-        for i, m in enumerate(metrics[:5], 1):
-            trade = session.query(Trade).filter_by(id=m.trade_id).first()
-            price_precision = 6 if m.entry_price < 1 else 2
-            price_change = ((m.price_after_2h - m.entry_price) / m.entry_price * 100) if m.price_after_2h else 0
-            status = '🟡 Активна' if m.success is None or m.success == 'TP1' else ('✅ TP2' if m.success == 'TP2' else '❌ SL')
-            message += (
-                f"#{i}: *{m.symbol} LONG*\n"
-                f"🎯 Вход: ${m.entry_price:.{price_precision}f}\n"
-                f"📈 Изменение: {price_change:.2f}%\n"
-                f"📊 Статус: {status}\n"
-                f"⏰ Время: {trade.timestamp.strftime('%Y-%m-%d %H:%M')}\n\n"
-            )
-        await update.message.reply_text(message, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"metrics: Ошибка: {e}")
-        await update.message.reply_text(f"🚨 **Ошибка**: {e}", parse_mode='Markdown')
-        await notify_admin(f"Ошибка в /metrics: {e}")
-    finally:
-        session.close()
-
-async def clear_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    logger.info(f"clear_trades: Команда от пользователя {user_id}")
-    if not is_authorized(user_id):
-        await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
-        return
-    session = None
-    try:
-        session = Session()
-        # Удаление только пользовательских записей из Trade
-        deleted_trades = session.query(Trade).filter_by(user_id=user_id).delete()
-        # Удаление связанных записей из TradeMetrics
-        deleted_metrics = session.query(TradeMetrics).filter(
-            TradeMetrics.trade_id.in_(
-                session.query(Trade.id).filter_by(user_id=user_id)
-            )
-        ).delete()
-        session.commit()
         await update.message.reply_text(
-            f"🗑️ **Удалено {deleted_trades} сделок и {deleted_metrics} метрик для вашего аккаунта.**",
+            "🚫 **Доступ запрещён.** Обратитесь к администратору для получения доступа.",
             parse_mode='Markdown'
         )
-        logger.info(f"clear_trades: Удалено {deleted_trades} сделок и {deleted_metrics} метрик для user_id={user_id}")
-    except Exception as e:
-        logger.error(f"clear_trades: Ошибка для user_id={user_id}: {e}")
-        await update.message.reply_text(f"🚨 **Ошибка при очистке сделок**: {e}", parse_mode='Markdown')
-        await notify_admin(f"Ошибка в clear_trades для user_id={user_id}: {e}")
-    finally:
-        if session is not None:
-            session.close()
+        return
 
-# Основная функция
-async def main():
-    global application
-    logging.basicConfig(
-        level=logging.WARNING,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    # Загрузка настроек пользователя
+    user_settings = get_user_settings(user_id)
+    balance = user_settings.get('balance', None)
+    min_probability = user_settings.get('min_probability', 60.0)
+    auto_interval = user_settings.get('auto_interval', DEFAULT_AUTO_INTERVAL)
+
+    # Формирование приветственного сообщения
+    message = (
+        f"👋 **Добро пожаловать в трейдинг-бота!**\n\n"
+        f"💰 **Ваш баланс**: {f'${balance:.2f}' if balance is not None else 'Не установлен'}\n"
+        f"🎲 **Минимальная вероятность**: {min_probability}%\n"
+        f"⏱ **Интервал автопоиска**: {auto_interval//60} мин\n\n"
+        f"📖 **Доступные команды**:\n"
+        f"/idea - Найти торговую возможность\n"
+        f"/test - Создать тестовую сделку\n"
+        f"/setbalance <сумма> - Установить баланс\n"
+        f"/setminprobability <процент> - Установить минимальную вероятность\n"
+        f"/setcriteria <volume> <price> <rsi> [rsi_off] [interval_minutes] - Настроить критерии\n"
     )
-    logger = logging.getLogger(__name__)
+    
+    if user_id == ADMIN_ID:
+        message += f"/add_user <user_id> - Добавить пользователя (только для админа)\n"
 
-    try:
-        application = (
-            Application.builder()
-            .token(TELEGRAM_TOKEN)
-            .arbitrary_callback_data(True)
-            .build()
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+    # Запуск задач для пользователя
+    job_name = f"auto_search_{user_id}"
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for job in current_jobs:
+        job.schedule_removal()
+        logger.info(f"start: Задача автопоиска {job_name} сброшена для user_id={user_id}")
+
+    context.job_queue.run_repeating(
+        auto_search_trades,
+        interval=auto_interval,
+        first=auto_interval,
+        name=job_name,
+        data=user_id
+    )
+    logger.info(f"start: Задача автопоиска запущена для user_id={user_id} с интервалом {auto_interval} сек")
+
+    # Запуск проверки активных сделок
+    job_check_trades = f"check_trades_{user_id}"
+    current_check_jobs = context.job_queue.get_jobs_by_name(job_check_trades)
+    for job in current_check_jobs:
+        job.schedule_removal()
+        logger.info(f"start: Задача проверки сделок {job_check_trades} сброшена для user_id={user_id}")
+
+    context.job_queue.run_repeating(
+        check_active_trades,
+        interval=60,  # Проверка каждую минуту
+        first=10,
+        name=job_check_trades,
+        data=user_id
+    )
+    logger.info(f"start: Задача проверки активных сделок запущена для user_id={user_id}")
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"error_handler: Ошибка: {context.error}")
+    await notify_admin(f"Ошибка в боте: {context.error}")
+    if update and update.effective_user:
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text="🚨 **Произошла ошибка.** Пожалуйста, попробуйте снова или свяжитесь с администратором.",
+            parse_mode='Markdown'
         )
 
-        time_00_00 = time(hour=0, minute=0)
+def main():
+    try:
+        # Инициализация приложения
+        application = Application.builder().token(TELEGRAM_TOKEN).build()
 
+        # Регистрация обработчиков команд
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("idea", idea))
+        application.add_handler(CommandHandler("test", test))
+        application.add_handler(CommandHandler("setbalance", set_balance))
+        application.add_handler(CommandHandler("setminprobability", set_min_probability))
+        application.add_handler(CommandHandler("setcriteria", set_criteria))
+        application.add_handler(CommandHandler("add_user", add_user))
+        application.add_handler(CallbackQueryHandler(button))
+
+        # Регистрация обработчика ошибок
+        application.add_error_handler(error_handler)
+
+        # Запуск ежедневного дообучения модели
         application.job_queue.run_daily(
             retrain_model_daily,
-            time=time_00_00,
-            name="daily_retrain"
+            time(hour=0, minute=0),
+            days=(0, 1, 2, 3, 4, 5, 6),
+            name="retrain_model_daily"
         )
+        logger.info("main: Задача ежедневного дообучения модели запущена")
 
-        handlers = [
-            CommandHandler("start", start),
-            CommandHandler("help", help_command),
-            CommandHandler("idea", idea),
-            CommandHandler("setcriteria", set_criteria),
-            CommandHandler("active", active),
-            CommandHandler("history", history),
-            CommandHandler("stats", stats),
-            CommandHandler("metrics", metrics),
-            CommandHandler("add_user", add_user),
-            CommandHandler("stop", stop),
-            CommandHandler("clear_trades", clear_trades),
-            CommandHandler("setbalance", set_balance),
-            CommandHandler("setminprobability", set_min_probability),
-            CommandHandler("test", test),  # Новая команда
-            CallbackQueryHandler(button),
-            CallbackQueryHandler(history_filter, pattern='^(filter_active|filter_completed|refresh_active)$')
-        ]
+        # Обеспечение существования необходимых файлов
+        ensure_files_exist()
 
-        for handler in handlers:
-            application.add_handler(handler)
-
-        await application.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
-        )
-
+        # Запуск бота
+        logger.info("main: Бот запускается...")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as e:
-        logger.error(f"Ошибка запуска: {e}")
-        await notify_admin(f"ОШИБКА: {e}")
-        
-    finally:
-        try:
-            if 'application' in globals():
-                await application.stop()
-                await application.shutdown()
-        except Exception as e:
-            logger.error(f"Ошибка завершения: {e}")
+        logger.error(f"main: Критическая ошибка при запуске бота: {e}")
+        asyncio.run(notify_admin(f"Критическая ошибка при запуске бота: {e}"))
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
