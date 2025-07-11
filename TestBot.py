@@ -237,14 +237,25 @@ class TradingModel:
             if not model or not scaler:
                 logger.error(f"predict_probability: Модель или скейлер не загружены для {symbol}")
                 return 0.0
-    
-            # Убедимся, что все активные признаки присутствуют в DataFrame
-            available_features = [f for f in self.active_features if f in df.columns]
+
+            # Проверяем, что все активные признаки присутствуют в DataFrame
+            available_features = []
+            for feature in self.active_features:
+                if feature in df.columns:
+                    available_features.append(feature)
+                else:
+                    logger.warning(f"predict_probability: Признак {feature} отсутствует для {symbol}")
+
             if not available_features:
                 logger.error(f"predict_probability: Нет доступных признаков для {symbol}")
                 return 0.0
-    
+
+            # Берем последнюю строку с доступными признаками
             features = df[available_features].iloc[-1:].values
+            if features.size == 0:
+                logger.error(f"predict_probability: Нет данных для предсказания {symbol}")
+                return 0.0
+
             features_scaled = scaler.transform(features)
             probability = model.predict_proba(features_scaled)[0][1] * 100
             
@@ -271,7 +282,7 @@ class TradingModel:
             if missing_columns:
                 logger.error(f"calculate_indicators: Отсутствуют столбцы: {missing_columns}")
                 return df
-    
+
             # Очистка данных
             df = df.dropna(subset=required_columns)
             df = df[(df['close'] > 0) & (df['volume'] >= 0)]
@@ -279,26 +290,26 @@ class TradingModel:
             if len(df) < 14:
                 logger.warning("calculate_indicators: После очистки недостаточно данных")
                 return df
-    
+
             # Добавляем price если его нет
             if 'price' not in df.columns:
                 df['price'] = df['close']
-    
+
             # Волатильность (Bollinger Bands)
             bb = BollingerBands(close=df['close'], window=20, window_dev=2)
             df['bb_upper'] = bb.bollinger_hband()
             df['bb_lower'] = bb.bollinger_lband()
             df['bb_width'] = bb.bollinger_wband()
-    
+
             # Моментум (RSI)
             df['rsi'] = RSIIndicator(close=df['close'], window=14).rsi()
-    
+
             # Расчет MACD
             ema_fast = df['close'].ewm(span=12, adjust=False).mean()
             ema_slow = df['close'].ewm(span=26, adjust=False).mean()
             df['macd'] = ema_fast - ema_slow
             df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-    
+
             # Тренд (ADX)
             high_diff = df['high'].diff()
             low_diff = df['low'].diff()
@@ -314,14 +325,14 @@ class TradingModel:
             minus_di = 100 * minus_dm.rolling(window=14).mean() / tr
             dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
             df['adx'] = dx.rolling(window=14).mean()
-    
+
             # Объем (OBV)
             df['obv'] = OnBalanceVolumeIndicator(close=df['close'], volume=df['volume']).on_balance_volume()
-    
+
             # VWAP
             df['vwap'] = (df['close'] * df['volume']).cumsum() / df['volume'].cumsum()
             df['vwap_signal'] = np.where(df['close'] > df['vwap'], 1.0, -1.0)
-    
+
             # Прочие признаки
             df['price_change_1h'] = df['close'].pct_change(4) * 100
             df['price_change_2h'] = df['close'].pct_change(8) * 100
@@ -329,13 +340,13 @@ class TradingModel:
             df['volume_score'] = df['volume'] / df['volume'].rolling(window=6).mean() * 100
             df['volume_change'] = df['volume'].pct_change() * 100
             df['atr_normalized'] = (df['high'] - df['low']) / df['close'].replace(0, 0.0001) * 100
-    
+
             # Уровни поддержки и сопротивления
             df['support_level'] = df['low'].rolling(window=20).min() / df['close'].replace(0, 0.0001)
             df['resistance_level'] = df['high'].rolling(window=20).max() / df['close'].replace(0, 0.0001)
-    
-            # Заполнение пропусков
-            df = df.fillna(method='ffill').fillna(0)
+
+            # Заполнение пропусков (исправленная версия без устаревшего метода)
+            df = df.ffill().fillna(0)
             
             logger.info(f"calculate_indicators: Сформированы признаки для {df['symbol'].iloc[0] if 'symbol' in df.columns else 'unknown'}")
             return df
@@ -1864,3 +1875,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
