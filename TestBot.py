@@ -137,15 +137,45 @@ class TradingModel:
         self.active_features = []
         self.load_model()
 
-    def get_model_for_symbol(self, symbol):
-        """Выбираем модель для символа"""
-        base_symbol = symbol.replace('/USDT', 'USDT')
-        if 'combined' in self.models:
-            return self.models['combined'], self.scalers['combined'], self.active_features['combined']
-        elif base_symbol in self.models:
-            return self.models[base_symbol], self.scalers[base_symbol], self.active_features[base_symbol]
-        else:
-            return None, None, None
+def get_model_for_symbol(self, symbol):
+    """Выбираем модель для символа с улучшенной обработкой ошибок"""
+    try:
+        base_symbol = symbol.replace('/USDT', '')
+        
+        # 1. Попробуем найти модель для конкретного символа
+        if base_symbol in self.models:
+            if base_symbol in self.scalers and base_symbol in self.active_features:
+                return (
+                    self.models[base_symbol], 
+                    self.scalers[base_symbol], 
+                    self.active_features[base_symbol]
+                )
+        
+        # 2. Попробуем найти общую модель
+        for model_key in ['combined', 'default', 'main']:
+            if model_key in self.models and model_key in self.scalers and model_key in self.active_features:
+                return (
+                    self.models[model_key], 
+                    self.scalers[model_key], 
+                    self.active_features[model_key]
+                )
+        
+        # 3. Возьмем первую доступную модель
+        if self.models:
+            first_key = next(iter(self.models))
+            if first_key in self.scalers and first_key in self.active_features:
+                return (
+                    self.models[first_key], 
+                    self.scalers[first_key], 
+                    self.active_features[first_key]
+                )
+        
+        logger.error(f"No valid model found for {symbol}")
+        return None, None, None
+        
+    except Exception as e:
+        logger.error(f"Error in get_model_for_symbol for {symbol}: {e}")
+        return None, None, None
 
     def load_model(self):
         try:
@@ -235,75 +265,43 @@ class TradingModel:
 
     
     async def predict_probability(self, symbol, direction='LONG', stop_loss=None, position_size=0):
-        """
-        Прогнозирует вероятность успешной сделки для заданного символа и направления
-        
-        Параметры:
-            symbol (str): Торговая пара (например, 'BTC/USDT')
-            direction (str): Направление сделки ('LONG' или 'SHORT')
-            stop_loss (float): Цена стоп-лосса (опционально)
-            position_size (float): Размер позиции (опционально)
-        
-        Возвращает:
-            float: Вероятность успеха в процентах (0-100)
-        """
+        """Прогнозирует вероятность успешной сделки с улучшенной обработкой ошибок"""
         try:
-            # Получаем исторические данные
             df = await self.get_historical_data(symbol)
             if df.empty:
-                logger.warning(f"predict_probability: Пустой DataFrame для {symbol}")
+                logger.warning(f"Empty DataFrame for {symbol}")
                 return 0.0
             
-            # Рассчитываем индикаторы
             df = self.calculate_indicators(df)
             
-            # Получаем модель и скейлер для символа
             model, scaler, active_features = self.get_model_for_symbol(symbol)
-            if not model or not scaler:
-                logger.error(f"predict_probability: Модель или скейлер не найдены для {symbol}")
+            if model is None or scaler is None or not active_features:
+                logger.error(f"No model/scaler available for {symbol}")
                 return 0.0
 
-            # Проверяем доступность признаков
+            # Проверяем доступные признаки
             available_features = [f for f in active_features if f in df.columns]
             if not available_features:
-                logger.error(f"predict_probability: Нет доступных признаков для {symbol}")
+                logger.error(f"No features available for {symbol}")
                 return 0.0
 
-            # Подготавливаем данные для предсказания
-            features = df[available_features].iloc[-1:].values
-            if features.size == 0:
-                logger.error(f"predict_probability: Нет данных для предсказания {symbol}")
+            # Подготавливаем данные
+            try:
+                features = df[available_features].iloc[-1:].values
+                features_scaled = scaler.transform(features)
+                probability = model.predict_proba(features_scaled)[0][1] * 100
+            except Exception as e:
+                logger.error(f"Prediction failed for {symbol}: {e}")
                 return 0.0
 
-            # Масштабируем признаки и делаем предсказание
-            features_scaled = scaler.transform(features)
-            proba = model.predict_proba(features_scaled)[0][1] * 100
-            
-            # Корректируем вероятность для SHORT сделок
             if direction == 'SHORT':
-                proba = 100 - proba
+                probability = 100 - probability
+                
+            return max(0.0, min(100.0, probability))
             
-            # Ограничиваем вероятность диапазоном 0-100%
-            final_proba = max(0.0, min(100.0, proba))
-            
-            logger.info(
-                f"predict_probability: {symbol} {direction} | "
-                f"Probability: {final_proba:.1f}% | "
-                f"Price: {df['price'].iloc[-1]:.4f} | "
-                f"RSI: {df['rsi'].iloc[-1]:.1f} | "
-                f"MACD: {df['macd'].iloc[-1]:.4f}"
-            )
-            
-            return final_proba
-            
-        except ccxt.NetworkError as e:
-            logger.error(f"predict_probability: Ошибка сети для {symbol}: {e}")
-        except ccxt.ExchangeError as e:
-            logger.error(f"predict_probability: Ошибка биржи для {symbol}: {e}")
         except Exception as e:
-            logger.error(f"predict_probability: Неожиданная ошибка для {symbol}: {e}", exc_info=True)
-        
-        return 0.0
+            logger.error(f"Error in predict_probability for {symbol}: {e}")
+            return 0.0
 
 
     
