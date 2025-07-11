@@ -76,14 +76,9 @@ class ForwardTradingBot:
         self.load_subscribed_users()
     
     def load_subscribed_users(self):
-        try:
-            if os.path.exists(ALLOWED_USERS_PATH):
-                with open(ALLOWED_USERS_PATH, 'r') as f:
-                    self.subscribed_users = set(json.load(f))
-            logger.info(f"Loaded subscribed users: {self.subscribed_users}")  # Добавьте эту строку
-        except Exception as e:
-            logger.error(f"Error loading subscribed users: {e}")
-            self.subscribed_users = set()
+        ensure_files_exist()
+        with open(ALLOWED_USERS_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
     
     def save_subscribed_users(self):
         try:
