@@ -73,7 +73,7 @@ class ForwardTradingBot:
         
         # Подписчики бота
         self.subscribed_users = set()
-        self.load_subscribed_users()
+        self.subscribed_users()
     
     def load_allowed_users():
         """Загрузка списка разрешенных пользователей с полной обработкой ошибок"""
