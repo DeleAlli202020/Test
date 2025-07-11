@@ -137,45 +137,45 @@ class TradingModel:
         self.active_features = []
         self.load_model()
 
-def get_model_for_symbol(self, symbol):
-    """Выбираем модель для символа с улучшенной обработкой ошибок"""
-    try:
-        base_symbol = symbol.replace('/USDT', '')
-        
-        # 1. Попробуем найти модель для конкретного символа
-        if base_symbol in self.models:
-            if base_symbol in self.scalers and base_symbol in self.active_features:
-                return (
-                    self.models[base_symbol], 
-                    self.scalers[base_symbol], 
-                    self.active_features[base_symbol]
-                )
-        
-        # 2. Попробуем найти общую модель
-        for model_key in ['combined', 'default', 'main']:
-            if model_key in self.models and model_key in self.scalers and model_key in self.active_features:
-                return (
-                    self.models[model_key], 
-                    self.scalers[model_key], 
-                    self.active_features[model_key]
-                )
-        
-        # 3. Возьмем первую доступную модель
-        if self.models:
-            first_key = next(iter(self.models))
-            if first_key in self.scalers and first_key in self.active_features:
-                return (
-                    self.models[first_key], 
-                    self.scalers[first_key], 
-                    self.active_features[first_key]
-                )
-        
-        logger.error(f"No valid model found for {symbol}")
-        return None, None, None
-        
-    except Exception as e:
-        logger.error(f"Error in get_model_for_symbol for {symbol}: {e}")
-        return None, None, None
+    def get_model_for_symbol(self, symbol):
+        """Выбираем модель для символа с улучшенной обработкой ошибок"""
+        try:
+            base_symbol = symbol.replace('/USDT', '')
+            
+            # 1. Попробуем найти модель для конкретного символа
+            if base_symbol in self.models:
+                if base_symbol in self.scalers and base_symbol in self.active_features:
+                    return (
+                        self.models[base_symbol], 
+                        self.scalers[base_symbol], 
+                        self.active_features[base_symbol]
+                    )
+            
+            # 2. Попробуем найти общую модель
+            for model_key in ['combined', 'default', 'main']:
+                if model_key in self.models and model_key in self.scalers and model_key in self.active_features:
+                    return (
+                        self.models[model_key], 
+                        self.scalers[model_key], 
+                        self.active_features[model_key]
+                    )
+            
+            # 3. Возьмем первую доступную модель
+            if self.models:
+                first_key = next(iter(self.models))
+                if first_key in self.scalers and first_key in self.active_features:
+                    return (
+                        self.models[first_key], 
+                        self.scalers[first_key], 
+                        self.active_features[first_key]
+                    )
+            
+            logger.error(f"No valid model found for {symbol}")
+            return None, None, None
+            
+        except Exception as e:
+            logger.error(f"Error in get_model_for_symbol for {symbol}: {e}")
+            return None, None, None
 
     def load_model(self):
         try:
