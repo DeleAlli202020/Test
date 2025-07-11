@@ -399,7 +399,7 @@ class TradingModel:
         finally:
             session.close()
 
-     async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if not is_authorized(user_id):
             await update.message.reply_text("🚫 Вы не авторизованы для использования бота.")
