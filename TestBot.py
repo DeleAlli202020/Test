@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 import telegram
 from ta.volatility import BollingerBands
 from ta.momentum import RSIIndicator
-from ta.trend import ADXIndicator, MACD
+from ta.trend import ADXIndicator
 from ta.volume import OnBalanceVolumeIndicator
 from sklearn.metrics import log_loss
 from threading import Lock
@@ -211,46 +211,68 @@ class TradingModel:
         logger.warning(f"get_historical_data: Не удалось получить данные для {symbol}")
         return pd.DataFrame()
 
-    def calculate_indicators(self, df):
-        if df.empty or len(df) < 14:
-            logger.warning("calculate_indicators: Недостаточно данных")
+   def calculate_indicators(self, df):
+    if df.empty or len(df) < 14:
+        logger.warning("calculate_indicators: Недостаточно данных")
+        return df
+    try:
+        # Проверка входных данных
+        required_columns = ['price', 'high', 'low', 'volume']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            logger.error(f"calculate_indicators: Отсутствуют столбцы: {missing_columns}")
             return df
-        try:
-            # Волатильность
-            bb = BollingerBands(close=df['price'], window=20, window_dev=2)
-            df['bb_upper'] = bb.bollinger_hband()
-            df['bb_lower'] = bb.bollinger_lband()
-            df['bb_width'] = bb.bollinger_wband()
-
-            # Моментум
-            df['rsi'] = RSIIndicator(close=df['price'], window=14).rsi()
-            macd = MACD(close=df['price'], window_slow=26, window_fast=12, window_sign=9)
-            df['macd'] = macd.macd()
-            df['macd_signal'] = macd.macd_signal()
-
-            # Тренд
-            df['adx'] = ADXIndicator(high=df['high'], low=df['low'], close=df['price'], window=14).adx()
-
-            # Объем
-            df['obv'] = OnBalanceVolumeIndicator(close=df['price'], volume=df['volume']).on_balance_volume()
-
-            # Прочие признаки
-            df['price_change_1h'] = df['price'].pct_change(4) * 100
-            df['price_change_2h'] = df['price'].pct_change(8) * 100
-            df['price_change_6h'] = df['price'].pct_change(24) * 100
-            df['volume_score'] = df['volume'] / df['volume'].rolling(window=6).mean() * 100
-            df['volume_change'] = df['volume'].pct_change() * 100
-            df['atr_normalized'] = (df['high'] - df['low']) / df['price'] * 100
-
-            # Уровни поддержки и сопротивления
-            df['support_level'] = df['low'].rolling(window=20).min() / df['price']
-            df['resistance_level'] = df['high'].rolling(window=20).max() / df['price']
-
-            return df.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
-        except Exception as e:
-            logger.error(f"calculate_indicators: Ошибка: {e}")
+        
+        # Очистка данных: удаление NaN и нулевых значений
+        df = df.dropna(subset=required_columns)
+        df = df[df['price'] > 0]  # Удаляем строки с нулевыми или отрицательными ценами
+        df = df[df['volume'] >= 0]  # Удаляем строки с отрицательным объемом
+        
+        if len(df) < 14:
+            logger.warning("calculate_indicators: После очистки недостаточно данных")
             return df
 
+        # Волатильность (Bollinger Bands)
+        bb = BollingerBands(close=df['price'], window=20, window_dev=2)
+        df['bb_upper'] = bb.bollinger_hband()
+        df['bb_lower'] = bb.bollinger_lband()
+        df['bb_width'] = bb.bollinger_wband()
+
+        # Моментум (RSI)
+        df['rsi'] = RSIIndicator(close=df['price'], window=14).rsi()
+
+        # Расчет MACD вручную, так как ta не содержит MACD
+        ema_fast = df['price'].ewm(span=12, adjust=False).mean()
+        ema_slow = df['price'].ewm(span=26, adjust=False).mean()
+        df['macd'] = ema_fast - ema_slow
+        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+
+        # Тренд (ADX)
+        df['adx'] = ADXIndicator(high=df['high'], low=df['low'], close=df['price'], window=14).adx()
+
+        # Объем (OBV)
+        df['obv'] = OnBalanceVolumeIndicator(close=df['price'], volume=df['volume']).on_balance_volume()
+
+        # VWAP (Volume Weighted Average Price)
+        df['vwap'] = (df['price'] * df['volume']).cumsum() / df['volume'].cumsum()
+        df['vwap_signal'] = np.where(df['price'] > df['vwap'], 1.0, -1.0)  # Бычий сигнал, если цена выше VWAP
+
+        # Прочие признаки
+        df['price_change_1h'] = df['price'].pct_change(4) * 100
+        df['price_change_2h'] = df['price'].pct_change(8) * 100
+        df['price_change_6h'] = df['price'].pct_change(24) * 100
+        df['volume_score'] = df['volume'] / df['volume'].rolling(window=6).mean() * 100
+        df['volume_change'] = df['volume'].pct_change() * 100
+        df['atr_normalized'] = (df['high'] - df['low']) / df['price'] * 100  # Упрощенный ATR
+
+        # Уровни поддержки и сопротивления
+        df['support_level'] = df['low'].rolling(window=20).min() / df['price']
+        df['resistance_level'] = df['high'].rolling(window=20).max() / df['price']
+
+        return df.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
+    except Exception as e:
+        logger.error(f"calculate_indicators: Ошибка: {e}")
+        return df
     async def predict_probability(self, symbol, direction='LONG', stop_loss=None, position_size=0):
         try:
             df = await self.get_historical_data(symbol)
