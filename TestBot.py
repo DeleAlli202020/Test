@@ -224,49 +224,75 @@ class TradingModel:
 
     
     async def predict_probability(self, symbol, direction='LONG', stop_loss=None, position_size=0):
+        """
+        Прогнозирует вероятность успешной сделки для заданного символа и направления
+        
+        Параметры:
+            symbol (str): Торговая пара (например, 'BTC/USDT')
+            direction (str): Направление сделки ('LONG' или 'SHORT')
+            stop_loss (float): Цена стоп-лосса (опционально)
+            position_size (float): Размер позиции (опционально)
+        
+        Возвращает:
+            float: Вероятность успеха в процентах (0-100)
+        """
         try:
+            # Получаем исторические данные
             df = await self.get_historical_data(symbol)
             if df.empty:
                 logger.warning(f"predict_probability: Пустой DataFrame для {symbol}")
                 return 0.0
             
+            # Рассчитываем индикаторы
             df = self.calculate_indicators(df)
-            model = self.models.get('combined')
-            scaler = self.scalers.get('combined')
             
+            # Получаем модель и скейлер для символа
+            model, scaler, active_features = self.get_model_for_symbol(symbol)
             if not model or not scaler:
-                logger.error(f"predict_probability: Модель или скейлер не загружены для {symbol}")
+                logger.error(f"predict_probability: Модель или скейлер не найдены для {symbol}")
                 return 0.0
 
-            # Проверяем, что все активные признаки присутствуют в DataFrame
-            available_features = []
-            for feature in self.active_features:
-                if feature in df.columns:
-                    available_features.append(feature)
-                else:
-                    logger.warning(f"predict_probability: Признак {feature} отсутствует для {symbol}")
-
+            # Проверяем доступность признаков
+            available_features = [f for f in active_features if f in df.columns]
             if not available_features:
                 logger.error(f"predict_probability: Нет доступных признаков для {symbol}")
                 return 0.0
 
-            # Берем последнюю строку с доступными признаками
+            # Подготавливаем данные для предсказания
             features = df[available_features].iloc[-1:].values
             if features.size == 0:
                 logger.error(f"predict_probability: Нет данных для предсказания {symbol}")
                 return 0.0
 
+            # Масштабируем признаки и делаем предсказание
             features_scaled = scaler.transform(features)
-            probability = model.predict_proba(features_scaled)[0][1] * 100
+            proba = model.predict_proba(features_scaled)[0][1] * 100
             
+            # Корректируем вероятность для SHORT сделок
             if direction == 'SHORT':
-                probability = 100 - probability
-                
-            logger.info(f"predict_probability: {symbol}, direction={direction}, probability={probability:.1f}%")
-            return max(0.0, min(100.0, probability))
+                proba = 100 - proba
+            
+            # Ограничиваем вероятность диапазоном 0-100%
+            final_proba = max(0.0, min(100.0, proba))
+            
+            logger.info(
+                f"predict_probability: {symbol} {direction} | "
+                f"Probability: {final_proba:.1f}% | "
+                f"Price: {df['price'].iloc[-1]:.4f} | "
+                f"RSI: {df['rsi'].iloc[-1]:.1f} | "
+                f"MACD: {df['macd'].iloc[-1]:.4f}"
+            )
+            
+            return final_proba
+            
+        except ccxt.NetworkError as e:
+            logger.error(f"predict_probability: Ошибка сети для {symbol}: {e}")
+        except ccxt.ExchangeError as e:
+            logger.error(f"predict_probability: Ошибка биржи для {symbol}: {e}")
         except Exception as e:
-            logger.error(f"predict_probability: Ошибка для {symbol}: {e}")
-            return 0.0
+            logger.error(f"predict_probability: Неожиданная ошибка для {symbol}: {e}", exc_info=True)
+        
+        return 0.0
 
 
     
