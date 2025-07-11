@@ -136,42 +136,43 @@ class TradingModel:
         self.active_features_dict = {}
         self.LOW_RECALL_SYMBOLS = ["BTC/USDT", "BNB/USDT"]
         self.load_model()
+        # Initialize default model if loading fails
+        if not self.models:
+            self.initialize_default_model()
 
     def load_model(self):
         try:
             if os.path.exists(MODEL_PATH):
                 model_data = joblib.load(MODEL_PATH)
-                self.models = model_data.get('models', {})
-                self.scalers = model_data.get('scalers', {})
-                self.active_features_dict = model_data.get('active_features', {})
-                
-                if os.path.exists(FEATURES_PATH):
-                    features_data = joblib.load(FEATURES_PATH)
-                    if isinstance(features_data, dict):
-                        self.active_features_dict = features_data
-                    elif isinstance(features_data, list):
-                        self.active_features_dict = {'combined': features_data}
-                
-                logger.info(f"Models and scalers loaded successfully. {len(self.models)} models available")
-            else:
-                logger.warning("Model file not found")
-                self.models = {}
-                self.scalers = {}
-                self.active_features_dict = {'combined': ACTIVE_FEATURES}
+                if not all(k in model_data for k in ['models', 'scalers', 'active_features']):
+                    raise ValueError("Invalid model file structure")
+                    
+                self.models = model_data['models']
+                self.scalers = model_data['scalers'] 
+                self.active_features_dict = model_data['active_features']
+                logger.info(f"Loaded {len(self.models)} models successfully")
         except Exception as e:
-            logger.error(f"Failed to load model data: {e}")
-            self.models = {}
-            self.scalers = {}
-            self.active_features_dict = {'combined': ACTIVE_FEATURES}
+            logger.error(f"Model loading failed: {e}")
+            self.initialize_default_model()
 
     def get_model_for_symbol(self, symbol):
-        base_symbol = symbol.replace('/USDT', 'USDT')
+        if not self.models:
+            self.initialize_default_model()
+            
         if 'combined' in self.models:
-            return self.models['combined'], self.scalers['combined'], self.active_features_dict['combined']
-        elif base_symbol in self.models:
-            return self.models[base_symbol], self.scalers[base_symbol], self.active_features_dict[base_symbol]
-        else:
-            return None, None, None
+            return (
+                self.models['combined'], 
+                self.scalers['combined'], 
+                self.active_features_dict.get('combined', ACTIVE_FEATURES)
+            )
+        base_symbol = symbol.replace('/USDT', 'USDT')
+        if base_symbol in self.models:
+            return (
+                self.models[base_symbol], 
+                self.scalers[base_symbol], 
+                self.active_features_dict.get(base_symbol, ACTIVE_FEATURES)
+            )
+        return None, None, None
 
     async def get_historical_data(self, symbol, timeframe='15m', limit=1000):
         cache_file = os.path.join(DATA_CACHE_PATH, f"{symbol.replace('/', '_')}_{timeframe}_historical.pkl")
@@ -342,15 +343,15 @@ class TradingModel:
             df = await self.get_historical_data(symbol)
             if df.empty or len(df) < 48:
                 logger.warning(f"Not enough data for {symbol}")
-                return 0.0
-            
+                return 50.0  # Return neutral probability instead of 0
+                
             df = self.calculate_indicators(df)
             X, _ = self.prepare_features(df)
             
             model, scaler, active_features = self.get_model_for_symbol(symbol)
             if model is None or scaler is None or not active_features:
-                logger.error(f"No model/scaler for {symbol}")
-                return 0.0
+                logger.error(f"No model/scaler for {symbol}, using default 50%")
+                return 50.0
 
             threshold = 0.3160 if symbol in self.LOW_RECALL_SYMBOLS else 0.5
             
@@ -1903,6 +1904,17 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify_admin(f"Error in /history: {e}")
     finally:
         session.close()
+
+async def notify_admin(message):
+    try:
+        bot = Application.builder().token(TELEGRAM_TOKEN).build()
+        await bot.bot.send_message(
+            chat_id=ADMIN_ID, 
+            text=f"🚨 Bot Error: {message}",  # Removed Markdown formatting
+            parse_mode=None  # Disable Markdown parsing
+        )
+    except Exception as e:
+        logger.error(f"Error sending notification: {e}")
 
 def main():
     try:
