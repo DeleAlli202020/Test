@@ -74,7 +74,7 @@ class ForwardTradingBot:
         # Подписчики бота
         self.subscribed_users = set(self.load_allowed_users())
     
-    ddef load_allowed_users(self):
+    def load_allowed_users(self):
         """Возвращает явно заданный список разрешённых пользователей"""
         allowed_users = [809820681, 667191785, 453365207]  # Жёстко заданные ID
         logger.info(f"Loaded {len(allowed_users)} allowed users from hardcoded list")
