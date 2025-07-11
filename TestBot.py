@@ -16,7 +16,7 @@ from ta.volume import OnBalanceVolumeIndicator
 import sys
 from dotenv import load_dotenv
 import telegram
-
+import json
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
