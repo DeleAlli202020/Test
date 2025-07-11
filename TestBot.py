@@ -75,17 +75,62 @@ class ForwardTradingBot:
         self.subscribed_users = set()
         self.load_subscribed_users()
     
-    def load_subscribed_users(self):
-        ensure_files_exist()
-        with open(ALLOWED_USERS_PATH, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    
-    def save_subscribed_users(self):
+    def load_allowed_users():
+        """Загрузка списка разрешенных пользователей с полной обработкой ошибок"""
         try:
-            with open(ALLOWED_USERS_PATH, 'w') as f:
-                json.dump(list(self.subscribed_users), f)
+            # Проверяем существование файла
+            if not os.path.exists(ALLOWED_USERS_PATH):
+                logger.warning(f"Allowed users file not found at {ALLOWED_USERS_PATH}")
+                return []
+    
+            # Проверяем что файл не пустой
+            if os.path.getsize(ALLOWED_USERS_PATH) == 0:
+                logger.warning("Allowed users file is empty")
+                return []
+    
+            # Читаем и парсим файл
+            with open(ALLOWED_USERS_PATH, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if not content:
+                    logger.warning("Allowed users file contains only whitespace")
+                    return []
+                    
+                users = json.loads(content)
+                if not isinstance(users, list):
+                    logger.error(f"Invalid format in allowed users file: expected list, got {type(users)}")
+                    return []
+                    
+                logger.info(f"Loaded {len(users)} allowed users from file")
+                return users
+    
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse allowed users file: {e}")
+            return []
         except Exception as e:
-            logger.error(f"Error saving subscribed users: {e}")
+            logger.error(f"Unexpected error loading allowed users: {e}")
+            return []
+    
+    def save_allowed_users(users):
+        """Сохранение списка разрешенных пользователей с обработкой ошибок"""
+        try:
+            # Проверяем что передан валидный список
+            if not isinstance(users, list):
+                logger.error(f"Invalid users data type: {type(users)}")
+                return False
+    
+            # Создаем директорию если не существует
+            os.makedirs(os.path.dirname(ALLOWED_USERS_PATH), exist_ok=True)
+    
+            # Сохраняем данные
+            with open(ALLOWED_USERS_PATH, 'w', encoding='utf-8') as f:
+                json.dump(users, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"Successfully saved {len(users)} allowed users")
+            return True
+    
+        except Exception as e:
+            logger.error(f"Failed to save allowed users: {e}")
+            return False
     
     def load_model(self):
         try:
