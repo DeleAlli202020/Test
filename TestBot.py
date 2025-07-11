@@ -72,8 +72,7 @@ class ForwardTradingBot:
         self.load_model()
         
         # Подписчики бота
-        self.subscribed_users = set()
-        self.load_allowed_users()
+        self.subscribed_users = set(self.load_allowed_users())
     
     def load_allowed_users():
         """Загрузка списка разрешенных пользователей с полной обработкой ошибок"""
@@ -110,6 +109,7 @@ class ForwardTradingBot:
             logger.error(f"Unexpected error loading allowed users: {e}")
             return []
     
+    @staticmethod
     def save_allowed_users(users):
         """Сохранение списка разрешенных пользователей с обработкой ошибок"""
         try:
