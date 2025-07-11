@@ -258,6 +258,13 @@ class TradingModel:
                 logger.warning("calculate_indicators: После очистки недостаточно данных")
                 return df
 
+            # Список всех возможных признаков, соответствующий ACTIVE_FEATURES
+            expected_features = [
+                'price_change_1h', 'price_change_2h', 'price_change_6h', 'volume_score',
+                'volume_change', 'atr_normalized', 'rsi', 'macd', 'vwap_signal', 'obv',
+                'adx', 'bb_upper', 'bb_lower', 'support_level', 'resistance_level'
+            ]
+
             # Волатильность (Bollinger Bands)
             bb = BollingerBands(close=df['price'], window=20, window_dev=2)
             df['bb_upper'] = bb.bollinger_hband()
@@ -267,21 +274,34 @@ class TradingModel:
             # Моментум (RSI)
             df['rsi'] = RSIIndicator(close=df['price'], window=14).rsi()
 
-            # Расчет MACD вручную, так как ta не содержит MACD
+            # Расчет MACD вручную
             ema_fast = df['price'].ewm(span=12, adjust=False).mean()
             ema_slow = df['price'].ewm(span=26, adjust=False).mean()
             df['macd'] = ema_fast - ema_slow
             df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
 
-            # Тренд (ADX)
-            df['adx'] = ADXIndicator(high=df['high'], low=df['low'], close=df['price'], window=14).adx()
+            # Тренд (ADX) с защитой от деления на ноль
+            high_diff = df['high'].diff()
+            low_diff = df['low'].diff()
+            tr = pd.concat([
+                df['high'] - df['low'],
+                (df['high'] - df['close'].shift(1)).abs(),
+                (df['low'] - df['close'].shift(1)).abs()
+            ], axis=1).max(axis=1)
+            tr = tr.replace(0, 0.0001)  # Защита от деления на ноль
+            plus_dm = high_diff.where(high_diff > low_diff, 0)
+            minus_dm = low_diff.where(low_diff > high_diff, 0)
+            plus_di = 100 * plus_dm.rolling(window=14).mean() / tr
+            minus_di = 100 * minus_dm.rolling(window=14).mean() / tr
+            dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
+            df['adx'] = dx.rolling(window=14).mean()
 
             # Объем (OBV)
             df['obv'] = OnBalanceVolumeIndicator(close=df['price'], volume=df['volume']).on_balance_volume()
 
             # VWAP (Volume Weighted Average Price)
             df['vwap'] = (df['price'] * df['volume']).cumsum() / df['volume'].cumsum()
-            df['vwap_signal'] = np.where(df['price'] > df['vwap'], 1.0, -1.0)  # Бычий сигнал, если цена выше VWAP
+            df['vwap_signal'] = np.where(df['price'] > df['vwap'], 1.0, -1.0)
 
             # Прочие признаки
             df['price_change_1h'] = df['price'].pct_change(4) * 100
@@ -289,13 +309,23 @@ class TradingModel:
             df['price_change_6h'] = df['price'].pct_change(24) * 100
             df['volume_score'] = df['volume'] / df['volume'].rolling(window=6).mean() * 100
             df['volume_change'] = df['volume'].pct_change() * 100
-            df['atr_normalized'] = (df['high'] - df['low']) / df['price'] * 100  # Упрощенный ATR
+            df['atr_normalized'] = (df['high'] - df['low']) / df['price'].replace(0, 0.0001) * 100
 
             # Уровни поддержки и сопротивления
-            df['support_level'] = df['low'].rolling(window=20).min() / df['price']
-            df['resistance_level'] = df['high'].rolling(window=20).max() / df['price']
+            df['support_level'] = df['low'].rolling(window=20).min() / df['price'].replace(0, 0.0001)
+            df['resistance_level'] = df['high'].rolling(window=20).max() / df['price'].replace(0, 0.0001)
 
-            return df.replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
+            # Добавление недостающих признаков с нулевыми значениями
+            for feature in expected_features:
+                if feature not in df.columns:
+                    df[feature] = 0.0
+
+            # Ограничение признаков только теми, что в active_features
+            df = df[expected_features].replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
+
+            # Проверка признаков
+            logger.info(f"calculate_indicators: Сформированы признаки для {df['symbol'].iloc[0] if 'symbol' in df else 'unknown'}: {list(df.columns)}")
+            return df
         except Exception as e:
             logger.error(f"calculate_indicators: Ошибка: {e}")
             return df
@@ -699,7 +729,7 @@ async def check_active_trades(context: ContextTypes.DEFAULT_TYPE):
     finally:
         session.close()
 
-async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
+async def retrain_model_daily(self, context: ContextTypes.DEFAULT_TYPE):
     logger.info("retrain_model_daily: Начало дообучения модели")
     session = None
     try:
@@ -728,7 +758,15 @@ async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
                 metrics.macd or 0,
                 metrics.adx or 0,
                 metrics.obv or 0,
-                metrics.smart_money_score or 0
+                metrics.smart_money_score or 0,
+                trade.entry_price / (trade.stop_loss + 1e-10),  # Пример дополнительного признака
+                trade.rr_ratio or 0,
+                metrics.probability or 0,
+                (trade.take_profit_1 - trade.entry_price) / trade.entry_price * 100 if trade.position_size > 0 else (trade.entry_price - trade.take_profit_1) / trade.entry_price * 100,
+                (trade.take_profit_2 - trade.entry_price) / trade.entry_price * 100 if trade.position_size > 0 else (trade.entry_price - trade.take_profit_2) / trade.entry_price * 100,
+                trade.probability or 0,
+                metrics.volume_change / (metrics.institutional_score + 1e-10) if metrics.institutional_score else 0,
+                metrics.rsi / 100 if metrics.rsi else 0
             ]
             X.append(features)
             y.append(1 if trade.result in ['TP1', 'TP2'] else 0)
@@ -739,7 +777,7 @@ async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
                 pnl = (trade.entry_price - final_price) * abs(trade.position_size)
             pnls.append(pnl)
         
-        X = np.array(X)
+        X = pd.DataFrame(X, columns=self.active_features)
         y = np.array(y)
         
         unique, counts = np.unique(y, return_counts=True)
@@ -755,15 +793,18 @@ async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
             X, y, test_size=0.2, random_state=42, stratify=y
         )
         
-        scaler = StandardScaler()
+        scaler = self.scalers.get('combined')
+        if not scaler:
+            scaler = StandardScaler()
+            self.scalers['combined'] = scaler
+        
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
         
-        model = trading_model.models.get('combined')
+        model = self.models.get('combined')
         if not model:
             model = lgb.LGBMClassifier(random_state=42)
-            trading_model.models['combined'] = model
-            trading_model.scalers['combined'] = scaler
+            self.models['combined'] = model
         
         loss_before = model.score(X_test_scaled, y_test)
         logger.info(f"retrain_model_daily: Точность до дообучения: {loss_before:.4f}")
@@ -773,9 +814,9 @@ async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
         loss_after = model.score(X_test_scaled, y_test)
         logger.info(f"retrain_model_daily: Точность после дообучения: {loss_after:.4f}, сэмплов: {len(X)}")
         
-        trading_model.models['combined'] = model
-        trading_model.scalers['combined'] = scaler
-        trading_model.save_model()
+        self.models['combined'] = model
+        self.scalers['combined'] = scaler
+        self.save_model()
         
     except Exception as e:
         logger.error(f"retrain_model_daily: Ошибка при дообучении: {str(e)}")
