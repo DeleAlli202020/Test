@@ -141,9 +141,9 @@ class TradingModel:
         """Выбираем модель для символа"""
         base_symbol = symbol.replace('/USDT', 'USDT')
         if 'combined' in self.models:
-            return self.models['combined'], self.scalers['combined'], self.active_features_dict['combined']
+            return self.models['combined'], self.scalers['combined'], self.active_features['combined']
         elif base_symbol in self.models:
-            return self.models[base_symbol], self.scalers[base_symbol], self.active_features_dict[base_symbol]
+            return self.models[base_symbol], self.scalers[base_symbol], self.active_features[base_symbol]
         else:
             return None, None, None
 
