@@ -166,11 +166,18 @@ class TradingModel:
                 cache_mtime = os.path.getmtime(cache_file)
                 if (datetime.utcnow().timestamp() - cache_mtime) < CACHE_TTL:
                     df = pd.read_pickle(cache_file)
-                    logger.info(f"get_historical_data: Кэш для {symbol}: {len(df)} записей")
-                    return df
+                    required_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'price', 'taker_buy_base', 'symbol']
+                    if not df.empty and all(col in df.columns for col in required_columns):
+                        logger.info(f"get_historical_data: Кэш для {symbol}: {len(df)} записей")
+                        return df
+                    else:
+                        logger.warning(f"get_historical_data: Кэш для {symbol} повреждён, удаляем")
+                        os.remove(cache_file)
             except Exception as e:
                 logger.error(f"get_historical_data: Ошибка чтения кэша для {symbol}: {e}")
                 await notify_admin(f"Ошибка чтения кэша для {symbol}: {e}")
+                if os.path.exists(cache_file):
+                    os.remove(cache_file)
 
         attempt = 0
         while attempt < MAX_RETRIES:
@@ -194,6 +201,10 @@ class TradingModel:
                     df['price'] = df['close'].astype(float)
                     df['taker_buy_base'] = df['volume'].astype(float) * 0.5
                     df['symbol'] = symbol
+                    # Проверка корректности данных
+                    if df['price'].isna().any() or (df['price'] <= 0).any():
+                        logger.warning(f"get_historical_data: Некорректные данные для {symbol}, пропуски или нулевые цены")
+                        return pd.DataFrame()
                     os.makedirs(DATA_CACHE_PATH, exist_ok=True)
                     df.to_pickle(cache_file)
                     logger.info(f"get_historical_data: Получено {len(df)} записей для {symbol}")
@@ -320,8 +331,9 @@ class TradingModel:
                 if feature not in df.columns:
                     df[feature] = 0.0
 
-            # Ограничение признаков только теми, что в active_features
-            df = df[expected_features].replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
+            # Сохраняем столбец 'price' и другие необходимые столбцы
+            result_columns = expected_features + ['price', 'symbol', 'timestamp']
+            df = df[result_columns].replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
 
             # Проверка признаков
             logger.info(f"calculate_indicators: Сформированы признаки для {df['symbol'].iloc[0] if 'symbol' in df else 'unknown'}: {list(df.columns)}")
