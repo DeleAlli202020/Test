@@ -21,7 +21,7 @@ import sys
 from dotenv import load_dotenv
 import telegram
 from ta.volatility import BollingerBands
-from ta.momentum import RSIIndicator, MACD
+from ta.momentum import RSIIndicator, MACDIndicator
 from ta.trend import ADXIndicator
 from ta.volume import OnBalanceVolumeIndicator
 from sklearn.metrics import log_loss
@@ -224,7 +224,7 @@ class TradingModel:
 
             # Моментум
             df['rsi'] = RSIIndicator(close=df['price'], window=14).rsi()
-            macd = MACD(close=df['price'], window_slow=26, window_fast=12, window_sign=9)
+            macd = MACDIndicator(close=df['price'], window_slow=26, window_fast=12, window_sign=9)
             df['macd'] = macd.macd()
             df['macd_signal'] = macd.macd_signal()
 
