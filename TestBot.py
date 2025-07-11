@@ -236,36 +236,7 @@ class TradingModel:
             return 0.0
 
 
-    async def clear_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        logger.info(f"clear_trades: Команда от пользователя {user_id}")
-        if not is_authorized(user_id):
-            await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
-            return
-        session = None
-        try:
-            session = Session()
-            # Удаление только пользовательских записей из Trade
-            deleted_trades = session.query(Trade).filter_by(user_id=user_id).delete()
-            # Удаление связанных записей из TradeMetrics
-            deleted_metrics = session.query(TradeMetrics).filter(
-                TradeMetrics.trade_id.in_(
-                    session.query(Trade.id).filter_by(user_id=user_id)
-                )
-            ).delete()
-            session.commit()
-            await update.message.reply_text(
-                f"🗑️ **Удалено {deleted_trades} сделок и {deleted_metrics} метрик для вашего аккаунта.**",
-                parse_mode='Markdown'
-            )
-            logger.info(f"clear_trades: Удалено {deleted_trades} сделок и {deleted_metrics} метрик для user_id={user_id}")
-        except Exception as e:
-            logger.error(f"clear_trades: Ошибка для user_id={user_id}: {e}")
-            await update.message.reply_text(f"🚨 **Ошибка при очистке сделок**: {e}", parse_mode='Markdown')
-            await notify_admin(f"Ошибка в clear_trades для user_id={user_id}: {e}")
-        finally:
-            if session is not None:
-                session.close()
+    
     def calculate_indicators(self, df):
         if df.empty or len(df) < 14:
             logger.warning("calculate_indicators: Недостаточно данных")
@@ -328,119 +299,11 @@ class TradingModel:
         except Exception as e:
             logger.error(f"calculate_indicators: Ошибка: {e}")
             return df
-    async def active(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not is_authorized(user_id):
-            await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
-            return
-        session = Session()
-        try:
-            active_trades = session.query(Trade).filter(
-                Trade.user_id == user_id,
-                Trade.result.is_(None) | (Trade.result == 'TP1')
-            ).order_by(Trade.timestamp.desc()).limit(5).all()
-            if not active_trades:
-                await update.message.reply_text("📊 **Активные сделки**: Нет активных сделок.", parse_mode='Markdown')
-                return
-            message = "📊 **Активные сделки**:\n"
-            for trade in active_trades:
-                price_precision = 6 if trade.entry_price < 1 else 2
-                current_price = await get_current_price(trade.symbol)
-                status = '🟡 Ожидает' if trade.result is None else '✅ TP1 достигнут'
-                message += (
-                    f"#{trade.id}: *{trade.symbol} LONG*\n"
-                    f"🎯 Вход: ${trade.entry_price:.{price_precision}f} | Текущая: ${current_price:.{price_precision}f}\n"
-                    f"⛔ SL: ${trade.stop_loss:.{price_precision}f} | 💰 TP1: ${trade.take_profit_1:.{price_precision}f} | 💰 TP2: ${trade.take_profit_2:.{price_precision}f}\n"
-                    f"📊 Статус: {status}\n"
-                    f"⏰ Время: {trade.timestamp.strftime('%Y-%m-%d %H:%M')}\n\n"
-                )
-            keyboard = [[InlineKeyboardButton("🔄 Обновить", callback_data="refresh_active")]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"active: Ошибка: {e}")
-            await update.message.reply_text(f"🚨 **Ошибка**: {e}", parse_mode='Markdown')
-            await notify_admin(f"Ошибка в /active: {e}")
-        finally:
-            session.close()
+    
 
-    async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not is_authorized(user_id):
-            await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
-            return
-        session = Session()
-        try:
-            trades = session.query(Trade).filter_by(user_id=user_id).order_by(Trade.timestamp.desc()).limit(5).all()
-            if not trades:
-                await update.message.reply_text("📜 **История сделок**: Нет сделок.", parse_mode='Markdown')
-                return
-            message = "📜 **История сделок**:\n"
-            for trade in trades:
-                price_precision = 6 if trade.entry_price < 1 else 2
-                status = '🟡 Активна' if trade.result is None or trade.result == 'TP1' else ('✅ TP2' if trade.result == 'TP2' else '❌ SL')
-                message += (
-                    f"#{trade.id}: *{trade.symbol} LONG*\n"
-                    f"🎯 Вход: ${trade.entry_price:.{price_precision}f}\n"
-                    f"⛔ SL: ${trade.stop_loss:.{price_precision}f} | 💰 TP1: ${trade.take_profit_1:.{price_precision}f} | 💰 TP2: ${trade.take_profit_2:.{price_precision}f}\n"
-                    f"📊 Статус: {status}\n"
-                    f"⏰ Время: {trade.timestamp.strftime('%Y-%m-%d %H:%M')}\n\n"
-                )
-            keyboard = [
-                [InlineKeyboardButton("🟡 Активные", callback_data="filter_active")],
-                [InlineKeyboardButton("✅ Завершённые", callback_data="filter_completed")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"history: Ошибка: {e}")
-            await update.message.reply_text(f"🚨 **Ошибка**: {e}", parse_mode='Markdown')
-            await notify_admin(f"Ошибка в /history: {e}")
-        finally:
-            session.close()
+    
 
-    async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        if not is_authorized(user_id):
-            await update.message.reply_text("🚫 Вы не авторизованы для использования бота.")
-            return
-        session = Session()
-        try:
-            trades = session.query(Trade).filter(Trade.user_id == user_id, Trade.result.isnot(None)).all()
-            if not trades:
-                await update.message.reply_text("Нет завершённых сделок.")
-                return
-            total_trades = len(trades)
-            successful_trades = sum(1 for trade in trades if trade.result in ['TP1', 'TP2'])
-            success_rate = (successful_trades / total_trades) * 100 if total_trades > 0 else 0
-            total_pnl = 0
-            for trade in trades:
-                trade_metrics = session.query(TradeMetrics).filter_by(trade_id=trade.id).first()
-                if trade_metrics:
-                    final_price = trade.stop_loss if trade_metrics.success == 'SL' else trade.take_profit_1 if trade_metrics.success == 'TP1' else trade.take_profit_2
-                    # Учитываем направление сделки (покупка/продажа)
-                    if trade.position_size > 0:  # Покупка (long)
-                        pnl = (final_price - trade.entry_price) * trade.position_size
-                    else:  # Продажа (short)
-                        pnl = (trade.entry_price - final_price) * abs(trade.position_size)
-                    total_pnl += pnl
-                    logger.warning(f"stats: Сделка #{trade.id}, PNL={pnl:.2f}, final_price={final_price:.2f}, entry_price={trade.entry_price:.2f}, position_size={trade.position_size}")
-            user_settings = get_user_settings(user_id)
-            balance = user_settings.get('balance', 0)
-            text = (
-                f"📊 Статистика:\n"
-                f"Всего сделок: {total_trades}\n"
-                f"Успешных сделок: {successful_trades} ({success_rate:.2f}%)\n"
-                f"Общий PNL: {total_pnl:.2f} USDT\n"
-                f"Текущий баланс: {balance:.2f} USDT"
-            )
-            await update.message.reply_text(text)
-        except Exception as e:
-            logger.error(f"stats: Ошибка для user_id={user_id}: {e}")
-            await update.message.reply_text(f"🚫 Ошибка: {str(e)}")
-            await notify_admin(f"Ошибка в stats для user_id={user_id}: {e}")
-        finally:
-            session.close()
+    
 
     async def analyze_symbol(self, symbol, coin_id, price_change_1h, taker_buy_base, volume, balance):
         try:
@@ -1758,6 +1621,150 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="🚨 **Произошла ошибка.** Пожалуйста, попробуйте снова или свяжитесь с администратором.",
             parse_mode='Markdown'
         )
+async def clear_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        logger.info(f"clear_trades: Команда от пользователя {user_id}")
+        if not is_authorized(user_id):
+            await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
+            return
+        session = None
+        try:
+            session = Session()
+            # Удаление только пользовательских записей из Trade
+            deleted_trades = session.query(Trade).filter_by(user_id=user_id).delete()
+            # Удаление связанных записей из TradeMetrics
+            deleted_metrics = session.query(TradeMetrics).filter(
+                TradeMetrics.trade_id.in_(
+                    session.query(Trade.id).filter_by(user_id=user_id)
+                )
+            ).delete()
+            session.commit()
+            await update.message.reply_text(
+                f"🗑️ **Удалено {deleted_trades} сделок и {deleted_metrics} метрик для вашего аккаунта.**",
+                parse_mode='Markdown'
+            )
+            logger.info(f"clear_trades: Удалено {deleted_trades} сделок и {deleted_metrics} метрик для user_id={user_id}")
+        except Exception as e:
+            logger.error(f"clear_trades: Ошибка для user_id={user_id}: {e}")
+            await update.message.reply_text(f"🚨 **Ошибка при очистке сделок**: {e}", parse_mode='Markdown')
+            await notify_admin(f"Ошибка в clear_trades для user_id={user_id}: {e}")
+        finally:
+            if session is not None:
+                session.close()
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not is_authorized(user_id):
+            await update.message.reply_text("🚫 Вы не авторизованы для использования бота.")
+            return
+        session = Session()
+        try:
+            trades = session.query(Trade).filter(Trade.user_id == user_id, Trade.result.isnot(None)).all()
+            if not trades:
+                await update.message.reply_text("Нет завершённых сделок.")
+                return
+            total_trades = len(trades)
+            successful_trades = sum(1 for trade in trades if trade.result in ['TP1', 'TP2'])
+            success_rate = (successful_trades / total_trades) * 100 if total_trades > 0 else 0
+            total_pnl = 0
+            for trade in trades:
+                trade_metrics = session.query(TradeMetrics).filter_by(trade_id=trade.id).first()
+                if trade_metrics:
+                    final_price = trade.stop_loss if trade_metrics.success == 'SL' else trade.take_profit_1 if trade_metrics.success == 'TP1' else trade.take_profit_2
+                    # Учитываем направление сделки (покупка/продажа)
+                    if trade.position_size > 0:  # Покупка (long)
+                        pnl = (final_price - trade.entry_price) * trade.position_size
+                    else:  # Продажа (short)
+                        pnl = (trade.entry_price - final_price) * abs(trade.position_size)
+                    total_pnl += pnl
+                    logger.warning(f"stats: Сделка #{trade.id}, PNL={pnl:.2f}, final_price={final_price:.2f}, entry_price={trade.entry_price:.2f}, position_size={trade.position_size}")
+            user_settings = get_user_settings(user_id)
+            balance = user_settings.get('balance', 0)
+            text = (
+                f"📊 Статистика:\n"
+                f"Всего сделок: {total_trades}\n"
+                f"Успешных сделок: {successful_trades} ({success_rate:.2f}%)\n"
+                f"Общий PNL: {total_pnl:.2f} USDT\n"
+                f"Текущий баланс: {balance:.2f} USDT"
+            )
+            await update.message.reply_text(text)
+        except Exception as e:
+            logger.error(f"stats: Ошибка для user_id={user_id}: {e}")
+            await update.message.reply_text(f"🚫 Ошибка: {str(e)}")
+            await notify_admin(f"Ошибка в stats для user_id={user_id}: {e}")
+        finally:
+            session.close()
+
+async def active(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not is_authorized(user_id):
+            await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
+            return
+        session = Session()
+        try:
+            active_trades = session.query(Trade).filter(
+                Trade.user_id == user_id,
+                Trade.result.is_(None) | (Trade.result == 'TP1')
+            ).order_by(Trade.timestamp.desc()).limit(5).all()
+            if not active_trades:
+                await update.message.reply_text("📊 **Активные сделки**: Нет активных сделок.", parse_mode='Markdown')
+                return
+            message = "📊 **Активные сделки**:\n"
+            for trade in active_trades:
+                price_precision = 6 if trade.entry_price < 1 else 2
+                current_price = await get_current_price(trade.symbol)
+                status = '🟡 Ожидает' if trade.result is None else '✅ TP1 достигнут'
+                message += (
+                    f"#{trade.id}: *{trade.symbol} LONG*\n"
+                    f"🎯 Вход: ${trade.entry_price:.{price_precision}f} | Текущая: ${current_price:.{price_precision}f}\n"
+                    f"⛔ SL: ${trade.stop_loss:.{price_precision}f} | 💰 TP1: ${trade.take_profit_1:.{price_precision}f} | 💰 TP2: ${trade.take_profit_2:.{price_precision}f}\n"
+                    f"📊 Статус: {status}\n"
+                    f"⏰ Время: {trade.timestamp.strftime('%Y-%m-%d %H:%M')}\n\n"
+                )
+            keyboard = [[InlineKeyboardButton("🔄 Обновить", callback_data="refresh_active")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"active: Ошибка: {e}")
+            await update.message.reply_text(f"🚨 **Ошибка**: {e}", parse_mode='Markdown')
+            await notify_admin(f"Ошибка в /active: {e}")
+        finally:
+            session.close()
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not is_authorized(user_id):
+            await update.message.reply_text("🚫 **Доступ запрещён.**", parse_mode='Markdown')
+            return
+        session = Session()
+        try:
+            trades = session.query(Trade).filter_by(user_id=user_id).order_by(Trade.timestamp.desc()).limit(5).all()
+            if not trades:
+                await update.message.reply_text("📜 **История сделок**: Нет сделок.", parse_mode='Markdown')
+                return
+            message = "📜 **История сделок**:\n"
+            for trade in trades:
+                price_precision = 6 if trade.entry_price < 1 else 2
+                status = '🟡 Активна' if trade.result is None or trade.result == 'TP1' else ('✅ TP2' if trade.result == 'TP2' else '❌ SL')
+                message += (
+                    f"#{trade.id}: *{trade.symbol} LONG*\n"
+                    f"🎯 Вход: ${trade.entry_price:.{price_precision}f}\n"
+                    f"⛔ SL: ${trade.stop_loss:.{price_precision}f} | 💰 TP1: ${trade.take_profit_1:.{price_precision}f} | 💰 TP2: ${trade.take_profit_2:.{price_precision}f}\n"
+                    f"📊 Статус: {status}\n"
+                    f"⏰ Время: {trade.timestamp.strftime('%Y-%m-%d %H:%M')}\n\n"
+                )
+            keyboard = [
+                [InlineKeyboardButton("🟡 Активные", callback_data="filter_active")],
+                [InlineKeyboardButton("✅ Завершённые", callback_data="filter_completed")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"history: Ошибка: {e}")
+            await update.message.reply_text(f"🚨 **Ошибка**: {e}", parse_mode='Markdown')
+            await notify_admin(f"Ошибка в /history: {e}")
+        finally:
+            session.close()
 
 def main():
     try:
