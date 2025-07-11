@@ -229,17 +229,28 @@ class TradingModel:
             if df.empty:
                 logger.warning(f"predict_probability: Пустой DataFrame для {symbol}")
                 return 0.0
+            
             df = self.calculate_indicators(df)
             model = self.models.get('combined')
             scaler = self.scalers.get('combined')
+            
             if not model or not scaler:
                 logger.error(f"predict_probability: Модель или скейлер не загружены для {symbol}")
                 return 0.0
-            features = df[self.active_features].iloc[-1:].values
+    
+            # Убедимся, что все активные признаки присутствуют в DataFrame
+            available_features = [f for f in self.active_features if f in df.columns]
+            if not available_features:
+                logger.error(f"predict_probability: Нет доступных признаков для {symbol}")
+                return 0.0
+    
+            features = df[available_features].iloc[-1:].values
             features_scaled = scaler.transform(features)
             probability = model.predict_proba(features_scaled)[0][1] * 100
+            
             if direction == 'SHORT':
                 probability = 100 - probability
+                
             logger.info(f"predict_probability: {symbol}, direction={direction}, probability={probability:.1f}%")
             return max(0.0, min(100.0, probability))
         except Exception as e:
@@ -252,46 +263,43 @@ class TradingModel:
         if df.empty or len(df) < 14:
             logger.warning("calculate_indicators: Недостаточно данных")
             return df
+            
         try:
-            # Проверка входных данных
-            required_columns = ['price', 'high', 'low', 'volume']
+            # Проверка и подготовка данных
+            required_columns = ['open', 'high', 'low', 'close', 'volume']
             missing_columns = [col for col in required_columns if col not in df.columns]
             if missing_columns:
                 logger.error(f"calculate_indicators: Отсутствуют столбцы: {missing_columns}")
                 return df
-            
-            # Очистка данных: удаление NaN и нулевых значений
+    
+            # Очистка данных
             df = df.dropna(subset=required_columns)
-            df = df[df['price'] > 0]  # Удаляем строки с нулевыми или отрицательными ценами
-            df = df[df['volume'] >= 0]  # Удаляем строки с отрицательным объемом
+            df = df[(df['close'] > 0) & (df['volume'] >= 0)]
             
             if len(df) < 14:
                 logger.warning("calculate_indicators: После очистки недостаточно данных")
                 return df
-
-            # Список всех возможных признаков, соответствующий ACTIVE_FEATURES
-            expected_features = [
-                'price_change_1h', 'price_change_2h', 'price_change_6h', 'volume_score',
-                'volume_change', 'atr_normalized', 'rsi', 'macd', 'vwap_signal', 'obv',
-                'adx', 'bb_upper', 'bb_lower', 'support_level', 'resistance_level'
-            ]
-
+    
+            # Добавляем price если его нет
+            if 'price' not in df.columns:
+                df['price'] = df['close']
+    
             # Волатильность (Bollinger Bands)
-            bb = BollingerBands(close=df['price'], window=20, window_dev=2)
+            bb = BollingerBands(close=df['close'], window=20, window_dev=2)
             df['bb_upper'] = bb.bollinger_hband()
             df['bb_lower'] = bb.bollinger_lband()
             df['bb_width'] = bb.bollinger_wband()
-
+    
             # Моментум (RSI)
-            df['rsi'] = RSIIndicator(close=df['price'], window=14).rsi()
-
-            # Расчет MACD вручную
-            ema_fast = df['price'].ewm(span=12, adjust=False).mean()
-            ema_slow = df['price'].ewm(span=26, adjust=False).mean()
+            df['rsi'] = RSIIndicator(close=df['close'], window=14).rsi()
+    
+            # Расчет MACD
+            ema_fast = df['close'].ewm(span=12, adjust=False).mean()
+            ema_slow = df['close'].ewm(span=26, adjust=False).mean()
             df['macd'] = ema_fast - ema_slow
             df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-
-            # Тренд (ADX) с защитой от деления на ноль
+    
+            # Тренд (ADX)
             high_diff = df['high'].diff()
             low_diff = df['low'].diff()
             tr = pd.concat([
@@ -299,45 +307,39 @@ class TradingModel:
                 (df['high'] - df['close'].shift(1)).abs(),
                 (df['low'] - df['close'].shift(1)).abs()
             ], axis=1).max(axis=1)
-            tr = tr.replace(0, 0.0001)  # Защита от деления на ноль
+            tr = tr.replace(0, 0.0001)
             plus_dm = high_diff.where(high_diff > low_diff, 0)
             minus_dm = low_diff.where(low_diff > high_diff, 0)
             plus_di = 100 * plus_dm.rolling(window=14).mean() / tr
             minus_di = 100 * minus_dm.rolling(window=14).mean() / tr
             dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
             df['adx'] = dx.rolling(window=14).mean()
-
+    
             # Объем (OBV)
-            df['obv'] = OnBalanceVolumeIndicator(close=df['price'], volume=df['volume']).on_balance_volume()
-
-            # VWAP (Volume Weighted Average Price)
-            df['vwap'] = (df['price'] * df['volume']).cumsum() / df['volume'].cumsum()
-            df['vwap_signal'] = np.where(df['price'] > df['vwap'], 1.0, -1.0)
-
+            df['obv'] = OnBalanceVolumeIndicator(close=df['close'], volume=df['volume']).on_balance_volume()
+    
+            # VWAP
+            df['vwap'] = (df['close'] * df['volume']).cumsum() / df['volume'].cumsum()
+            df['vwap_signal'] = np.where(df['close'] > df['vwap'], 1.0, -1.0)
+    
             # Прочие признаки
-            df['price_change_1h'] = df['price'].pct_change(4) * 100
-            df['price_change_2h'] = df['price'].pct_change(8) * 100
-            df['price_change_6h'] = df['price'].pct_change(24) * 100
+            df['price_change_1h'] = df['close'].pct_change(4) * 100
+            df['price_change_2h'] = df['close'].pct_change(8) * 100
+            df['price_change_6h'] = df['close'].pct_change(24) * 100
             df['volume_score'] = df['volume'] / df['volume'].rolling(window=6).mean() * 100
             df['volume_change'] = df['volume'].pct_change() * 100
-            df['atr_normalized'] = (df['high'] - df['low']) / df['price'].replace(0, 0.0001) * 100
-
+            df['atr_normalized'] = (df['high'] - df['low']) / df['close'].replace(0, 0.0001) * 100
+    
             # Уровни поддержки и сопротивления
-            df['support_level'] = df['low'].rolling(window=20).min() / df['price'].replace(0, 0.0001)
-            df['resistance_level'] = df['high'].rolling(window=20).max() / df['price'].replace(0, 0.0001)
-
-            # Добавление недостающих признаков с нулевыми значениями
-            for feature in expected_features:
-                if feature not in df.columns:
-                    df[feature] = 0.0
-
-            # Сохраняем столбец 'price' и другие необходимые столбцы
-            result_columns = expected_features + ['price', 'symbol', 'timestamp']
-            df = df[result_columns].replace([np.inf, -np.inf], np.nan).ffill().fillna(0)
-
-            # Проверка признаков
-            logger.info(f"calculate_indicators: Сформированы признаки для {df['symbol'].iloc[0] if 'symbol' in df else 'unknown'}: {list(df.columns)}")
+            df['support_level'] = df['low'].rolling(window=20).min() / df['close'].replace(0, 0.0001)
+            df['resistance_level'] = df['high'].rolling(window=20).max() / df['close'].replace(0, 0.0001)
+    
+            # Заполнение пропусков
+            df = df.fillna(method='ffill').fillna(0)
+            
+            logger.info(f"calculate_indicators: Сформированы признаки для {df['symbol'].iloc[0] if 'symbol' in df.columns else 'unknown'}")
             return df
+            
         except Exception as e:
             logger.error(f"calculate_indicators: Ошибка: {e}")
             return df
