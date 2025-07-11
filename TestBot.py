@@ -265,42 +265,84 @@ class TradingModel:
 
     
     async def predict_probability(self, symbol, direction='LONG', stop_loss=None, position_size=0):
-        """Прогнозирует вероятность успешной сделки с улучшенной обработкой ошибок"""
+        """Прогнозирует вероятность успешной сделки с улучшенной обработкой данных и ошибок"""
         try:
+            # Получаем исторические данные
             df = await self.get_historical_data(symbol)
-            if df.empty:
-                logger.warning(f"Empty DataFrame for {symbol}")
+            if df.empty or len(df) < 48:  # Минимум 48 свечей (12 часов для 15m таймфрейма)
+                logger.warning(f"predict_probability: Недостаточно данных для {symbol} - {len(df)} записей")
                 return 0.0
             
+            # Рассчитываем индикаторы
             df = self.calculate_indicators(df)
             
+            # Получаем модель, скейлер и активные признаки
             model, scaler, active_features = self.get_model_for_symbol(symbol)
             if model is None or scaler is None or not active_features:
-                logger.error(f"No model/scaler available for {symbol}")
+                logger.error(f"predict_probability: Нет модели/скейлера для {symbol}")
                 return 0.0
 
             # Проверяем доступные признаки
             available_features = [f for f in active_features if f in df.columns]
-            if not available_features:
-                logger.error(f"No features available for {symbol}")
-                return 0.0
-
-            # Подготавливаем данные
-            try:
-                features = df[available_features].iloc[-1:].values
-                features_scaled = scaler.transform(features)
-                probability = model.predict_proba(features_scaled)[0][1] * 100
-            except Exception as e:
-                logger.error(f"Prediction failed for {symbol}: {e}")
-                return 0.0
-
-            if direction == 'SHORT':
-                probability = 100 - probability
-                
-            return max(0.0, min(100.0, probability))
+            missing_features = set(active_features) - set(available_features)
             
+            if missing_features:
+                logger.warning(f"predict_probability: Отсутствуют признаки для {symbol}: {missing_features}")
+            
+            if not available_features:
+                logger.error(f"predict_probability: Нет доступных признаков для {symbol}")
+                return 0.0
+
+            # Берем последние данные и масштабируем
+            latest_data = df[available_features].iloc[-1:].replace([np.inf, -np.inf], np.nan)
+            
+            # Проверка на NaN после замены
+            if latest_data.isna().any().any():
+                logger.warning(f"predict_probability: NaN в данных после обработки для {symbol}")
+                latest_data = latest_data.fillna(0)
+            
+            try:
+                # Масштабирование и предсказание
+                scaled_data = scaler.transform(latest_data)
+                proba = model.predict_proba(scaled_data)[0][1] * 100  # Вероятность класса 1 (успех)
+                
+                # Корректировка для SHORT сделок
+                if direction == 'SHORT':
+                    proba = 100 - proba
+                
+                # Применяем дополнительные фильтры
+                current_rsi = df['rsi'].iloc[-1]
+                current_macd = df['macd'].iloc[-1]
+                current_adx = df['adx'].iloc[-1]
+                
+                # Уменьшаем вероятность если условия не оптимальны
+                if direction == 'LONG':
+                    if current_rsi > 70:  # Перекупленность
+                        proba *= 0.7
+                    if current_macd < 0:  # Медвежий MACD
+                        proba *= 0.8
+                else:  # SHORT
+                    if current_rsi < 30:  # Перепроданность
+                        proba *= 0.7
+                    if current_macd > 0:  # Бычий MACD
+                        proba *= 0.8
+                
+                # Учет силы тренда
+                if current_adx < 25:  # Слабый тренд
+                    proba *= 0.9
+                
+                # Ограничиваем вероятность в разумных пределах
+                final_proba = max(1.0, min(99.0, proba))
+                
+                logger.info(f"predict_probability: {symbol} {direction} - Исходная: {proba:.1f}%, Скорректированная: {final_proba:.1f}%")
+                return final_proba
+                
+            except Exception as e:
+                logger.error(f"predict_probability: Ошибка предсказания для {symbol}: {e}")
+                return 0.0
+                
         except Exception as e:
-            logger.error(f"Error in predict_probability for {symbol}: {e}")
+            logger.error(f"predict_probability: Критическая ошибка для {symbol}: {e}")
             return 0.0
 
 
