@@ -74,41 +74,11 @@ class ForwardTradingBot:
         # Подписчики бота
         self.subscribed_users = set(self.load_allowed_users())
     
-    def load_allowed_users(self):
-        """Загрузка списка разрешенных пользователей с полной обработкой ошибок"""
-        try:
-            # Проверяем существование файла
-            if not os.path.exists(ALLOWED_USERS_PATH):
-                logger.warning(f"Allowed users file not found at {ALLOWED_USERS_PATH}")
-                return []
-    
-            # Проверяем что файл не пустой
-            if os.path.getsize(ALLOWED_USERS_PATH) == 0:
-                logger.warning("Allowed users file is empty")
-                return []
-    
-            # Читаем и парсим файл
-            with open(ALLOWED_USERS_PATH, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-                if not content:
-                    logger.warning("Allowed users file contains only whitespace")
-                    return []
-                    
-                users = json.loads(content)
-                if not isinstance(users, list):
-                    logger.error(f"Invalid format in allowed users file: expected list, got {type(users)}")
-                    return []
-                    
-                logger.info(f"Loaded {len(users)} allowed users from file")
-                return users
-    
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse allowed users file: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Unexpected error loading allowed users: {e}")
-            return []
-    
+    ddef load_allowed_users(self):
+        """Возвращает явно заданный список разрешённых пользователей"""
+        allowed_users = [809820681, 667191785, 453365207]  # Жёстко заданные ID
+        logger.info(f"Loaded {len(allowed_users)} allowed users from hardcoded list")
+        return allowed_users
     @staticmethod
     def save_allowed_users(users):
         """Сохранение списка разрешенных пользователей с обработкой ошибок"""
