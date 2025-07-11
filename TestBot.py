@@ -127,15 +127,7 @@ engine = create_engine('sqlite:///trades.db')
 Base.metadata.create_all(engine)
 Session = sessionmaker(bind=engine)
 
-def get_model_for_symbol(self, symbol):
-        """Выбираем модель для символа"""
-        base_symbol = symbol.replace('/USDT', 'USDT')
-        if 'combined' in self.models:
-            return self.models['combined'], self.scalers['combined'], self.active_features_dict['combined']
-        elif base_symbol in self.models:
-            return self.models[base_symbol], self.scalers[base_symbol], self.active_features_dict[base_symbol]
-        else:
-            return None, None, None
+
 # Класс TradingModel
 class TradingModel:
     def __init__(self):
@@ -144,6 +136,16 @@ class TradingModel:
         self.scalers = {}
         self.active_features = []
         self.load_model()
+
+    def get_model_for_symbol(self, symbol):
+        """Выбираем модель для символа"""
+        base_symbol = symbol.replace('/USDT', 'USDT')
+        if 'combined' in self.models:
+            return self.models['combined'], self.scalers['combined'], self.active_features_dict['combined']
+        elif base_symbol in self.models:
+            return self.models[base_symbol], self.scalers[base_symbol], self.active_features_dict[base_symbol]
+        else:
+            return None, None, None
 
     def load_model(self):
         try:
