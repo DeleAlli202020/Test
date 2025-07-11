@@ -785,41 +785,36 @@ async def retrain_model_daily(context: ContextTypes.DEFAULT_TYPE):
 # Прогноз вероятности
 async def predict_probability(model, scaler, active_features, df, coin_id, stop_loss, position_size, direction='LONG'):
     try:
-        # Подготовка данных с использованием prepare_training_data
-        X, _ = prepare_training_data(df)
-        if X.empty:
-            logger.warning(f"predict_probability: Пустой DataFrame для {coin_id}")
-            return 0.0
-
-        # Выбор последней строки и активных признаков
-        X_last = X.iloc[-1][active_features]
-        X_last_df = pd.DataFrame([X_last], columns=active_features)
-
-        # Масштабирование данных
-        X_last_scaled = pd.DataFrame(scaler.transform(X_last_df), columns=active_features)
-
+        # Подготовка признаков
+        features = [
+            ((df['volume'].iloc[-1] - df['volume'].iloc[-2]) / df['volume'].iloc[-2] * 100) if len(df) >= 2 else 0.0,  # volume_change
+            calculate_institutional_score(df, coin_id),  # institutional_score
+            calculate_vwap_signal(df).iloc[-1],  # vwap_signal
+            calculate_sentiment(coin_id),  # sentiment
+            calculate_rsi(df).iloc[-1] if len(df) >= 14 else 50.0,  # rsi
+            calculate_macd(df).iloc[-1] if len(df) >= 26 else 0.0,  # macd
+            calculate_adx(df).iloc[-1] if len(df) >= 14 else 0.0,  # adx
+            calculate_obv(df).iloc[-1] if len(df) >= 2 else 0.0,  # obv
+            calculate_smart_money_score(df, coin_id)  # smart_money_score
+        ]
+        
+        # Фильтрация активных признаков
+        X = np.array([features[i] for i in active_features]).reshape(1, -1)
+        
+        # Масштабирование
+        X_scaled = scaler.transform(X)
+        
         # Предсказание вероятности
-        probability = model.predict_proba(X_last_scaled)[0][1] * 100
-        base_probability = probability
-
-        # Корректировка вероятности с учётом rr_ratio
-        rr_ratio = 0.0
-        if stop_loss > 0 and position_size > 0:
-            current_price = df['price'].iloc[-1]
-            rr_ratio = (current_price - stop_loss) / position_size if direction == 'LONG' else (stop_loss - current_price) / abs(position_size)
-            rr_ratio = min(max(rr_ratio, -1.0), 3.0)
-        probability = min(probability * (1 + rr_ratio * 0.1), 95.0)
-
+        probability = model.predict_proba(X_scaled)[0][1] * 100  # Вероятность положительного класса (успех)
+        
         # Инверсия вероятности для SHORT
         if direction == 'SHORT':
             probability = 100 - probability
-
-        logger.info(f"predict_probability: {coin_id}: base_probability={base_probability:.2f}%, скорректировано={probability:.2f}%")
+        
         return max(0.0, min(100.0, probability))
-
+    
     except Exception as e:
-        logger.error(f"predict_probability: Ошибка для {coin_id}: {str(e)}")
-        await notify_admin(f"Ошибка в predict_probability для {coin_id}: {str(e)}")
+        logger.error(f"predict_probability: Ошибка для coin_id={coin_id}: {str(e)}")
         return 0.0
 # Список криптовалют
 def get_top_cryptos():
@@ -967,69 +962,76 @@ def create_price_chart(df, symbol, price_change):
         return None
 
 # Анализ торговой возможности
-async def analyze_trade_opportunity(symbol, timeframe, model, scaler, active_features):
+async def analyze_trade_opportunity(model, scaler, active_features, df, price_change_1h, current_price, symbol, taker_buy_base, volume, coin_id, direction=None, balance=1000):
     try:
-        # Получение данных
-        df = await fetch_ohlcv(symbol, timeframe)
-        if df.empty or len(df) < 48:
-            logger.warning(f"analyze_trade_opportunity: Недостаточно данных для {symbol}, строк: {len(df)}")
-            return None
-
-        # Логирование входных данных
-        logger.info(f"analyze_trade_opportunity: df_shape={df.shape}, df_columns={df.columns.tolist() if not df.empty else 'empty'}, symbol={symbol}")
-
+        if df.empty:
+            logger.warning(f"analyze_trade_opportunity: Пустой DataFrame для {symbol}")
+            return False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        
         # Расчёт индикаторов
-        coin_id = symbol.replace('/USDT', '')
-        volume_change, vwap_signal, sentiment, rsi, macd, adx, obv, bb_width, smart_money_score = smart_money_analysis(
-            df,
-            0.0,  # taker_buy_volume не используется
-            df['volume'].iloc[-1] if 'volume' in df.columns else 0.0,
-            coin_id
-        )
-
-        # Расчёт уровней
-        current_price = df['price'].iloc[-1]
+        rsi = calculate_rsi(df).iloc[-1] if len(df) >= 14 else 50.0
+        macd = calculate_macd(df).iloc[-1] if len(df) >= 26 else 0.0
+        signal = calculate_macd(df, fast=12, slow=26).ewm(span=9, adjust=False).mean().iloc[-1] if len(df) >= 26 else 0.0
+        adx = calculate_adx(df).iloc[-1] if len(df) >= 14 else 0.0
+        obv = calculate_obv(df).iloc[-1] if len(df) >= 2 else 0.0
+        
+        # Расчёт stop_loss для вероятности
         atr = calculate_atr_normalized(df).iloc[-1] * current_price
-        stop_loss_long = current_price - atr * 1.5
-        stop_loss_short = current_price + atr * 1.5
-        tp1_long = current_price + atr * 1.5
-        tp2_long = current_price + atr * 2.5
-        tp1_short = current_price - atr * 1.5
-        tp2_short = current_price - atr * 2.5
-
-        # Расчёт вероятностей
-        prob_long = await predict_probability(model, scaler, active_features, df, coin_id, stop_loss_long, current_price - stop_loss_long, 'LONG')
-        prob_short = await predict_probability(model, scaler, active_features, df, coin_id, stop_loss_short, stop_loss_short - current_price, 'SHORT')
-
-        # Логика выбора направления
-        direction = 'LONG' if prob_long > prob_short and prob_long > 30 else 'SHORT' if prob_short > prob_long and prob_short > 30 else None
-        if direction is None:
-            logger.info(f"analyze_trade_opportunity: Нет подходящего направления для {symbol}, prob_long={prob_long:.2f}%, prob_short={prob_short:.2f}%")
-            return None
-
-        # Формирование результата
-        result = {
-            'symbol': symbol,
-            'direction': direction,
-            'entry_price': current_price,
-            'stop_loss': stop_loss_long if direction == 'LONG' else stop_loss_short,
-            'tp1': tp1_long if direction == 'LONG' else tp1_short,
-            'tp2': tp2_long if direction == 'LONG' else tp2_short,
-            'probability': prob_long if direction == 'LONG' else prob_short,
-            'rsi': rsi.iloc[-1],
-            'macd': 'Бычий' if macd.iloc[-1] > 0 else 'Медвежий',
-            'adx': adx.iloc[-1],
-            'vwap': 'Бычий' if vwap_signal.iloc[-1] > 0 else 'Медвежий',
-            'sentiment': sentiment.iloc[-1],
-            'smart_money_score': smart_money_score.iloc[-1],
-            'volume_change': volume_change.iloc[-1]
-        }
-
-        logger.info(f"analyze_trade_opportunity: Успешно для {symbol}, direction={direction}, probability={result['probability']:.2f}%")
-        return result
+        stop_loss = current_price - max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01) if direction == 'LONG' else \
+                    current_price + max(2 * atr, current_price * 0.005 if current_price >= 1 else current_price * 0.01)
+        
+        # Расчёт position_size
+        position_size, _ = calculate_position_size(current_price, stop_loss, balance)
+        
+        # Получение вероятности от модели
+        probability = await predict_probability(model, scaler, active_features, df, coin_id, stop_loss, abs(position_size), direction)
+        
+        # Проверка условий входа
+        if direction == 'LONG':
+            is_opportunity = (
+                rsi > 50 and rsi < 70 and
+                macd > signal and macd > 0 and
+                adx > 20 and
+                price_change_1h > 0
+            )
+        elif direction == 'SHORT':
+            is_opportunity = (
+                rsi < 50 and rsi > 30 and
+                macd < signal and macd < 0 and
+                adx > 20 and
+                price_change_1h < 0
+            )
+        else:
+            is_opportunity = (
+                (rsi > 50 and rsi < 70) or (rsi < 50 and rsi > 30) and
+                abs(macd) > abs(signal) and
+                adx > 15
+            )
+        
+        # Дополнительные метрики
+        volume_change = ((df['volume'].iloc[-1] - df['volume'].iloc[-2]) / df['volume'].iloc[-2] * 100) if len(df) >= 2 else 0.0
+        institutional_score = taker_buy_base / volume * 100 if volume > 0 else 50.0
+        vwap_signal = calculate_vwap_signal(df).iloc[-1]
+        sentiment = min(100, institutional_score + (volume_change / 2)) if direction == 'LONG' else max(0, institutional_score - (volume_change / 2))
+        smart_money_score = min(100, institutional_score + (volume_change / 5))
+        
+        return (
+            is_opportunity,
+            price_change_1h,
+            volume_change,
+            institutional_score,
+            vwap_signal,
+            sentiment,
+            rsi,
+            macd,
+            adx,
+            obv,
+            smart_money_score,
+            probability
+        )
     except Exception as e:
-        logger.error(f"analyze_trade_opportunity: Ошибка для {symbol}: {str(e)}")
-        return None
+        logger.error(f"analyze_trade_opportunity: Ошибка для {symbol}: {e}")
+        return False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 # Проверка активных сделок
 from threading import Lock
 
