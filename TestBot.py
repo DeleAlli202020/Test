@@ -74,7 +74,7 @@ class ForwardTradingBot:
         # Подписчики бота
         self.subscribed_users = set(self.load_allowed_users())
     
-    def load_allowed_users():
+    def load_allowed_users(self):
         """Загрузка списка разрешенных пользователей с полной обработкой ошибок"""
         try:
             # Проверяем существование файла
