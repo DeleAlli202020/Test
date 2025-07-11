@@ -138,43 +138,54 @@ class TradingModel:
         self.load_model()
 
     def get_model_for_symbol(self, symbol):
-        """Выбираем модель для символа с улучшенной обработкой ошибок"""
+        """Выбираем модель для символа с улучшенной обработкой ошибок и приоритетами"""
         try:
-            base_symbol = symbol.replace('/USDT', '')
+            if not symbol:
+                logger.error("get_model_for_symbol: Пустой символ")
+                return None, None, None
+
+            # Нормализация символа (удаляем '/USDT' если есть)
+            base_symbol = symbol.replace('/USDT', '').replace('USDT', '')
             
-            # 1. Попробуем найти модель для конкретного символа
+            # 1. Проверяем наличие конкретной модели для символа
             if base_symbol in self.models:
                 if base_symbol in self.scalers and base_symbol in self.active_features:
+                    logger.info(f"get_model_for_symbol: Используется модель для конкретного символа {base_symbol}")
                     return (
                         self.models[base_symbol], 
                         self.scalers[base_symbol], 
                         self.active_features[base_symbol]
                     )
-            
-            # 2. Попробуем найти общую модель
-            for model_key in ['combined', 'default', 'main']:
+                else:
+                    logger.warning(f"get_model_for_symbol: Для символа {base_symbol} нет скейлера или фичей")
+
+            # 2. Проверяем общие модели (combined/default/main)
+            general_model_keys = ['combined', 'default', 'main']
+            for model_key in general_model_keys:
                 if model_key in self.models and model_key in self.scalers and model_key in self.active_features:
+                    logger.info(f"get_model_for_symbol: Используется общая модель {model_key} для {symbol}")
                     return (
                         self.models[model_key], 
                         self.scalers[model_key], 
                         self.active_features[model_key]
                     )
-            
-            # 3. Возьмем первую доступную модель
+
+            # 3. Если ничего не найдено, пробуем первую доступную модель
             if self.models:
                 first_key = next(iter(self.models))
                 if first_key in self.scalers and first_key in self.active_features:
+                    logger.warning(f"get_model_for_symbol: Используется первая доступная модель {first_key} для {symbol}")
                     return (
                         self.models[first_key], 
                         self.scalers[first_key], 
                         self.active_features[first_key]
                     )
-            
-            logger.error(f"No valid model found for {symbol}")
+
+            logger.error(f"get_model_for_symbol: Нет подходящей модели для {symbol}")
             return None, None, None
             
         except Exception as e:
-            logger.error(f"Error in get_model_for_symbol for {symbol}: {e}")
+            logger.error(f"get_model_for_symbol: Критическая ошибка для {symbol}: {str(e)}")
             return None, None, None
 
     def load_model(self):
@@ -183,13 +194,35 @@ class TradingModel:
                 model_data = joblib.load(MODEL_PATH)
                 self.models = model_data.get('models', {})
                 self.scalers = model_data.get('scalers', {})
-                self.active_features = joblib.load(FEATURES_PATH) if os.path.exists(FEATURES_PATH) else ACTIVE_FEATURES
-                logger.info("Модель и скейлеры успешно загружены")
+                
+                # Загрузка активных фичей с обработкой разных форматов
+                if os.path.exists(FEATURES_PATH):
+                    features_data = joblib.load(FEATURES_PATH)
+                    if isinstance(features_data, dict):
+                        self.active_features = features_data
+                    elif isinstance(features_data, list):
+                        self.active_features = {'combined': features_data}
+                    else:
+                        self.active_features = ACTIVE_FEATURES
+                        logger.warning("load_model: Неподдерживаемый формат features.pkl, использованы фичи по умолчанию")
+                else:
+                    self.active_features = {'combined': ACTIVE_FEATURES}
+                    logger.warning("load_model: Файл features.pkl не найден, использованы фичи по умолчанию")
+                
+                logger.info(f"Модель и скейлеры успешно загружены. Доступно {len(self.models)} моделей")
             else:
                 logger.warning("Файл модели не найден")
+                # Инициализация пустых моделей, чтобы избежать ошибок
+                self.models = {}
+                self.scalers = {}
+                self.active_features = {'combined': ACTIVE_FEATURES}
         except Exception as e:
-            logger.error(f"Ошибка загрузки модели: {e}")
-            asyncio.create_task(notify_admin(f"Ошибка загрузки модели: {e}"))
+            logger.error(f"Ошибка загрузки модели: {str(e)}")
+            asyncio.create_task(notify_admin(f"Ошибка загрузки модели: {str(e)}"))
+            # Инициализация пустых моделей в случае ошибки
+            self.models = {}
+            self.scalers = {}
+            self.active_features = {'combined': ACTIVE_FEATURES}
 
     def save_model(self):
         try:
