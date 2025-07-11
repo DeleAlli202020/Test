@@ -65,10 +65,10 @@ DEFAULT_AUTO_INTERVAL = 300  # 5 минут
 
 # Конфигурационные параметры для торговых стратегий
 ACTIVE_FEATURES = [
-    'price_change_1h', 'price_change_2h', 'price_change_6h', 'volume_score',
-    'volume_change', 'atr_normalized', 'rsi', 'macd', 'vwap_signal', 'obv',
-    'adx', 'bb_upper', 'bb_lower', 'support_level', 'resistance_level',
-    'sentiment', 'smart_money_score'
+    'price_change_1h', 'price_change_2h', 'price_change_6h', 'price_change_12h',
+    'volume_score', 'volume_change', 'atr_normalized', 'rsi', 'macd',
+    'vwap_signal', 'obv', 'adx', 'bb_upper', 'bb_lower',
+    'support_level', 'resistance_level', 'sentiment', 'smart_money_score'
 ]
 STOP_LOSS_PCT = 0.01
 TAKE_PROFIT_1_PCT = 0.03
@@ -303,6 +303,7 @@ class TradingModel:
             df['price_change_1h'] = df['close'].pct_change(4) * 100
             df['price_change_2h'] = df['close'].pct_change(8) * 100
             df['price_change_6h'] = df['close'].pct_change(24) * 100
+            df['price_change_12h'] = df['close'].pct_change(48) * 100
             df['volume_score'] = df['volume'] / df['volume'].rolling(window=6).mean() * 100
             df['volume_change'] = df['volume'].pct_change() * 100
             df['atr_normalized'] = (df['high'] - df['low']) / df['close'].replace(0, 0.0001) * 100
@@ -320,6 +321,7 @@ class TradingModel:
             logger.info(f"Indicators calculated for {df['symbol'].iloc[0] if 'symbol' in df.columns else 'unknown'}")
             return df
             
+            
         except Exception as e:
             logger.error(f"Error calculating indicators: {e}")
             return df
@@ -329,7 +331,7 @@ class TradingModel:
             return pd.DataFrame(), pd.DataFrame()
         
         features = [
-            'price_change_1h', 'price_change_2h', 'price_change_6h', 'volume_score',
+            'price_change_1h', 'price_change_2h', 'price_change_6h', 'price_change_12h', 'volume_score',
             'volume_change', 'atr_normalized', 'rsi', 'macd', 'vwap_signal', 'obv',
             'adx', 'bb_upper', 'bb_lower', 'support_level', 'resistance_level',
             'sentiment', 'smart_money_score'
@@ -343,26 +345,36 @@ class TradingModel:
             df = await self.get_historical_data(symbol)
             if df.empty or len(df) < 48:
                 logger.warning(f"Not enough data for {symbol}")
-                return 50.0  # Return neutral probability instead of 0
+                return 50.0  # Return neutral probability
                 
             df = self.calculate_indicators(df)
             X, _ = self.prepare_features(df)
             
             model, scaler, active_features = self.get_model_for_symbol(symbol)
-            if model is None or scaler is None or not active_features:
-                logger.error(f"No model/scaler for {symbol}, using default 50%")
+            if model is None or scaler is None:
+                logger.error(f"No model/scaler for {symbol}")
                 return 50.0
-
-            threshold = 0.3160 if symbol in self.LOW_RECALL_SYMBOLS else 0.5
-            
+                
+            # Ensure all active features exist
+            missing_features = [f for f in active_features if f not in X.columns]
+            if missing_features:
+                logger.warning(f"Missing features for {symbol}: {missing_features}")
+                for f in missing_features:
+                    X[f] = 0.0
+                    
             latest_data = X[active_features].iloc[-1:].replace([np.inf, -np.inf], np.nan).fillna(0)
-            X_scaled = scaler.transform(latest_data)
-            y_pred_proba = model.predict_proba(X_scaled)[0][1] * 100
             
+            try:
+                X_scaled = scaler.transform(latest_data)
+                y_pred_proba = model.predict_proba(X_scaled)[0][1] * 100
+            except Exception as e:
+                logger.error(f"Prediction failed for {symbol}: {e}")
+                return 50.0
+                
             if direction == 'SHORT':
                 y_pred_proba = 100 - y_pred_proba
-            
-            # Дополнительные фильтры
+                
+            # Additional filters
             current_rsi = df['rsi'].iloc[-1]
             current_macd = df['macd'].iloc[-1]
             current_adx = df['adx'].iloc[-1]
@@ -373,16 +385,14 @@ class TradingModel:
             else:  # SHORT
                 if current_rsi < 30: y_pred_proba *= 0.7
                 if current_macd > 0: y_pred_proba *= 0.8
-            
+                
             if current_adx < 25: y_pred_proba *= 0.9
-            
-            final_proba = max(1.0, min(99.0, y_pred_proba))
-            logger.info(f"Predicted probability for {symbol} {direction}: {final_proba:.1f}%")
-            return final_proba
+                
+            return max(1.0, min(99.0, y_pred_proba))
             
         except Exception as e:
             logger.error(f"Error predicting for {symbol}: {e}")
-            return 0.0
+            return 50.0  # Return neutral probability on error
 
     async def analyze_symbol(self, symbol, coin_id, price_change_1h, taker_buy_base, volume, balance):
         try:
