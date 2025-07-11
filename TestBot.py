@@ -327,18 +327,67 @@ class TradingModel:
             return df
 
     def prepare_features(self, df):
+        """Prepare features for model prediction with robust error handling"""
         if df.empty:
+            logger.warning("Empty DataFrame received in prepare_features")
             return pd.DataFrame(), pd.DataFrame()
         
-        features = [
-            'price_change_1h', 'price_change_2h', 'price_change_6h', 'price_change_12h', 'volume_score',
-            'volume_change', 'atr_normalized', 'rsi', 'macd', 'vwap_signal', 'obv',
-            'adx', 'bb_upper', 'bb_lower', 'support_level', 'resistance_level',
-            'sentiment', 'smart_money_score'
-        ]
+        # Define all expected features with default values
+        feature_specs = {
+            'price_change_1h': 0.0,
+            'price_change_2h': 0.0,
+            'price_change_6h': 0.0,
+            'price_change_12h': 0.0,
+            'volume_score': 0.0,
+            'volume_change': 0.0,
+            'atr_normalized': 0.0,
+            'rsi': 50.0,  # Neutral RSI value
+            'macd': 0.0,
+            'vwap_signal': 0.0,
+            'obv': 0.0,
+            'adx': 25.0,  # Neutral ADX value
+            'bb_upper': lambda: df['close'].iloc[-1] if not df.empty else 0.0,
+            'bb_lower': lambda: df['close'].iloc[-1] if not df.empty else 0.0,
+            'support_level': 1.0,
+            'resistance_level': 1.0,
+            'sentiment': 50.0,  # Neutral sentiment
+            'smart_money_score': 50.0  # Neutral score
+        }
         
-        df[features] = df[features].replace([np.inf, -np.inf], np.nan).fillna(0)
-        return df[features].iloc[-2:], df.iloc[-2:]
+        # Prepare output DataFrame with consistent columns
+        features_df = pd.DataFrame(index=df.index[-2:])
+        
+        try:
+            # Ensure all features exist with proper values
+            for feature, default in feature_specs.items():
+                if feature in df.columns:
+                    features_df[feature] = df[feature].iloc[-2:]
+                else:
+                    features_df[feature] = default() if callable(default) else default
+            
+            # Handle infinite and missing values
+            features_df = features_df.replace([np.inf, -np.inf], np.nan)
+            
+            # Fill remaining NA values with feature-specific defaults
+            for feature in feature_specs:
+                if features_df[feature].isna().any():
+                    default = feature_specs[feature]
+                    fill_value = default() if callable(default) else default
+                    features_df[feature] = features_df[feature].fillna(fill_value)
+            
+            # Log if we had to use defaults
+            missing_features = [f for f in feature_specs if f not in df.columns]
+            if missing_features:
+                logger.warning(f"Using default values for missing features: {missing_features}")
+            
+            return features_df, df.iloc[-2:]
+        
+        except Exception as e:
+            logger.error(f"Error preparing features: {str(e)}")
+            # Return DataFrame with all default values if error occurs
+            default_features = {f: (d() if callable(d) else d) for f, d in feature_specs.items()}
+            error_df = pd.DataFrame([default_features], index=df.index[-1:]) if not df.empty else pd.DataFrame([default_features])
+            return error_df, df.iloc[-1:] if not df.empty else pd.DataFrame()
 
     async def predict_probability(self, symbol, direction='LONG', stop_loss=None, position_size=0):
         try:
