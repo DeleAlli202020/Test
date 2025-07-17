@@ -101,6 +101,20 @@ class TradingBot:
             return False
             
         return True
+    
+    def get_expected_features(self, is_short: bool) -> list:
+        """Возвращает фичи в том порядке, в котором их ожидает модель"""
+        model_data = self.short_model_data if is_short else self.long_model_data
+        if not model_data:
+            return []
+        
+        # Пробуем получить фичи из scaler, затем из модели
+        if hasattr(model_data['scalers']['combined'], 'feature_names_in_'):
+            return list(model_data['scalers']['combined'].feature_names_in_)
+        elif hasattr(model_data['models']['combined'], 'feature_name_'):
+            return model_data['models']['combined'].feature_name_
+        else:
+            return self.get_model_features(is_short)
 
     def init_exchange(self):
         """Инициализация биржи"""
@@ -263,53 +277,58 @@ class TradingBot:
         return df
             
     def calculate_additional_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Расчет всех необходимых фичей с полной инициализацией"""
+        """Расчет всех дополнительных фичей с проверкой данных"""
         try:
-            # Инициализируем все колонки
-            df = self.init_feature_columns(df.copy())
-            
             if len(df) < 48:
-                logger.warning("Not enough data for feature calculation")
+                logger.warning("Not enough data for full feature calculation")
                 return df
                 
-            # Расчет изменений цены
-            periods = {
-                'price_change_1h': 4,
-                'price_change_2h': 8,
-                'price_change_6h': 24,
-                'price_change_12h': 48
-            }
+            # Копируем DataFrame чтобы не модифицировать оригинал
+            df = df.copy()
             
-            for name, period in periods.items():
-                if len(df) > period:
-                    df[name] = df['price'].pct_change(period).fillna(0) * 100
+            # Расчет всех фичей с проверкой на достаточность данных
+            try:
+                # Price changes
+                df['price_change_1h'] = df['price'].pct_change(4).fillna(0) * 100 if len(df) > 4 else 0
+                df['price_change_2h'] = df['price'].pct_change(8).fillna(0) * 100 if len(df) > 8 else 0
+                df['price_change_6h'] = df['price'].pct_change(24).fillna(0) * 100 if len(df) > 24 else 0
+                df['price_change_12h'] = df['price'].pct_change(48).fillna(0) * 100 if len(df) > 48 else 0
+                
+                # Volume metrics
+                if len(df) >= 6:
+                    vol_mean = df['volume'].rolling(6).mean().replace(0, 1)
+                    df['volume_score'] = (df['volume'] / vol_mean * 100).fillna(0)
+                    df['volume_change'] = df['volume'].pct_change().fillna(0) * 100
                 else:
-                    df[name] = 0.0
-            
-            # Объемные показатели
-            if len(df) >= 6:
-                vol_mean = df['volume'].rolling(6).mean().replace(0, 1)
-                df['volume_score'] = (df['volume'] / vol_mean * 100).fillna(0)
-                df['volume_change'] = df['volume'].pct_change().fillna(0) * 100
-            
-            # Нормализованный ATR (убедитесь, что atr уже рассчитан)
-            if 'atr' in df.columns:
-                df['atr_normalized'] = (df['atr'] / df['price'].replace(0, 1)) * 100
-            
-            # On-Balance Volume
-            price_diff = df['price'].diff().fillna(0)
-            df['obv'] = (np.sign(price_diff) * df['volume']).cumsum()
-            
-            # Уровни поддержки/сопротивления
-            if len(df) >= 20:
-                df['support_level'] = df['low'].rolling(20).min().fillna(df['low'].min())
-                df['resistance_level'] = df['high'].rolling(20).max().fillna(df['high'].max())
-            
+                    df['volume_score'] = 0
+                    df['volume_change'] = 0
+                    
+                # ATR (должен быть уже рассчитан в calculate_indicators)
+                if 'atr' in df.columns:
+                    df['atr_normalized'] = (df['atr'] / df['price'].replace(0, 1) * 100).fillna(0)
+                else:
+                    df['atr_normalized'] = 0
+                    
+                # OBV
+                price_diff = df['price'].diff().fillna(0)
+                df['obv'] = (np.sign(price_diff) * df['volume']).cumsum()
+                
+                # Support/Resistance
+                if len(df) >= 20:
+                    df['support_level'] = df['low'].rolling(20).min().fillna(df['low'].min())
+                    df['resistance_level'] = df['high'].rolling(20).max().fillna(df['high'].max())
+                else:
+                    df['support_level'] = df['low'].min()
+                    df['resistance_level'] = df['high'].max()
+                    
+            except Exception as e:
+                logger.error(f"Error in feature calculation: {e}")
+                
             return df.replace([np.inf, -np.inf], 0)
             
         except Exception as e:
-            logger.error(f"Error calculating features: {e}")
-            return self.init_feature_columns(df.copy())
+            logger.error(f"Error in calculate_additional_features: {e}")
+            return pd.DataFrame()
 
     def calculate_indicators(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
         """Расчет индикаторов для модели"""
@@ -396,12 +415,12 @@ class TradingBot:
         return []
 
     def prepare_features(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
-        """Подготовка фичей с гарантией правильного порядка"""
+        """Подготовка фичей с гарантией правильного порядка и наличия всех фичей"""
         try:
-            # Получаем список требуемых фичей
-            required_features = self.get_model_features(is_short)
-            if not required_features:
-                logger.error("No features list available")
+            # Получаем ожидаемые фичи в правильном порядке
+            expected_features = self.get_expected_features(is_short)
+            if not expected_features:
+                logger.error("No expected features list available")
                 return pd.DataFrame()
             
             # Рассчитываем все индикаторы
@@ -414,20 +433,20 @@ class TradingBot:
             if df.empty:
                 return pd.DataFrame()
             
-            # Создаем DataFrame с правильными feature names
-            features = pd.DataFrame(index=[0])
+            # Создаем финальный DataFrame с правильным порядком фичей
+            final_features = pd.DataFrame(index=[0])
             
-            for feature in required_features:
+            for feature in expected_features:
                 if feature in df.columns:
-                    features[feature] = [df[feature].iloc[-1]]
+                    final_features[feature] = [df[feature].iloc[-1]]
                 else:
                     logger.warning(f"Feature {feature} not found, filling with 0")
-                    features[feature] = [0.0]
+                    final_features[feature] = [0.0]
             
-            # Убедимся, что порядок колонок соответствует expected
-            features = features[required_features]
+            # Убедимся, что порядок фичей точно соответствует ожидаемому
+            final_features = final_features[expected_features]
             
-            return features.replace([np.inf, -np.inf], 0)
+            return final_features.replace([np.inf, -np.inf], 0)
             
         except Exception as e:
             logger.error(f"Error preparing features: {e}")
@@ -479,18 +498,13 @@ class TradingBot:
             try:
                 # Получаем feature names из scaler или модели
                 # Получаем feature names из scaler или модели
-                feature_names = (
-                    scaler.feature_names_in_ 
-                    if hasattr(scaler, 'feature_names_in_') 
-                    else getattr(model, 'feature_name_', None)
-                )
+                features_array = features.values.astype(np.float32)
                 
-                # Преобразуем данные с учетом feature names
-                if feature_names is not None:
-                    features = features[feature_names]
-                
+                # Преобразуем данные с учетом feature names           
                 # Масштабирование
-                features_scaled = scaler.transform(features)
+                features_scaled = scaler.transform(features_array)
+            
+            # Предсказание
                 
                 # Предсказание
                 proba = model.predict_proba(features_scaled)[0][1]
