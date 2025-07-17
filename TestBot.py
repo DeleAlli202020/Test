@@ -154,24 +154,22 @@ class TradingBot:
                 await asyncio.sleep(5)
         return pd.DataFrame()
 
+    # В методе calculate_indicators (для обоих файлов):
+
     def calculate_indicators(self, df, is_short=False):
         """Расчет индикаторов для модели"""
         try:
-            # Базовые индикаторы
+            # Базовые индикаторы (общие для обеих моделей)
             df['rsi'] = RSIIndicator(df['close'], window=14).rsi().fillna(50)
             macd = MACD(df['close'], window_slow=26, window_fast=12)
             df['macd'] = macd.macd().fillna(0)
             df['macd_signal'] = macd.macd_signal().fillna(0)
             df['macd_diff'] = macd.macd_diff().fillna(0)
             
-            adx = ADXIndicator(df['high'], df['low'], df['close'], window=14)
-            df['adx'] = adx.adx().fillna(0)
-            df['dip'] = adx.adx_pos().fillna(0)
-            df['din'] = adx.adx_neg().fillna(0)
-            
+            df['adx'] = ADXIndicator(df['high'], df['low'], df['close'], window=14).adx().fillna(0)
             df['atr'] = AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range().fillna(0)
             
-            # EMA Cross
+            # EMA Cross (разные для лонг/шорт)
             df['ema_20'] = df['price'].ewm(span=20, adjust=False).mean()
             df['ema_50'] = df['price'].ewm(span=50, adjust=False).mean()
             df['ema_cross'] = (df['ema_20'] < df['ema_50']).astype(int) if is_short else (df['ema_20'] > df['ema_50']).astype(int)
@@ -182,10 +180,9 @@ class TradingBot:
             df['bear_volume'] = (df['close'] < df['open']) * df['volume']
             
             # Support/Resistance
-            df['support'] = df['low'].rolling(20).min()
-            df['resistance'] = df['high'].rolling(20).max()
+            df['support'] = df['low'].rolling(20).min().fillna(df['price'].min())
+            df['resistance'] = df['high'].rolling(20).max().fillna(df['price'].max())
             
-            # Добавление недостающих индикаторов
             # VWAP
             typical_price = (df['high'] + df['low'] + df['close']) / 3
             df['vwap'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
@@ -193,40 +190,52 @@ class TradingBot:
             
             # Bollinger Bands
             bb = BollingerBands(df['close'], window=20, window_dev=2)
-            df['bb_upper'] = bb.bollinger_hband()
-            df['bb_lower'] = bb.bollinger_lband()
-            df['bb_width'] = bb.bollinger_wband()
+            df['bb_upper'] = bb.bollinger_hband().fillna(0)
+            df['bb_lower'] = bb.bollinger_lband().fillna(0)
+            df['bb_width'] = bb.bollinger_wband().fillna(0)
             
-            # SuperTrend (упрощенная реализация)
+            # SuperTrend (исправленная версия)
             atr = df['atr']
             hl2 = (df['high'] + df['low']) / 2
             df['super_trend_upper'] = hl2 + (3 * atr)
             df['super_trend_lower'] = hl2 - (3 * atr)
-            df['super_trend'] = 1  # 1 для бычьего, -1 для медвежьего
-            for i in range(1, len(df)):
-                if df['close'].loc[i-1] > df['super_trend_upper'].loc[i-1]:
-                    df['super_trend'].loc[i] = 1
-                elif df['close'].loc[i-1] < df['super_trend_lower'].loc[i-1]:
-                    df['super_trend'].loc[i] = -1
+            df['super_trend'] = 1  # Инициализация
+            
+            for i in df.index[1:]:
+                prev_i = df.index[df.index.get_loc(i)-1]
+                if df.loc[prev_i, 'close'] > df.loc[prev_i, 'super_trend_upper']:
+                    df.loc[i, 'super_trend'] = 1
+                elif df.loc[prev_i, 'close'] < df.loc[prev_i, 'super_trend_lower']:
+                    df.loc[i, 'super_trend'] = -1
                 else:
-                    df['super_trend'].loc[i] = df['super_trend'].loc[i-1]
+                    df.loc[i, 'super_trend'] = df.loc[prev_i, 'super_trend']
             
-            # VWAP Angle (упрощенная реализация)
+            # Добавление недостающих фичей
             df['vwap_angle'] = df['vwap'].diff(5) / 5 * 100
-            
-            # Smart Money Score (упрощенная реализация)
             df['smart_money_score'] = (df['rsi'] * 0.4 + (100 - df['rsi']) * 0.3 + df['adx'] * 0.3).clip(0, 100)
-            
-            # Sentiment (заглушка)
-            df['sentiment'] = 50
-            
-            # Price to Resistance
+            df['sentiment'] = 50  # Заглушка
             df['price_to_resistance'] = ((df['price'] - df['resistance']) / df['price']) * 100
-            
-            # ATR Change
             df['atr_change'] = df['atr'].pct_change() * 100
             
+            # Убедимся, что все фичи присутствуют
+            required_features = [
+                'price_change_1h', 'price_change_2h', 'price_change_6h', 'price_change_12h',
+                'volume_score', 'volume_change', 'atr_normalized', 'obv',
+                'bb_upper', 'bb_lower', 'bb_width', 'support_level', 'resistance_level'
+            ]
+            
+            for feat in required_features:
+                if feat not in df.columns:
+                    df[feat] = 0  # Заполняем нулями если фича отсутствует
+                    
+            # Переименуем колонки для совместимости
+            df = df.rename(columns={
+                'support': 'support_level',
+                'resistance': 'resistance_level'
+            })
+            
             return df.replace([np.inf, -np.inf], np.nan).fillna(0)
+        
         except Exception as e:
             logger.error(f"Error calculating indicators: {e}")
             return df
@@ -371,48 +380,34 @@ class TradingBot:
             return None
 
     def prepare_features(self, df, is_short=False):
-        """Подготовка фичей для модели (унифицированная версия)"""
+        """Подготовка фичей для модели"""
         try:
             features = pd.DataFrame(index=df.index)
             
             # Общие фичи для обеих моделей
-            features['price_change_1h'] = df['price'].pct_change(4).fillna(0) * 100
-            features['price_change_2h'] = df['price'].pct_change(8).fillna(0) * 100
-            features['price_change_3h'] = df['price'].pct_change(12).fillna(0) * 100
-            features['price_change_4h'] = df['price'].pct_change(16).fillna(0) * 100
-            features['price_change_6h'] = df['price'].pct_change(24).fillna(0) * 100
-            features['price_change_8h'] = df['price'].pct_change(32).fillna(0) * 100
-            features['price_change_12h'] = df['price'].pct_change(48).fillna(0) * 100
+            common_features = [
+                'price_change_1h', 'price_change_2h', 'price_change_6h', 'price_change_12h',
+                'volume_score', 'volume_change', 'atr_normalized', 'rsi', 'macd',
+                'adx', 'ema_cross', 'volume_spike', 'super_trend', 'vwap_signal',
+                'vwap_angle', 'bb_upper', 'bb_lower', 'bb_width', 'support_level',
+                'resistance_level', 'price_to_resistance', 'atr_change'
+            ]
             
-            features['volume_score'] = (df['volume'] / df['volume'].rolling(6).mean()).fillna(1) * 100
-            features['volume_change'] = df['volume'].pct_change().fillna(0) * 100
-            features['atr_normalized'] = (df['atr'] / df['price']).fillna(0) * 100
-            features['atr_change'] = df['atr'].pct_change(4).fillna(0) * 100
+            for feat in common_features:
+                if feat in df.columns:
+                    features[feat] = df[feat].fillna(0)
+                else:
+                    features[feat] = 0  # Заполняем нулями если фича отсутствует
+                    logger.warning(f"Missing feature {feat}, filling with zeros")
             
-            features['rsi'] = df['rsi'].fillna(50)
-            features['macd'] = df['macd'].fillna(0)
-            features['adx'] = df['adx'].fillna(0)
-            features['ema_cross'] = df['ema_cross'].fillna(0)
-            features['volume_spike'] = df['volume_spike'].fillna(0)
-            features['super_trend'] = df['super_trend'].fillna(0)
-            features['vwap_signal'] = df['vwap_signal'].fillna(0)
-            features['vwap_angle'] = df['vwap_angle'].fillna(0)
-            
-            features['bull_volume'] = df['bull_volume'].fillna(0)
-            features['bear_volume'] = df['bear_volume'].fillna(0)
-            
-            features['bb_upper'] = df['bb_upper'].fillna(0)
-            features['bb_lower'] = df['bb_lower'].fillna(0)
-            features['bb_width'] = (features['bb_upper'] - features['bb_lower']).fillna(0)
-            
-            features['support_level'] = df['support'].fillna(0)
-            features['resistance_level'] = df['resistance'].fillna(0)
-            features['price_to_resistance'] = ((df['price'] - features['resistance_level']) / df['price']).fillna(0) * 100
-            
-            features['sentiment'] = df['sentiment'].fillna(50)
-            features['smart_money_score'] = df['smart_money_score'].fillna(50)
+            # Специфичные фичи
+            if is_short:
+                features['bear_volume'] = df['bear_volume'].fillna(0)
+            else:
+                features['bull_volume'] = df['bull_volume'].fillna(0)
             
             return features.loc[-1:].replace([np.inf, -np.inf], np.nan).fillna(0)
+        
         except Exception as e:
             logger.error(f"Error preparing features: {e}")
             return pd.DataFrame()
