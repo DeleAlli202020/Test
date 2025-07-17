@@ -137,38 +137,38 @@ class TradingBot:
             raise
 
     def load_allowed_users(self):
-        """Загрузка списка разрешенных пользователей с улучшенной обработкой ошибок"""
+        """Загрузка списка разрешенных пользователей"""
         try:
             if not os.path.exists(ALLOWED_USERS_PATH):
-                logger.warning(f"Allowed users file not found at {ALLOWED_USERS_PATH}")
-                return [ADMIN_ID] if ADMIN_ID != 0 else []
+                # Создаем файл если не существует
+                default_users = [ADMIN_ID] if ADMIN_ID != 0 else []
+                with open(ALLOWED_USERS_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(default_users, f)
+                return default_users
 
-            with open(ALLOWED_USERS_PATH, 'r', encoding='utf-8') as f:
+            with open(ALLOWED_USERS_PATH, 'r+', encoding='utf-8') as f:
                 content = f.read().strip()
-                
                 if not content:
-                    logger.warning("Allowed users file is empty")
-                    return [ADMIN_ID] if ADMIN_ID != 0 else []
+                    # Если файл пустой, записываем дефолтные значения
+                    default_users = [ADMIN_ID] if ADMIN_ID != 0 else []
+                    f.seek(0)
+                    json.dump(default_users, f)
+                    return default_users
                 
                 try:
                     users = json.loads(content)
                     if not isinstance(users, list):
-                        logger.error("Allowed users file must contain a list")
-                        return [ADMIN_ID] if ADMIN_ID != 0 else []
-                    
-                    logger.info(f"Loaded {len(users)} allowed users")
+                        raise ValueError("File must contain JSON array")
                     return users
-                    
-                except json.JSONDecodeError as e:
-                    logger.error(f"Invalid JSON in allowed users file: {e}")
-                    return [ADMIN_ID] if ADMIN_ID != 0 else []
-                    
-        except PermissionError as e:
-            logger.error(f"Permission denied: {e}")
-            return [ADMIN_ID] if ADMIN_ID != 0 else []
-            
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.error(f"Invalid JSON: {e}, resetting to default")
+                    default_users = [ADMIN_ID] if ADMIN_ID != 0 else []
+                    f.seek(0)
+                    f.truncate()
+                    json.dump(default_users, f)
+                    return default_users
         except Exception as e:
-            logger.error(f"Unexpected error loading allowed users: {e}")
+            logger.error(f"Error loading allowed users: {e}")
             return [ADMIN_ID] if ADMIN_ID != 0 else []
     
     def save_allowed_users(self):
@@ -702,10 +702,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(status_msg, parse_mode='Markdown')
 
-async def check_all_symbols(context: ContextTypes.DEFAULT_TYPE):
+async def check_all_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Проверка всех символов на сигналы с уведомлением о результатах"""
     logger.info("Starting periodic check for all symbols")
     signals_found = 0
+
+    if isinstance(update, Update):
+        await update.message.reply_text("🔍 Начинаю проверку рынка...")
     
     for symbol in SYMBOLS:
         try:
@@ -723,7 +726,7 @@ async def check_all_symbols(context: ContextTypes.DEFAULT_TYPE):
         message = (
             "🔍 **Результаты проверки рынка**\n"
             f"🕒 Время: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} (UTC)\n"
-            "📊 Проверено символов: {len(SYMBOLS)}\n"
+            f"📊 Проверено символов: {len(SYMBOLS)}\n"
             "❌ Торговых сигналов не найдено\n\n"
             "Следующая проверка через 15 минут"
         )
@@ -746,7 +749,7 @@ async def main():
         
         # Запуск периодической проверки каждые 15 минут
         app.job_queue.run_repeating(
-            check_all_symbols,
+            lambda ctx: check_all_symbols(None, ctx),  # Без Update объекта
             interval=CHECK_INTERVAL,
             first=10
         )
