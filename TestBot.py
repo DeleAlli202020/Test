@@ -8,15 +8,13 @@ import joblib
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 import ccxt.async_support as ccxt
-from ta.volatility import BollingerBands, AverageTrueRange
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, ADXIndicator
-from ta.volume import OnBalanceVolumeIndicator
+from ta.volatility import AverageTrueRange
 import sys
 from dotenv import load_dotenv
 import json
 import nest_asyncio
-from telegram.ext import ContextTypes
 
 nest_asyncio.apply()
 
@@ -65,6 +63,7 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Failed to initialize Binance API: {e}")
             raise
+
     def load_allowed_users(self):
         """Загрузка списка разрешенных пользователей"""
         try:
@@ -75,10 +74,10 @@ class TradingBot:
                 return users
             else:
                 logger.warning("Allowed users file not found, using default list")
-                return [809820681, 667191785, 453365207]
+                return [ADMIN_ID] if ADMIN_ID != 0 else []
         except Exception as e:
             logger.error(f"Failed to load allowed users: {e}")
-            return [809820681, 667191785, 453365207]
+            return [ADMIN_ID] if ADMIN_ID != 0 else []
     
     def save_allowed_users(self):
         """Сохранение списка разрешенных пользователей"""
@@ -163,11 +162,6 @@ class TradingBot:
             df['adx'] = ADXIndicator(df['high'], df['low'], df['close'], window=14).adx().fillna(0)
             df['atr'] = AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
             
-            # Bollinger Bands
-            bb = BollingerBands(df['close'], window=20, window_dev=2)
-            df['bb_upper'] = bb.bollinger_hband()
-            df['bb_lower'] = bb.bollinger_lband()
-            
             # EMA Cross
             df['ema_20'] = df['price'].ewm(span=20, adjust=False).mean()
             df['ema_50'] = df['price'].ewm(span=50, adjust=False).mean()
@@ -178,76 +172,51 @@ class TradingBot:
             df['bull_volume'] = (df['close'] > df['open']) * df['volume']
             df['bear_volume'] = (df['close'] < df['open']) * df['volume']
             
-            # SuperTrend
-            hl2 = (df['high'] + df['low']) / 2
-            upper_band = hl2 + (3 * df['atr'])
-            lower_band = hl2 - (3 * df['atr'])
-            super_trend = pd.Series(0.0, index=df.index)
-            trend = pd.Series(0, index=df.index)
-            
-            for i in range(1, len(df)):
-                if df['close'].iloc[i-1] > super_trend.iloc[i-1]:
-                    super_trend.iloc[i] = lower_band.iloc[i]
-                    trend.iloc[i] = 1
-                else:
-                    super_trend.iloc[i] = upper_band.iloc[i]
-                    trend.iloc[i] = -1
-                
-                if trend.iloc[i] == trend.iloc[i-1]:
-                    if trend.iloc[i] == 1 and super_trend.iloc[i] < super_trend.iloc[i-1]:
-                        super_trend.iloc[i] = super_trend.iloc[i-1]
-                    elif trend.iloc[i] == -1 and super_trend.iloc[i] > super_trend.iloc[i-1]:
-                        super_trend.iloc[i] = super_trend.iloc[i-1]
-            
-            df['super_trend'] = trend
+            # Support/Resistance
+            df['support'] = df['low'].rolling(20).min()
+            df['resistance'] = df['high'].rolling(20).max()
             
             return df.replace([np.inf, -np.inf], np.nan).fillna(0)
         except Exception as e:
             logger.error(f"Error calculating indicators: {e}")
             return df
 
-    async def check_signal(self, context: ContextTypes.DEFAULT_TYPE = None):
-        """Проверка сигналов для всех символов"""
+    async def check_signal(self, symbol):
+        """Проверка сигналов для символа"""
         try:
-            available_symbols = await self.check_symbol_availability()
-            if not available_symbols:
-                logger.warning("No available symbols to check")
+            df = await self.fetch_ohlcv_data(symbol)
+            if df.empty:
                 return
 
-            for symbol in available_symbols:
-                try:
-                    df = await self.fetch_ohlcv_data(symbol)
-                    if df.empty:
-                        continue
+            # Подготовка данных для моделей
+            df_long = self.calculate_indicators(df, is_short=False)
+            df_short = self.calculate_indicators(df, is_short=True)
+            current_price = df['price'].iloc[-1]
+            atr = df['atr'].iloc[-1]
 
-                    # Подготовка данных для моделей
-                    df = self.calculate_indicators(df, is_short=False)
-                    current_price = df['price'].iloc[-1]
-                    atr = df['atr'].iloc[-1]
+            # Проверка LONG сигнала
+            long_signal = await self.check_long_signal(df_long, symbol)
+            
+            # Проверка SHORT сигнала
+            short_signal = await self.check_short_signal(df_short, symbol)
 
-                    # Проверка LONG сигнала
-                    long_signal = await self.check_long_signal(df, symbol)
-                    
-                    # Проверка SHORT сигнала
-                    short_signal = await self.check_short_signal(df, symbol)
+            # Определение лучшего сигнала (если есть оба, выбираем с большей вероятностью)
+            best_signal = None
+            if long_signal and short_signal:
+                if long_signal['probability'] > short_signal['probability']:
+                    best_signal = long_signal
+                else:
+                    best_signal = short_signal
+            elif long_signal:
+                best_signal = long_signal
+            elif short_signal:
+                best_signal = short_signal
 
-                    # Определение лучшего сигнала
-                    best_signal = None
-                    if long_signal and short_signal:
-                        best_signal = long_signal if long_signal['probability'] > short_signal['probability'] else short_signal
-                    elif long_signal:
-                        best_signal = long_signal
-                    elif short_signal:
-                        best_signal = short_signal
-
-                    if best_signal:
-                        await self.send_signal_message(symbol, best_signal, current_price, atr)
-                        
-                except Exception as e:
-                    logger.error(f"Error checking signal for {symbol}: {e}")
-
+            if best_signal:
+                await self.send_signal_message(symbol, best_signal, current_price, atr, df)
+                
         except Exception as e:
-            logger.error(f"Error in check_signal: {e}")
+            logger.error(f"Error checking signal for {symbol}: {e}")
 
     async def check_long_signal(self, df, symbol):
         """Проверка LONG сигнала"""
@@ -262,7 +231,6 @@ class TradingBot:
                 (last_row['macd'] > -0.5) &
                 (last_row['adx'] > 15) &
                 ((last_row['ema_cross'] == 1) | (last_row['volume_spike'] == 1)) &
-                (last_row['super_trend'] == 1) &
                 (last_row['bull_volume'] > df['volume'].rolling(20).mean().iloc[-1]))
             
             if not valid_signal:
@@ -283,7 +251,10 @@ class TradingBot:
                     'probability': proba,
                     'rsi': last_row['rsi'],
                     'macd': last_row['macd'],
-                    'adx': last_row['adx']
+                    'adx': last_row['adx'],
+                    'atr': last_row['atr'],
+                    'support': last_row['support'],
+                    'resistance': last_row['resistance']
                 }
             return None
         except Exception as e:
@@ -303,7 +274,6 @@ class TradingBot:
                 (last_row['macd'] < 0) &
                 (last_row['adx'] > 15) &
                 ((last_row['ema_cross'] == 1) | (last_row['volume_spike'] == 1)) &
-                (last_row['super_trend'] == -1) &
                 (last_row['bear_volume'] > df['volume'].rolling(20).mean().iloc[-1]))
             
             if not valid_signal:
@@ -324,7 +294,10 @@ class TradingBot:
                     'probability': proba,
                     'rsi': last_row['rsi'],
                     'macd': last_row['macd'],
-                    'adx': last_row['adx']
+                    'adx': last_row['adx'],
+                    'atr': last_row['atr'],
+                    'support': last_row['support'],
+                    'resistance': last_row['resistance']
                 }
             return None
         except Exception as e:
@@ -351,11 +324,8 @@ class TradingBot:
             features['macd'] = df['macd']
             features['adx'] = df['adx']
             features['atr'] = df['atr']
-            features['bb_upper'] = df['bb_upper']
-            features['bb_lower'] = df['bb_lower']
             features['ema_cross'] = df['ema_cross']
             features['volume_spike'] = df['volume_spike']
-            features['super_trend'] = df['super_trend']
             
             if is_short:
                 features['bear_volume'] = df['bear_volume']
@@ -368,39 +338,83 @@ class TradingBot:
             logger.error(f"Error preparing features: {e}")
             return pd.DataFrame()
 
-    async def send_signal_message(self, symbol, signal, current_price, atr):
+    async def send_signal_message(self, symbol, signal, current_price, atr, df):
         """Отправка сообщения о сигнале"""
         try:
-            # Расчет уровней TP/SL
+            # Расчет уровней TP/SL с Risk/Reward >= 3
             if signal['type'] == 'LONG':
                 sl = current_price - atr * 1.5
-                tp1 = current_price + atr * 3
-                tp2 = current_price + atr * 4.5
+                tp1 = current_price + atr * 4.5  # RR 1:3
+                tp2 = current_price + atr * 6.0  # RR 1:4
                 rr1 = (tp1 - current_price) / (current_price - sl) if current_price != sl else 0
                 rr2 = (tp2 - current_price) / (current_price - sl) if current_price != sl else 0
             else:
                 sl = current_price + atr * 1.5
-                tp1 = current_price - atr * 3
-                tp2 = current_price - atr * 4.5
+                tp1 = current_price - atr * 4.5  # RR 1:3
+                tp2 = current_price - atr * 6.0  # RR 1:4
                 rr1 = (current_price - tp1) / (sl - current_price) if sl != current_price else 0
                 rr2 = (current_price - tp2) / (sl - current_price) if sl != current_price else 0
 
+            # Определение силы тренда по ADX
+            adx_strength = "слабый" if signal['adx'] < 25 else "умеренный" if signal['adx'] < 50 else "сильный"
+            
+            # Определение состояния RSI
+            rsi_state = (
+                "перепроданность" if signal['rsi'] < 30 else 
+                "перекупленность" if signal['rsi'] > 70 else 
+                "нейтральный"
+            )
+            
+            # Определение направления MACD
+            macd_direction = (
+                "бычий" if signal['macd'] > 0 else 
+                "медвежий"
+            )
+            
+            # Определение волатильности
+            volatility_level = (
+                "низкая" if atr < current_price * 0.01 else 
+                "средняя" if atr < current_price * 0.02 else 
+                "высокая"
+            )
+            
+            # Форматирование сообщения
             message = (
-                f"🚀 **{symbol.replace('USDT', '/USDT')} - {signal['type']} Signal**\n"
-                f"⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-                f"💰 Price: {current_price:.4f}\n"
-                f"📊 Probability: {signal['probability']*100:.1f}%\n\n"
-                f"📈 Indicators:\n"
-                f"- RSI: {signal['rsi']:.1f}\n"
-                f"- MACD: {signal['macd']:.4f}\n"
-                f"- ADX: {signal['adx']:.1f}\n"
-                f"- ATR: {atr:.4f}\n\n"
-                f"🎯 Targets:\n"
+                f"🚀 **{symbol.replace('USDT', '/USDT')} — {signal['type']} Сигнал**\n"
+                f"🕒 Время: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} (UTC)\n"
+                f"💰 Текущая цена: {current_price:.4f} USDT\n\n"
+                
+                f"#### 📈 Технические индикаторы:\n"
+                f"- RSI: {signal['rsi']:.1f} ({rsi_state})\n"
+                f"- MACD: {signal['macd']:.4f} ({macd_direction})\n"
+                f"- ADX: {signal['adx']:.1f} ({adx_strength} тренд)\n"
+                f"- Волатильность (ATR): {atr:.4f} ({volatility_level})\n\n"
+                
+                f"#### 📊 Вероятностные метрики:\n"
+                f"- Модель предсказания: {signal['probability']*100:.1f}%\n"
+                f"- Risk/Reward (R/R): 1:{min(rr1, rr2):.1f}\n\n"
+                
+                f"#### 🔍 Ключевые уровни:\n"
+                f"- Ближайшая поддержка: {signal['support']:.4f} ({((current_price - signal['support'])/current_price*100:.1f}%)\n"
+                f"- Ближайшее сопротивление: {signal['resistance']:.4f} ({((signal['resistance'] - current_price)/current_price*100:.1f}%)\n\n"
+                
+                f"#### 🎯 Цели:\n"
                 f"- TP1: {tp1:.4f} (RR 1:{rr1:.1f})\n"
                 f"- TP2: {tp2:.4f} (RR 1:{rr2:.1f})\n"
                 f"- SL: {sl:.4f}\n\n"
-                f"⚠️ Risk: {'Low' if rr1 >= MIN_RR else 'Medium' if rr1 >= 2 else 'High'}"
+                
+                f"#### ⚠️ Риски:\n"
             )
+            
+            # Добавление предупреждений о рисках
+            if signal['adx'] < 25:
+                message += "- Слабый тренд → возможны ложные пробои\n"
+            if signal['rsi'] > 70 and signal['type'] == 'LONG':
+                message += "- RSI в зоне перекупленности → возможен откат\n"
+            elif signal['rsi'] < 30 and signal['type'] == 'SHORT':
+                message += "- RSI в зоне перепроданности → возможен откат\n"
+            if atr < current_price * 0.01:
+                message += "- Низкая волатильность → малый потенциал движения\n"
             
             await self.broadcast_message(message)
             logger.info(f"Sent {signal['type']} signal for {symbol}")
@@ -421,8 +435,6 @@ class TradingBot:
                 )
             except Exception as e:
                 logger.error(f"Failed to send to user {user_id}: {e}")
-
-    # ... (остальные методы класса остаются без изменений)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
@@ -450,6 +462,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(status_msg, parse_mode='Markdown')
 
+async def check_all_symbols(context: ContextTypes.DEFAULT_TYPE):
+    """Проверка всех символов на сигналы"""
+    logger.info("Starting periodic check for all symbols")
+    for symbol in SYMBOLS:
+        await trading_bot.check_signal(symbol)
+    logger.info("Completed periodic check for all symbols")
+
 async def main():
     """Основная функция"""
     global trading_bot
@@ -462,9 +481,10 @@ async def main():
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("status", status))
         
+        # Запуск периодической проверки каждые 15 минут
         app.job_queue.run_repeating(
-            lambda context: asyncio.create_task(trading_bot.check_signal(context)),
-            interval=CHECK_INTERVAL, 
+            check_all_symbols,
+            interval=CHECK_INTERVAL,
             first=10
         )
         
