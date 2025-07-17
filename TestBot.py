@@ -158,9 +158,17 @@ class TradingBot:
         try:
             # Базовые индикаторы
             df['rsi'] = RSIIndicator(df['close'], window=14).rsi().fillna(50)
-            df['macd'] = MACD(df['close'], window_slow=26, window_fast=12).macd().fillna(0)
-            df['adx'] = ADXIndicator(df['high'], df['low'], df['close'], window=14).adx().fillna(0)
-            df['atr'] = AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
+            macd = MACD(df['close'], window_slow=26, window_fast=12)
+            df['macd'] = macd.macd().fillna(0)
+            df['macd_signal'] = macd.macd_signal().fillna(0)
+            df['macd_diff'] = macd.macd_diff().fillna(0)
+            
+            adx = ADXIndicator(df['high'], df['low'], df['close'], window=14)
+            df['adx'] = adx.adx().fillna(0)
+            df['dip'] = adx.adx_pos().fillna(0)
+            df['din'] = adx.adx_neg().fillna(0)
+            
+            df['atr'] = AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range().fillna(0)
             
             # EMA Cross
             df['ema_20'] = df['price'].ewm(span=20, adjust=False).mean()
@@ -175,6 +183,14 @@ class TradingBot:
             # Support/Resistance
             df['support'] = df['low'].rolling(20).min()
             df['resistance'] = df['high'].rolling(20).max()
+            
+            # Добавление недостающих индикаторов
+            df['super_trend'] = 0  # Заглушка - нужно реализовать расчет SuperTrend
+            df['vwap_angle'] = 0  # Заглушка - нужно реализовать расчет угла VWAP
+            df['bb_upper'] = df['close'].rolling(20).mean() + 2 * df['close'].rolling(20).std()
+            df['bb_lower'] = df['close'].rolling(20).mean() - 2 * df['close'].rolling(20).std()
+            df['sentiment'] = 50  # Заглушка - нужно реализовать анализ сентимента
+            df['smart_money_score'] = 50  # Заглушка - нужно реализовать расчет
             
             return df.replace([np.inf, -np.inf], np.nan).fillna(0)
         except Exception as e:
