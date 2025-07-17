@@ -457,12 +457,28 @@ class TradingBot:
             # Создаем финальный DataFrame с правильным порядком фичей
             final_features = pd.DataFrame(index=[0])
             
+            # Словарь с осмысленными значениями по умолчанию для разных типов фичей
+            DEFAULT_VALUES = {
+                'price_change': 0.0,        # Для процентных изменений
+                'volume': 1.0,              # Для объемов (избегаем деления на 0)
+                'atr': df['close'].std(),   # Волатильность как замена ATR
+                'rsi': 50.0,                # Нейтральное значение для RSI
+                'macd': 0.0,                # Нейтральное значение для MACD
+                'support': df['low'].min(), # Минимальный low как поддержка
+                'resistance': df['high'].max() # Максимальный high как сопротивление
+            }
+
             for feature in expected_features:
                 if feature in df.columns:
                     final_features[feature] = [df[feature].iloc[-1]]
                 else:
-                    logger.warning(f"Feature {feature} not found, filling with 0")
-                    final_features[feature] = [0.0]
+                    # Автоподбор разумного значения по умолчанию
+                    default_value = next(
+                        (val for key, val in DEFAULT_VALUES.items() if key in feature),
+                        0.0  # Fallback значение
+                    )
+                    logger.warning(f"Feature {feature} not found, filling with {default_value}")
+                    final_features[feature] = [default_value]
             
             # Убедимся, что порядок фичей точно соответствует ожидаемому
             final_features = final_features[expected_features]
@@ -477,8 +493,8 @@ class TradingBot:
         """Проверка сигналов с надежной обработкой None"""
         try:
             df = await self.fetch_ohlcv_data(symbol, limit=100)
-            if df.empty:
-                logger.warning(f"No data for {symbol}")
+            if len(df) < 48:  # Минимум для всех фичей
+                logger.error(f"Недостаточно данных для {symbol}: {len(df)} свечей")
                 return None
                 
             if not self.validate_data(df):
