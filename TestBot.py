@@ -76,6 +76,8 @@ class TradingBot:
             self.short_model = short_model_data['models'].get('combined')
             self.short_scaler = short_model_data['scalers'].get('combined')
             logger.info("Models and features loaded successfully")
+            logger.info(f"Expected long features: {self.long_features}")
+            logger.info(f"Expected short features: {self.short_features}")
         except Exception as e:
             logger.error(f"Failed to load models or features: {e}")
             raise
@@ -148,8 +150,8 @@ class TradingBot:
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                 df['price'] = df['close'].astype(float)
                 df['symbol'] = symbol
-                # Фильтрация данных для избежания деления на ноль
-                df = df[df['price'] > 0]
+                # Фильтрация некорректных данных
+                df = df[(df['price'] > 0) & (df['high'] != df['low']) & (df['volume'] > 0)]
                 return df
             except ccxt.NetworkError as e:
                 logger.warning(f"Network error fetching data for {symbol} (attempt {attempt + 1}): {str(e)}")
@@ -171,7 +173,7 @@ class TradingBot:
             df['rsi'] = RSIIndicator(df['close'], window=14).rsi().fillna(50)
             macd = MACD(df['close'], window_slow=26, window_fast=12)
             df['macd'] = macd.macd().fillna(0)
-            # Проверка данных перед расчетом ADX
+            # Проверка данных для ADX
             if (df['high'] - df['low']).abs().sum() > 0:
                 df['adx'] = ADXIndicator(df['high'], df['low'], df['close'], window=14).adx().fillna(0)
             else:
@@ -225,11 +227,13 @@ class TradingBot:
             df['bear_volume'] = (df['close'] < df['open']) * df['volume'] if is_short else pd.Series(0, index=df.index)
             
             df['atr_normalized'] = (df['atr'] / df['price'].replace(0, 0.0001) * 100).fillna(0)
+            df['atr_change'] = df['atr'].pct_change(4).fillna(0) * 100  # Добавляем atr_change
             
             support = df['low'].rolling(window=20).min().fillna(df['price'].min())
             resistance = df['high'].rolling(window=20).max().fillna(df['price'].max())
             df['support_level'] = support
             df['resistance_level'] = resistance
+            df['price_to_resistance'] = ((resistance - df['price']) / df['price'].replace(0, 0.0001) * 100).fillna(0)  # Добавляем price_to_resistance
             
             df['sentiment'] = pd.Series(50.0 + (df['rsi'] - 50) * 0.5 + df['macd'] * 10, index=df.index).clip(0, 100).replace([np.inf, -np.inf], np.nan).fillna(50)
             df['smart_money_score'] = (df['sentiment'] * 0.4 + (df['rsi'] / 100) * 30 + (df['adx'] / 100) * 30) / 0.7
