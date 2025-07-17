@@ -137,25 +137,38 @@ class TradingBot:
             raise
 
     def load_allowed_users(self):
-        """Загрузка списка разрешенных пользователей с обработкой ошибок"""
+        """Загрузка списка разрешенных пользователей с улучшенной обработкой ошибок"""
         try:
-            if os.path.exists(ALLOWED_USERS_PATH):
-                with open(ALLOWED_USERS_PATH, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                    if not content:  # Если файл пустой
-                        logger.warning("Allowed users file is empty")
-                        return [ADMIN_ID] if ADMIN_ID != 0 else []
+            if not os.path.exists(ALLOWED_USERS_PATH):
+                logger.warning(f"Allowed users file not found at {ALLOWED_USERS_PATH}")
+                return [ADMIN_ID] if ADMIN_ID != 0 else []
+
+            with open(ALLOWED_USERS_PATH, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                
+                if not content:
+                    logger.warning("Allowed users file is empty")
+                    return [ADMIN_ID] if ADMIN_ID != 0 else []
+                
+                try:
                     users = json.loads(content)
+                    if not isinstance(users, list):
+                        logger.error("Allowed users file must contain a list")
+                        return [ADMIN_ID] if ADMIN_ID != 0 else []
+                    
                     logger.info(f"Loaded {len(users)} allowed users")
                     return users
-            else:
-                logger.warning("Allowed users file not found, using default list")
-                return [ADMIN_ID] if ADMIN_ID != 0 else []
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in allowed users file: {e}")
+                    
+                except json.JSONDecodeError as e:
+                    logger.error(f"Invalid JSON in allowed users file: {e}")
+                    return [ADMIN_ID] if ADMIN_ID != 0 else []
+                    
+        except PermissionError as e:
+            logger.error(f"Permission denied: {e}")
             return [ADMIN_ID] if ADMIN_ID != 0 else []
+            
         except Exception as e:
-            logger.error(f"Failed to load allowed users: {e}")
+            logger.error(f"Unexpected error loading allowed users: {e}")
             return [ADMIN_ID] if ADMIN_ID != 0 else []
     
     def save_allowed_users(self):
