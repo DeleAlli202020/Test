@@ -15,6 +15,7 @@ import sys
 from dotenv import load_dotenv
 import json
 import nest_asyncio
+from ta.volatility import BollingerBands
 
 nest_asyncio.apply()
 
@@ -185,12 +186,45 @@ class TradingBot:
             df['resistance'] = df['high'].rolling(20).max()
             
             # Добавление недостающих индикаторов
-            df['super_trend'] = 0  # Заглушка - нужно реализовать расчет SuperTrend
-            df['vwap_angle'] = 0  # Заглушка - нужно реализовать расчет угла VWAP
-            df['bb_upper'] = df['close'].rolling(20).mean() + 2 * df['close'].rolling(20).std()
-            df['bb_lower'] = df['close'].rolling(20).mean() - 2 * df['close'].rolling(20).std()
-            df['sentiment'] = 50  # Заглушка - нужно реализовать анализ сентимента
-            df['smart_money_score'] = 50  # Заглушка - нужно реализовать расчет
+            # VWAP
+            typical_price = (df['high'] + df['low'] + df['close']) / 3
+            df['vwap'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
+            df['vwap_signal'] = (df['price'] - df['vwap']) / df['vwap'] * 100
+            
+            # Bollinger Bands
+            bb = BollingerBands(df['close'], window=20, window_dev=2)
+            df['bb_upper'] = bb.bollinger_hband()
+            df['bb_lower'] = bb.bollinger_lband()
+            df['bb_width'] = bb.bollinger_wband()
+            
+            # SuperTrend (упрощенная реализация)
+            atr = df['atr']
+            hl2 = (df['high'] + df['low']) / 2
+            df['super_trend_upper'] = hl2 + (3 * atr)
+            df['super_trend_lower'] = hl2 - (3 * atr)
+            df['super_trend'] = 1  # 1 для бычьего, -1 для медвежьего
+            for i in range(1, len(df)):
+                if df['close'].iloc[i-1] > df['super_trend_upper'].iloc[i-1]:
+                    df['super_trend'].iloc[i] = 1
+                elif df['close'].iloc[i-1] < df['super_trend_lower'].iloc[i-1]:
+                    df['super_trend'].iloc[i] = -1
+                else:
+                    df['super_trend'].iloc[i] = df['super_trend'].iloc[i-1]
+            
+            # VWAP Angle (упрощенная реализация)
+            df['vwap_angle'] = df['vwap'].diff(5) / 5 * 100
+            
+            # Smart Money Score (упрощенная реализация)
+            df['smart_money_score'] = (df['rsi'] * 0.4 + (100 - df['rsi']) * 0.3 + df['adx'] * 0.3).clip(0, 100)
+            
+            # Sentiment (заглушка)
+            df['sentiment'] = 50
+            
+            # Price to Resistance
+            df['price_to_resistance'] = ((df['price'] - df['resistance']) / df['price']) * 100
+            
+            # ATR Change
+            df['atr_change'] = df['atr'].pct_change() * 100
             
             return df.replace([np.inf, -np.inf], np.nan).fillna(0)
         except Exception as e:
@@ -361,6 +395,7 @@ class TradingBot:
             features['ema_cross'] = df['ema_cross'].fillna(0)
             features['volume_spike'] = df['volume_spike'].fillna(0)
             features['super_trend'] = df['super_trend'].fillna(0)
+            features['vwap_signal'] = df['vwap_signal'].fillna(0)
             features['vwap_angle'] = df['vwap_angle'].fillna(0)
             
             features['bull_volume'] = df['bull_volume'].fillna(0)
