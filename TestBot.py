@@ -221,7 +221,15 @@ class TradingBot:
     async def check_long_signal(self, df, symbol):
         """Проверка LONG сигнала"""
         try:
-            if self.long_model is None or self.long_scaler is None:
+            if self.long_model is None:
+                    return None
+            
+            # Проверка наличия всех фичей
+            required_features = set(self.long_model.feature_names_in_)
+            available_features = set(df.columns)
+            missing_features = required_features - available_features
+            if missing_features:
+                logger.error(f"Missing features for LONG {symbol}: {missing_features}")
                 return None
 
             # Фильтрация по условиям LONG
@@ -264,7 +272,15 @@ class TradingBot:
     async def check_short_signal(self, df, symbol):
         """Проверка SHORT сигнала"""
         try:
-            if self.short_model is None or self.short_scaler is None:
+            if self.short_model is None:
+                    return None
+            
+            # Проверка наличия всех фичей
+            required_features = set(self.short_model.feature_names_in_)
+            available_features = set(df.columns)
+            missing_features = required_features - available_features
+            if missing_features:
+                logger.error(f"Missing features for LONG {symbol}: {missing_features}")
                 return None
 
             # Фильтрация по условиям SHORT
@@ -305,10 +321,11 @@ class TradingBot:
             return None
 
     def prepare_features(self, df, is_short=False):
-        """Подготовка фичей для модели"""
+        """Подготовка фичей для модели (унифицированная версия)"""
         try:
-            # Общие фичи
             features = pd.DataFrame(index=df.index)
+            
+            # Общие фичи для обеих моделей
             features['price_change_1h'] = df['price'].pct_change(4).fillna(0) * 100
             features['price_change_2h'] = df['price'].pct_change(8).fillna(0) * 100
             features['price_change_3h'] = df['price'].pct_change(12).fillna(0) * 100
@@ -319,19 +336,30 @@ class TradingBot:
             
             features['volume_score'] = (df['volume'] / df['volume'].rolling(6).mean()).fillna(1) * 100
             features['volume_change'] = df['volume'].pct_change().fillna(0) * 100
+            features['atr_normalized'] = (df['atr'] / df['price']).fillna(0) * 100
+            features['atr_change'] = df['atr'].pct_change(4).fillna(0) * 100
             
-            features['rsi'] = df['rsi']
-            features['macd'] = df['macd']
-            features['adx'] = df['adx']
-            features['atr'] = df['atr']
-            features['ema_cross'] = df['ema_cross']
-            features['volume_spike'] = df['volume_spike']
+            features['rsi'] = df['rsi'].fillna(50)
+            features['macd'] = df['macd'].fillna(0)
+            features['adx'] = df['adx'].fillna(0)
+            features['ema_cross'] = df['ema_cross'].fillna(0)
+            features['volume_spike'] = df['volume_spike'].fillna(0)
+            features['super_trend'] = df['super_trend'].fillna(0)
+            features['vwap_angle'] = df['vwap_angle'].fillna(0)
             
-            if is_short:
-                features['bear_volume'] = df['bear_volume']
-                features['atr_change'] = df['atr'].pct_change(4).fillna(0) * 100
-            else:
-                features['bull_volume'] = df['bull_volume']
+            features['bull_volume'] = df['bull_volume'].fillna(0)
+            features['bear_volume'] = df['bear_volume'].fillna(0)
+            
+            features['bb_upper'] = df['bb_upper'].fillna(0)
+            features['bb_lower'] = df['bb_lower'].fillna(0)
+            features['bb_width'] = (features['bb_upper'] - features['bb_lower']).fillna(0)
+            
+            features['support_level'] = df['support'].fillna(0)
+            features['resistance_level'] = df['resistance'].fillna(0)
+            features['price_to_resistance'] = ((df['price'] - features['resistance_level']) / df['price']).fillna(0) * 100
+            
+            features['sentiment'] = df['sentiment'].fillna(50)
+            features['smart_money_score'] = df['smart_money_score'].fillna(50)
             
             return features.iloc[-1:].replace([np.inf, -np.inf], np.nan).fillna(0)
         except Exception as e:
