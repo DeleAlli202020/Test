@@ -90,6 +90,36 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Failed to save allowed users: {e}")
             return False
+        
+    async def check_symbol_availability(self):
+        """Проверка доступности символов"""
+        available_symbols = []
+        try:
+            await self.exchange.load_markets()
+            logger.info("Successfully loaded Binance markets")
+        except Exception as e:
+            logger.error(f"Failed to load markets: {e}")
+            return available_symbols
+        
+        for symbol in SYMBOLS:
+            try:
+                ticker = await self.exchange.fetch_ticker(symbol)
+                if ticker['last'] is None:
+                    logger.warning(f"No price data available for {symbol}")
+                    continue
+                ohlcv = await self.exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=10)
+                if len(ohlcv) < 10:
+                    logger.warning(f"Insufficient historical data for {symbol}")
+                    continue
+                available_symbols.append(symbol)
+                logger.info(f"Symbol {symbol} is available with current price: {ticker['last']}")
+            except ccxt.NetworkError as e:
+                logger.warning(f"Network error checking {symbol}: {e}")
+            except ccxt.ExchangeError as e:
+                logger.warning(f"Exchange error checking {symbol}: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error checking {symbol}: {e}")
+        return available_symbols
 
     def load_models(self):
         """Загрузка моделей и скейлеров"""
@@ -422,7 +452,7 @@ async def main():
         app.add_handler(CommandHandler("status", status))
         
         app.job_queue.run_repeating(
-            trading_bot.check_signals, 
+            trading_bot.check_signal, 
             interval=CHECK_INTERVAL, 
             first=10
         )
