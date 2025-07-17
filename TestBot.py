@@ -16,6 +16,7 @@ import sys
 from dotenv import load_dotenv
 import json
 import nest_asyncio
+from telegram.ext import ContextTypes
 
 nest_asyncio.apply()
 
@@ -205,38 +206,48 @@ class TradingBot:
             logger.error(f"Error calculating indicators: {e}")
             return df
 
-    async def check_signal(self, symbol):
-        """Проверка сигналов для символа"""
+    async def check_signal(self, context: ContextTypes.DEFAULT_TYPE = None):
+        """Проверка сигналов для всех символов"""
         try:
-            df = await self.fetch_ohlcv_data(symbol)
-            if df.empty:
+            available_symbols = await self.check_symbol_availability()
+            if not available_symbols:
+                logger.warning("No available symbols to check")
                 return
 
-            # Подготовка данных для моделей
-            df = self.calculate_indicators(df, is_short=False)
-            current_price = df['price'].iloc[-1]
-            atr = df['atr'].iloc[-1]
+            for symbol in available_symbols:
+                try:
+                    df = await self.fetch_ohlcv_data(symbol)
+                    if df.empty:
+                        continue
 
-            # Проверка LONG сигнала
-            long_signal = await self.check_long_signal(df, symbol)
-            
-            # Проверка SHORT сигнала
-            short_signal = await self.check_short_signal(df, symbol)
+                    # Подготовка данных для моделей
+                    df = self.calculate_indicators(df, is_short=False)
+                    current_price = df['price'].iloc[-1]
+                    atr = df['atr'].iloc[-1]
 
-            # Определение лучшего сигнала
-            best_signal = None
-            if long_signal and short_signal:
-                best_signal = long_signal if long_signal['probability'] > short_signal['probability'] else short_signal
-            elif long_signal:
-                best_signal = long_signal
-            elif short_signal:
-                best_signal = short_signal
+                    # Проверка LONG сигнала
+                    long_signal = await self.check_long_signal(df, symbol)
+                    
+                    # Проверка SHORT сигнала
+                    short_signal = await self.check_short_signal(df, symbol)
 
-            if best_signal:
-                await self.send_signal_message(symbol, best_signal, current_price, atr)
-                
+                    # Определение лучшего сигнала
+                    best_signal = None
+                    if long_signal and short_signal:
+                        best_signal = long_signal if long_signal['probability'] > short_signal['probability'] else short_signal
+                    elif long_signal:
+                        best_signal = long_signal
+                    elif short_signal:
+                        best_signal = short_signal
+
+                    if best_signal:
+                        await self.send_signal_message(symbol, best_signal, current_price, atr)
+                        
+                except Exception as e:
+                    logger.error(f"Error checking signal for {symbol}: {e}")
+
         except Exception as e:
-            logger.error(f"Error checking signal for {symbol}: {e}")
+            logger.error(f"Error in check_signal: {e}")
 
     async def check_long_signal(self, df, symbol):
         """Проверка LONG сигнала"""
@@ -452,7 +463,7 @@ async def main():
         app.add_handler(CommandHandler("status", status))
         
         app.job_queue.run_repeating(
-            trading_bot.check_signal, 
+            lambda context: asyncio.create_task(trading_bot.check_signal(context)),
             interval=CHECK_INTERVAL, 
             first=10
         )
