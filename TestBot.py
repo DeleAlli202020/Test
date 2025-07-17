@@ -16,6 +16,12 @@ from dotenv import load_dotenv
 import json
 import nest_asyncio
 from typing import Optional, Dict, Any
+import warnings
+from sklearn.exceptions import DataConversionWarning, UndefinedMetricWarning
+
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+warnings.filterwarnings("ignore", category=DataConversionWarning)
+warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 nest_asyncio.apply()
 
