@@ -152,6 +152,9 @@ class TradingBot:
                 df['symbol'] = symbol
                 # Фильтрация некорректных данных
                 df = df[(df['price'] > 0) & (df['high'] != df['low']) & (df['volume'] > 0)]
+                if len(df) < 50:
+                    logger.warning(f"Insufficient data after filtering for {symbol}: {len(df)} rows")
+                    return pd.DataFrame()
                 return df
             except ccxt.NetworkError as e:
                 logger.warning(f"Network error fetching data for {symbol} (attempt {attempt + 1}): {str(e)}")
@@ -174,9 +177,10 @@ class TradingBot:
             macd = MACD(df['close'], window_slow=26, window_fast=12)
             df['macd'] = macd.macd().fillna(0)
             # Проверка данных для ADX
-            if (df['high'] - df['low']).abs().sum() > 0:
+            if (df['high'] - df['low']).abs().sum() > 0 and df['close'].std() > 0:
                 df['adx'] = ADXIndicator(df['high'], df['low'], df['close'], window=14).adx().fillna(0)
             else:
+                logger.warning("Invalid data for ADX calculation, setting to 0")
                 df['adx'] = pd.Series(0, index=df.index)
             atr = AverageTrueRange(df['high'], df['low'], df['close'], window=14)
             df['atr'] = atr.average_true_range().fillna(df['close'].iloc[-1] * 0.001)
@@ -227,13 +231,12 @@ class TradingBot:
             df['bear_volume'] = (df['close'] < df['open']) * df['volume'] if is_short else pd.Series(0, index=df.index)
             
             df['atr_normalized'] = (df['atr'] / df['price'].replace(0, 0.0001) * 100).fillna(0)
-            df['atr_change'] = df['atr'].pct_change(4).fillna(0) * 100  # Добавляем atr_change
-            
+            df['atr_change'] = df['atr'].pct_change(4).fillna(0) * 100
             support = df['low'].rolling(window=20).min().fillna(df['price'].min())
             resistance = df['high'].rolling(window=20).max().fillna(df['price'].max())
             df['support_level'] = support
             df['resistance_level'] = resistance
-            df['price_to_resistance'] = ((resistance - df['price']) / df['price'].replace(0, 0.0001) * 100).fillna(0)  # Добавляем price_to_resistance
+            df['price_to_resistance'] = ((resistance - df['price']) / df['price'].replace(0, 0.0001) * 100).fillna(0)
             
             df['sentiment'] = pd.Series(50.0 + (df['rsi'] - 50) * 0.5 + df['macd'] * 10, index=df.index).clip(0, 100).replace([np.inf, -np.inf], np.nan).fillna(50)
             df['smart_money_score'] = (df['sentiment'] * 0.4 + (df['rsi'] / 100) * 30 + (df['adx'] / 100) * 30) / 0.7
@@ -268,6 +271,7 @@ class TradingBot:
                 return pd.DataFrame(), None
             
             X = df[features].iloc[-1:]
+            logger.info(f"Prepared features for model: {X.columns.tolist()}")
             return X, df
         except Exception as e:
             logger.error(f"Error in prepare_data_for_model: {e}")
@@ -280,6 +284,9 @@ class TradingBot:
             if df.empty:
                 logger.warning(f"No data for {symbol}")
                 return
+            
+            # Определение порога
+            threshold = 0.3160 if symbol in LOW_RECALL_SYMBOLS else 0.5
             
             # Проверка лонг сигнала
             X_long, df_long = self.prepare_data_for_model(df, self.long_features, is_short=False)
@@ -301,7 +308,6 @@ class TradingBot:
                     bull_volume = df_long['bull_volume'].iloc[-1]
                     volume_mean = df_long['volume'].rolling(20).mean().iloc[-1]
                     
-                    threshold = 0.3160 if symbol in LOW_RECALL_SYMBOLS else 0.5
                     long_valid = (
                         long_proba > threshold and
                         rsi >= 25 and rsi <= 75 and
