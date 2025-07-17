@@ -231,12 +231,22 @@ class TradingBot:
             df['bear_volume'] = (df['close'] < df['open']) * df['volume'] if is_short else pd.Series(0, index=df.index)
             
             df['atr_normalized'] = (df['atr'] / df['price'].replace(0, 0.0001) * 100).fillna(0)
-            df['atr_change'] = df['atr'].pct_change(4).fillna(0) * 100
-            support = df['low'].rolling(window=20).min().fillna(df['price'].min())
-            resistance = df['high'].rolling(window=20).max().fillna(df['price'].max())
-            df['support_level'] = support
-            df['resistance_level'] = resistance
-            df['price_to_resistance'] = ((resistance - df['price']) / df['price'].replace(0, 0.0001) * 100).fillna(0)
+            
+            # Признаки для шорт-модели
+            if is_short:
+                df['atr_change'] = df['atr'].pct_change(4).fillna(0) * 100
+                support = df['low'].rolling(window=20).min().fillna(df['price'].min())
+                resistance = df['high'].rolling(window=20).max().fillna(df['price'].max())
+                df['support_level'] = support
+                df['resistance_level'] = resistance
+                df['price_to_resistance'] = ((resistance - df['price']) / df['price'].replace(0, 0.0001) * 100).fillna(0)
+            else:
+                df['atr_change'] = pd.Series(0, index=df.index)
+                support = df['low'].rolling(window=20).min().fillna(df['price'].min())
+                resistance = df['high'].rolling(window=20).max().fillna(df['price'].max())
+                df['support_level'] = support
+                df['resistance_level'] = resistance
+                df['price_to_resistance'] = pd.Series(0, index=df.index)
             
             df['sentiment'] = pd.Series(50.0 + (df['rsi'] - 50) * 0.5 + df['macd'] * 10, index=df.index).clip(0, 100).replace([np.inf, -np.inf], np.nan).fillna(50)
             df['smart_money_score'] = (df['sentiment'] * 0.4 + (df['rsi'] / 100) * 30 + (df['adx'] / 100) * 30) / 0.7
@@ -268,14 +278,14 @@ class TradingBot:
             missing_features = [f for f in features if f not in df.columns]
             if missing_features:
                 logger.error(f"Missing features in prepared data: {missing_features}")
-                return pd.DataFrame(), None
+                return pd.DataFrame(), df
             
             X = df[features].iloc[-1:]
             logger.info(f"Prepared features for model: {X.columns.tolist()}")
             return X, df
         except Exception as e:
             logger.error(f"Error in prepare_data_for_model: {e}")
-            return pd.DataFrame(), None
+            return pd.DataFrame(), df
     
     async def check_signal(self, symbol):
         """Проверка сигнала"""
@@ -292,35 +302,39 @@ class TradingBot:
             X_long, df_long = self.prepare_data_for_model(df, self.long_features, is_short=False)
             long_proba = 0
             long_valid = False
+            model_failed = False
             if not X_long.empty and self.long_model is not None and self.long_scaler is not None:
                 try:
                     X_long_scaled = self.long_scaler.transform(X_long)
                     X_long_scaled = pd.DataFrame(X_long_scaled, columns=self.long_features)
                     long_proba = self.long_model.predict_proba(X_long_scaled)[:, 1][0]
-                    
-                    rsi = df_long['rsi'].iloc[-1]
-                    macd = df_long['macd'].iloc[-1]
-                    adx = df_long['adx'].iloc[-1]
-                    ema_cross = df_long['ema_cross'].iloc[-1]
-                    volume_spike = df_long['volume_spike'].iloc[-1]
-                    super_trend = df_long['super_trend'].iloc[-1]
-                    vwap_angle = df_long['vwap_angle'].iloc[-1]
-                    bull_volume = df_long['bull_volume'].iloc[-1]
-                    volume_mean = df_long['volume'].rolling(20).mean().iloc[-1]
-                    
-                    long_valid = (
-                        long_proba > threshold and
-                        rsi >= 25 and rsi <= 75 and
-                        macd > -0.5 and
-                        adx > 15 and
-                        (ema_cross == 1 or volume_spike == 1) and
-                        super_trend == 1 and
-                        vwap_angle > 0 and
-                        bull_volume > volume_mean
-                    )
                 except Exception as e:
                     logger.error(f"Error processing long signal for {symbol}: {e}")
-                    long_valid = False
+                    model_failed = True
+            
+            rsi = df_long['rsi'].iloc[-1] if not df_long.empty else 50
+            macd = df_long['macd'].iloc[-1] if not df_long.empty else 0
+            adx = df_long['adx'].iloc[-1] if not df_long.empty else 0
+            ema_cross = df_long['ema_cross'].iloc[-1] if not df_long.empty else 0
+            volume_spike = df_long['volume_spike'].iloc[-1] if not df_long.empty else 0
+            super_trend = df_long['super_trend'].iloc[-1] if not df_long.empty else 0
+            vwap_angle = df_long['vwap_angle'].iloc[-1] if not df_long.empty else 0
+            bull_volume = df_long['bull_volume'].iloc[-1] if not df_long.empty else 0
+            volume_mean = df_long['volume'].rolling(20).mean().iloc[-1] if not df_long.empty else 0
+            
+            long_valid = (
+                rsi >= 25 and rsi <= 75 and
+                macd > -0.5 and
+                adx > 15 and
+                (ema_cross == 1 or volume_spike == 1) and
+                super_trend == 1 and
+                vwap_angle > 0 and
+                bull_volume > volume_mean
+            )
+            if model_failed:
+                long_valid = long_valid and long_proba == 0  # Сигнал без модели
+            else:
+                long_valid = long_valid and long_proba > threshold
             
             # Проверка шорт сигнала
             X_short, df_short = self.prepare_data_for_model(df, self.short_features, is_short=True)
@@ -331,30 +345,33 @@ class TradingBot:
                     X_short_scaled = self.short_scaler.transform(X_short)
                     X_short_scaled = pd.DataFrame(X_short_scaled, columns=self.short_features)
                     short_proba = self.short_model.predict_proba(X_short_scaled)[:, 1][0]
-                    
-                    rsi = df_short['rsi'].iloc[-1]
-                    macd = df_short['macd'].iloc[-1]
-                    adx = df_short['adx'].iloc[-1]
-                    ema_cross = df_short['ema_cross'].iloc[-1]
-                    volume_spike = df_short['volume_spike'].iloc[-1]
-                    super_trend = df_short['super_trend'].iloc[-1]
-                    vwap_angle = df_short['vwap_angle'].iloc[-1]
-                    bear_volume = df_short['bear_volume'].iloc[-1]
-                    volume_mean = df_short['volume'].rolling(20).mean().iloc[-1]
-                    
-                    short_valid = (
-                        short_proba > threshold and
-                        rsi >= 60 and
-                        macd < 0 and
-                        adx > 15 and
-                        (ema_cross == 1 or volume_spike == 1) and
-                        super_trend == -1 and
-                        vwap_angle < 0 and
-                        bear_volume > volume_mean
-                    )
                 except Exception as e:
                     logger.error(f"Error processing short signal for {symbol}: {e}")
-                    short_valid = False
+                    model_failed = True
+            
+            rsi = df_short['rsi'].iloc[-1] if not df_short.empty else 50
+            macd = df_short['macd'].iloc[-1] if not df_short.empty else 0
+            adx = df_short['adx'].iloc[-1] if not df_short.empty else 0
+            ema_cross = df_short['ema_cross'].iloc[-1] if not df_short.empty else 0
+            volume_spike = df_short['volume_spike'].iloc[-1] if not df_short.empty else 0
+            super_trend = df_short['super_trend'].iloc[-1] if not df_short.empty else 0
+            vwap_angle = df_short['vwap_angle'].iloc[-1] if not df_short.empty else 0
+            bear_volume = df_short['bear_volume'].iloc[-1] if not df_short.empty else 0
+            volume_mean = df_short['volume'].rolling(20).mean().iloc[-1] if not df_short.empty else 0
+            
+            short_valid = (
+                rsi >= 60 and
+                macd < 0 and
+                adx > 15 and
+                (ema_cross == 1 or volume_spike == 1) and
+                super_trend == -1 and
+                vwap_angle < 0 and
+                bear_volume > volume_mean
+            )
+            if model_failed:
+                short_valid = short_valid and short_proba == 0  # Сигнал без модели
+            else:
+                short_valid = short_valid and short_proba > threshold
                 
             current_price = df['price'].iloc[-1]
             support = df_long['support_level'].iloc[-1] if not df_long.empty else df['price'].min()
@@ -364,7 +381,7 @@ class TradingBot:
             signal_type = None
             signal_proba = 0
             if long_valid and short_valid:
-                signal_type = "LONG" if long_proba > short_proba else "SHORT"
+                signal_type = "LONG" if (long_proba > short_proba or model_failed) else "SHORT"
                 signal_proba = long_proba if long_proba > short_proba else short_proba
             elif long_valid:
                 signal_type = "LONG"
@@ -373,7 +390,7 @@ class TradingBot:
                 signal_type = "SHORT"
                 signal_proba = short_proba
             
-            if signal_type and signal_proba > threshold:
+            if signal_type:
                 # Расчет уровней TP и SL
                 if signal_type == "LONG":
                     sl = current_price - atr * 1.5
@@ -389,10 +406,12 @@ class TradingBot:
                     rr2 = (current_price - tp2) / (sl - current_price) if sl != current_price else 0
                 
                 if rr1 >= MIN_RR:
+                    model_status = "⚠️ Сигнал не проверен моделью (ошибка данных)" if model_failed else ""
                     message = (
                         f"**{symbol.replace('USDT', '/USDT')} — Анализ сигнала**\n"
                         f"🕒 **Время:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} (UTC)\n"
-                        f"📊 **Текущая цена:** {current_price:.4f} USDT\n\n"
+                        f"📊 **Текущая цена:** {current_price:.4f} USDT\n"
+                        f"{model_status}\n\n"
                         f"#### 📈 Технические индикаторы:\n"
                         f"- **RSI:** {rsi:.1f} ({'перекуплен' if rsi > 70 else 'перепродан' if rsi < 30 else 'нейтральный'})\n"
                         f"- **MACD:** {macd:.4f} ({'бычий импульс' if macd > 0 else 'медвежий импульс'})\n"
@@ -400,10 +419,10 @@ class TradingBot:
                         f"- **Волатильность (ATR):** {atr:.4f} ({'высокая' if atr > current_price * 0.01 else 'ниже среднего'})\n\n"
                         f"#### 📊 Вероятностные метрики:\n"
                         f"- **Тип сделки:** {signal_type}\n"
-                        f"- **Вероятность (модель):** {signal_proba*100:.1f}%\n"
+                        f"- **Вероятность (модель):** {signal_proba*100:.1f}% {'(не проверено моделью)' if model_failed else ''}\n"
                         f"- **Risk/Reward (TP1):** 1:{rr1:.1f}\n"
                         f"- **Risk/Reward (TP2):** 1:{rr2:.1f}\n"
-                        f"- **Историческая успешность:** {62 + signal_proba*20:.1f}% (оценка на основе модели)\n\n"
+                        f"- **Историческая успешность:** {62 + signal_proba*20:.1f}% {'(оценка без модели)' if model_failed else '(оценка на основе модели)'}\n\n"
                         f"#### 🔍 Ключевые уровни:\n"
                         f"- **Ближайшая поддержка:** {support:.4f} ({(support - current_price)/current_price*100:.1f}%)\n"
                         f"- **Ближайшее сопротивление:** {resistance:.4f} ({(resistance - current_price)/current_price*100:.1f}%)\n"
@@ -415,7 +434,7 @@ class TradingBot:
                         f"- Объемы: {'ниже среднего' if (bull_volume if signal_type == 'LONG' else bear_volume) < volume_mean else 'выше среднего'}"
                     )
                     await self.broadcast_message(message)
-                    logger.info(f"Sent {signal_type} signal for {symbol}: Probability={signal_proba:.4f}, RR1={rr1:.1f}")
+                    logger.info(f"Sent {signal_type} signal for {symbol}: Probability={signal_proba:.4f}, RR1={rr1:.1f}, ModelFailed={model_failed}")
         except Exception as e:
             logger.error(f"Error in check_signal for {symbol}: {e}")
             await self.notify_admin(f"Ошибка обработки {symbol}: {e}")
