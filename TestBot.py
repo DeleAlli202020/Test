@@ -395,8 +395,8 @@ class TradingBot:
                 f"- Risk/Reward (R/R): 1:{min(rr1, rr2):.1f}\n\n"
                 
                 f"#### 🔍 Ключевые уровни:\n"
-                f"- Ближайшая поддержка: {signal['support']:.4f} ({((current_price - signal['support'])/current_price*100:.1f}%)\n"
-                f"- Ближайшее сопротивление: {signal['resistance']:.4f} ({((signal['resistance'] - current_price)/current_price*100:.1f}%)\n\n"
+                f"- Ближайшая поддержка: {signal['support']:.4f} ({(current_price - signal['support'])/current_price*100:.1f}%)\n"
+                f"- Ближайшее сопротивление: {signal['resistance']:.4f} ({(signal['resistance'] - current_price)/current_price*100:.1f}%)\n\n"
                 
                 f"#### 🎯 Цели:\n"
                 f"- TP1: {tp1:.4f} (RR 1:{rr1:.1f})\n"
@@ -404,8 +404,8 @@ class TradingBot:
                 f"- SL: {sl:.4f}\n\n"
                 
                 f"#### ⚠️ Риски:\n"
-            )
             
+            )
             # Добавление предупреждений о рисках
             if signal['adx'] < 25:
                 message += "- Слабый тренд → возможны ложные пробои\n"
