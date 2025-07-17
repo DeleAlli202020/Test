@@ -242,12 +242,15 @@ class TradingBot:
             return pd.Series(0, index=high.index), pd.Series(0, index=high.index), pd.Series(0, index=high.index)
         
     def calculate_additional_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Расчет дополнительных фичей с правильным именованием колонок"""
+        """Расчет дополнительных фичей с проверкой длины данных"""
         try:
-            # Создаем копию, чтобы не изменять исходный DataFrame
+            if len(df) < 48:  # Минимум 48 периодов для 12-часового изменения
+                logger.warning(f"Insufficient data length: {len(df)}")
+                return pd.DataFrame()
+                
             df = df.copy()
             
-            # Price changes
+            # Price changes (с проверкой на достаточное количество данных)
             df['price_change_1h'] = df['price'].pct_change(4).fillna(0) * 100
             df['price_change_2h'] = df['price'].pct_change(8).fillna(0) * 100
             df['price_change_6h'] = df['price'].pct_change(24).fillna(0) * 100
@@ -263,22 +266,20 @@ class TradingBot:
             # On-Balance Volume (OBV)
             df['obv'] = (np.sign(df['price'].diff().fillna(0)) * df['volume']).cumsum()
             
-            # Убедимся, что support/resistance существуют под любым именем
-            if 'support' in df.columns and 'support_level' not in df.columns:
-                df['support_level'] = df['support']
-            if 'resistance' in df.columns and 'resistance_level' not in df.columns:
-                df['resistance_level'] = df['resistance']
+            # Support/Resistance
+            if 'support' not in df.columns:
+                df['support'] = df['low'].rolling(20).min().fillna(df['price'].min())
+            if 'resistance' not in df.columns:
+                df['resistance'] = df['high'].rolling(20).max().fillna(df['price'].max())
                 
-            # Если все еще нет, создадим простые уровни
-            if 'support_level' not in df.columns:
-                df['support_level'] = df['low'].rolling(20).min().fillna(df['price'].min())
-            if 'resistance_level' not in df.columns:
-                df['resistance_level'] = df['high'].rolling(20).max().fillna(df['price'].max())
+            # Для совместимости с моделями
+            df['support_level'] = df['support']
+            df['resistance_level'] = df['resistance']
             
             return df.replace([np.inf, -np.inf], 0)
         except Exception as e:
             logger.error(f"Error calculating additional features: {e}")
-            return df
+            return pd.DataFrame()
 
     def calculate_indicators(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
         """Расчет индикаторов для модели"""
@@ -365,7 +366,7 @@ class TradingBot:
         return []
 
     def prepare_features(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
-        """Подготовка фичей с надежной обработкой ошибок"""
+        """Подготовка фичей с исправлением проблемы длины значений"""
         try:
             model_features = self.get_model_features(is_short)
             if not model_features:
@@ -375,17 +376,20 @@ class TradingBot:
             # Рассчитываем все дополнительные фичи
             df = self.calculate_additional_features(df)
             
+            # Берем только последнюю строку для предсказания
+            last_row = df.iloc[-1:].copy()
+            
             # Создаем DataFrame с нужными фичами
             features = {}
             for feat in model_features:
-                if feat in df.columns:
-                    features[feat] = df[feat].fillna(0).values  # Используем values для избежания проблем с индексами
+                if feat in last_row:
+                    features[feat] = [last_row[feat].iloc[0]]  # Используем список с одним элементом
                 else:
-                    features[feat] = 0
+                    features[feat] = [0]  # Заполняем нулем в виде списка
                     logger.warning(f"Feature {feat} not found, filled with 0")
             
             # Создаем DataFrame с правильным порядком колонок
-            features_df = pd.DataFrame(features, index=[df.index[-1]], columns=model_features)
+            features_df = pd.DataFrame(features, columns=model_features)
             
             return features_df.replace([np.inf, -np.inf], 0)
         
@@ -638,8 +642,10 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(status_msg, parse_mode='Markdown')
 
 async def check_all_symbols(context: ContextTypes.DEFAULT_TYPE):
-    """Проверка всех символов на сигналы"""
+    """Проверка всех символов на сигналы с уведомлением о результатах"""
     logger.info("Starting periodic check for all symbols")
+    signals_found = 0
+    
     for symbol in SYMBOLS:
         try:
             signal = await trading_bot.check_signal(symbol)
@@ -647,9 +653,22 @@ async def check_all_symbols(context: ContextTypes.DEFAULT_TYPE):
                 df = await trading_bot.fetch_ohlcv_data(symbol, limit=100)
                 if not df.empty:
                     await trading_bot.send_signal_message(symbol, signal, df)
+                    signals_found += 1
         except Exception as e:
             logger.error(f"Error processing symbol {symbol}: {e}")
-    logger.info("Completed periodic check for all symbols")
+    
+    # Отправляем уведомление, если не найдено ни одного сигнала
+    if signals_found == 0:
+        message = (
+            "🔍 **Результаты проверки рынка**\n"
+            f"🕒 Время: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} (UTC)\n"
+            "📊 Проверено символов: {len(SYMBOLS)}\n"
+            "❌ Торговых сигналов не найдено\n\n"
+            "Следующая проверка через 15 минут"
+        )
+        await trading_bot.broadcast_message(message)
+    
+    logger.info(f"Completed periodic check. Found {signals_found} signals")
 
 async def main():
     """Основная функция"""
