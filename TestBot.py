@@ -140,21 +140,73 @@ class TradingBot:
             raise
 
     async def fetch_ohlcv_data(self, symbol, limit=200):
-        """Получение OHLCV данных"""
+        """Получение данных с обработкой ошибок"""
         for attempt in range(3):
             try:
                 ohlcv = await self.exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=limit)
+                if not ohlcv:
+                    continue
+                    
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                 df['price'] = df['close'].astype(float)
-                df['symbol'] = symbol
-                return df[(df['price'] > 0) & (df['high'] != df['low']) & (df['volume'] > 0)]
+                
+                # Проверка качества данных
+                if not self.validate_data(df):
+                    logger.warning(f"Invalid data for {symbol} on attempt {attempt+1}")
+                    continue
+                    
+                return df
+                
             except Exception as e:
                 logger.warning(f"Attempt {attempt+1} failed for {symbol}: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
+                
+        logger.error(f"All attempts failed for {symbol}")
         return pd.DataFrame()
 
     # В методе calculate_indicators (для обоих файлов):
+    def calculate_adx(self, high, low, close, window=14):
+        """Надежный расчет ADX с обработкой ошибок"""
+        try:
+            # Расчет True Range
+            tr = pd.DataFrame({
+                'hl': high - low,
+                'hc': abs(high - close.shift(1)),
+                'lc': abs(low - close.shift(1))
+            }).max(axis=1)
+            
+            # Расчет Directional Movement
+            up = high.diff()
+            down = -low.diff()
+            plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+            minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+            
+            # Сглаживание
+            alpha = 1/window
+            tr_smooth = tr.ewm(alpha=alpha, adjust=False).mean()
+            plus_dm_smooth = pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean()
+            minus_dm_smooth = pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean()
+            
+            # Расчет индексов
+            with np.errstate(divide='ignore', invalid='ignore'):
+                plus_di = 100 * (plus_dm_smooth / tr_smooth)
+                minus_di = 100 * (minus_dm_smooth / tr_smooth)
+                dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
+            
+            # Заполнение NaN
+            plus_di = plus_di.fillna(0)
+            minus_di = minus_di.fillna(0)
+            dx = dx.fillna(0)
+            
+            # Расчет ADX
+            adx = dx.ewm(alpha=alpha, adjust=False).mean().fillna(0)
+            
+            return adx, plus_di, minus_di
+    
+        except Exception as e:
+            logger.error(f"Error in ADX calculation: {e}")
+            return pd.Series(0, index=high.index), pd.Series(0, index=high.index), pd.Series(0, index=high.index)
 
     def calculate_indicators(self, df, is_short=False):
         """Расчет индикаторов для модели"""
@@ -166,7 +218,7 @@ class TradingBot:
             df['macd_signal'] = macd.macd_signal().fillna(0)
             df['macd_diff'] = macd.macd_diff().fillna(0)
             
-            df['adx'] = ADXIndicator(df['high'], df['low'], df['close'], window=14).adx().fillna(0)
+            df['adx'], df['dip'], df['din'] = self.calculate_adx(df['high'], df['low'], df['close'])
             df['atr'] = AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range().fillna(0)
             
             # EMA Cross (разные для лонг/шорт)
