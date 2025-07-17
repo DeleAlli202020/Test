@@ -251,7 +251,7 @@ class TradingBot:
     def calculate_additional_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Расчет всех необходимых фичей"""
         try:
-            if len(df) < 48:  # Минимум 48 свечей для 12-часовых изменений
+            if len(df) < 48:
                 logger.warning("Not enough data for feature calculation")
                 return pd.DataFrame()
 
@@ -263,7 +263,7 @@ class TradingBot:
                 if df.empty:
                     return pd.DataFrame()
             
-            # Расчет изменений цены
+            # Расчет изменений цены (убедимся, что есть достаточно данных)
             periods = {
                 'price_change_1h': 4,
                 'price_change_2h': 8,
@@ -272,11 +272,18 @@ class TradingBot:
             }
             
             for name, period in periods.items():
-                df[name] = df['price'].pct_change(period).fillna(0) * 100
+                if len(df) >= period:
+                    df[name] = df['price'].pct_change(period).fillna(0) * 100
+                else:
+                    df[name] = 0
             
             # Объемные показатели
-            df['volume_score'] = df['volume'] / df['volume'].rolling(6).mean().replace(0, 1) * 100
-            df['volume_change'] = df['volume'].pct_change().fillna(0) * 100
+            if len(df) >= 6:
+                df['volume_score'] = df['volume'] / df['volume'].rolling(6).mean().replace(0, 1) * 100
+                df['volume_change'] = df['volume'].pct_change().fillna(0) * 100
+            else:
+                df['volume_score'] = 0
+                df['volume_change'] = 0
             
             # Нормализованный ATR
             df['atr_normalized'] = df['atr'] / df['price'].replace(0, 1) * 100
@@ -285,15 +292,18 @@ class TradingBot:
             df['obv'] = (np.sign(df['price'].diff()) * df['volume']).cumsum().fillna(0)
             
             # Уровни поддержки/сопротивления
-            df['support_level'] = df['low'].rolling(20).min().fillna(df['low'].min())
-            df['resistance_level'] = df['high'].rolling(20).max().fillna(df['high'].max())
+            if len(df) >= 20:
+                df['support_level'] = df['low'].rolling(20).min().fillna(df['low'].min())
+                df['resistance_level'] = df['high'].rolling(20).max().fillna(df['high'].max())
+            else:
+                df['support_level'] = df['low'].min()
+                df['resistance_level'] = df['high'].max()
             
             return df.replace([np.inf, -np.inf], 0)
             
         except Exception as e:
             logger.error(f"Error calculating features: {e}")
             return pd.DataFrame()
-
     def calculate_indicators(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
         """Расчет индикаторов для модели"""
         try:
@@ -404,13 +414,18 @@ class TradingBot:
                 for f in missing:
                     df[f] = 0
             
-            # Возвращаем только последнюю строку с нужными фичами
-            return df[required_features].iloc[-1:].replace([np.inf, -np.inf], 0)
+            # Убедимся, что порядок фичей соответствует ожидаемому моделью
+            features = df[required_features].iloc[-1:]
+            
+            # Добавим названия фичей для избежания предупреждения
+            features.columns = required_features
+            
+            return features.replace([np.inf, -np.inf], 0)
             
         except Exception as e:
             logger.error(f"Error preparing features: {e}")
             return pd.DataFrame()
-
+    
     async def check_signal(self, symbol: str):
         """Проверка сигналов с надежной обработкой None"""
         try:
@@ -455,44 +470,21 @@ class TradingBot:
                 return None
                 
             try:
-                features_scaled = scaler.transform(features)
+                # Преобразуем в numpy array и убедимся, что фичи в правильном порядке
+                features_array = features.values.reshape(1, -1)
+                features_scaled = scaler.transform(features_array)
+                
+                # Убедимся, что модель получит данные с правильными feature names
+                if hasattr(model, 'feature_name_'):
+                    features_scaled = pd.DataFrame(features_scaled, columns=model.feature_name_)
+                
                 proba = model.predict_proba(features_scaled)[0][1]
             except Exception as e:
                 logger.error(f"Prediction failed for {symbol}: {e}")
                 return None
-                
-            # Проверка условий сигнала
-            last = df.iloc[-1]
-            threshold = 0.4 if is_short else 0.35
-            if symbol in LOW_RECALL_SYMBOLS:
-                threshold = 0.5 if is_short else 0.316
-                
-            conditions_met = (
-                (last['rsi'] >= 60 if is_short else 25 <= last['rsi'] <= 75) &
-                (last['macd'] < 0 if is_short else last['macd'] > -0.5) &
-                (last['adx'] > 15) &
-                ((last['ema_cross'] == 1) | (last['volume_spike'] == 1)) &
-                (last['bear_volume' if is_short else 'bull_volume'] > df['volume'].rolling(20).mean().iloc[-1])
-            )
-            
-            if proba > threshold and conditions_met:
-                return {
-                    'type': 'SHORT' if is_short else 'LONG',
-                    'probability': proba,
-                    'rsi': last['rsi'],
-                    'macd': last['macd'],
-                    'adx': last['adx'],
-                    'atr': last['atr'],
-                    'support': last.get('support_level', last.get('support', 0)),
-                    'resistance': last.get('resistance_level', last.get('resistance', 0)),
-                    'model_evaluated': True
-                }
-                
-            return None
-            
         except Exception as e:
-            logger.error(f"Error in check_model_signal: {e}")
-            return None
+                logger.error(f"Prediction failed for {symbol}: {e}")
+                return None
 
     async def send_signal_message(self, symbol: str, signal: Dict[str, Any], df: pd.DataFrame):
         """Отправка сообщения о сигнале"""
