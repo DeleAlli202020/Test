@@ -196,7 +196,7 @@ class TradingBot:
                 (last_row['adx'] > 15) &
                 ((last_row['ema_cross'] == 1) | (last_row['volume_spike'] == 1)) &
                 (last_row['super_trend'] == 1) &
-                (last_row['bull_volume'] > df['volume'].rolling(20).mean().iloc[-1])
+                (last_row['bull_volume'] > df['volume'].rolling(20).mean().iloc[-1]))
             
             if not valid_signal:
                 return None
@@ -237,7 +237,7 @@ class TradingBot:
                 (last_row['adx'] > 15) &
                 ((last_row['ema_cross'] == 1) | (last_row['volume_spike'] == 1)) &
                 (last_row['super_trend'] == -1) &
-                (last_row['bear_volume'] > df['volume'].rolling(20).mean().iloc[-1])
+                (last_row['bear_volume'] > df['volume'].rolling(20).mean().iloc[-1]))
             
             if not valid_signal:
                 return None
