@@ -139,7 +139,7 @@ class TradingBot:
                 logger.error(f"Unexpected error checking {symbol}: {e}")
         return available_symbols
     
-    async def fetch_current_data(self, symbol, limit=100):
+    async def fetch_current_data(self, symbol, limit=200):
         """Получение актуальных данных"""
         max_retries = 5
         retry_delay = 5
@@ -177,7 +177,7 @@ class TradingBot:
             macd = MACD(df['close'], window_slow=26, window_fast=12)
             df['macd'] = macd.macd().fillna(0)
             # Проверка данных для ADX
-            if (df['high'] - df['low']).abs().sum() > 0 and df['close'].std() > 0:
+            if (df['high'] - df['low']).abs().sum() > 0 and df['close'].std() > 0 and df['volume'].sum() > 0:
                 df['adx'] = ADXIndicator(df['high'], df['low'], df['close'], window=14).adx().fillna(0)
             else:
                 logger.warning("Invalid data for ADX calculation, setting to 0")
@@ -185,8 +185,8 @@ class TradingBot:
             atr = AverageTrueRange(df['high'], df['low'], df['close'], window=14)
             df['atr'] = atr.average_true_range().fillna(df['close'].iloc[-1] * 0.001)
             bb = BollingerBands(df['close'], window=20, window_dev=2)
-            df['bb_upper'] = bb.bollinger_hband().fillna(0)
-            df['bb_lower'] = bb.bollinger_lband().fillna(0)
+            df['bb_upper'] = bb.bollinger_hband().fillna(df['close'].iloc[-1])
+            df['bb_lower'] = bb.bollinger_lband().fillna(df['close'].iloc[-1])
             df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['price'].replace(0, 0.0001) * 100
             df['obv'] = OnBalanceVolumeIndicator(df['close'], df['volume']).on_balance_volume().fillna(0)
             return df
