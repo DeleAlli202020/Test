@@ -257,6 +257,12 @@ class TradingBot:
 
             df = df.copy()
             
+            # Рассчитываем базовые индикаторы если они ещё не рассчитаны
+            if 'atr' not in df.columns:
+                df = self.calculate_indicators(df)
+                if df.empty:
+                    return pd.DataFrame()
+            
             # Расчет изменений цены
             periods = {
                 'price_change_1h': 4,
@@ -381,7 +387,12 @@ class TradingBot:
                 logger.error("No features list available")
                 return pd.DataFrame()
             
-            # Рассчитываем все фичи
+            # Рассчитываем все индикаторы
+            df = self.calculate_indicators(df, is_short)
+            if df.empty:
+                return pd.DataFrame()
+                
+            # Рассчитываем дополнительные фичи
             df = self.calculate_additional_features(df)
             if df.empty:
                 return pd.DataFrame()
