@@ -242,31 +242,40 @@ class TradingBot:
             return pd.Series(0, index=high.index), pd.Series(0, index=high.index), pd.Series(0, index=high.index)
         
     def calculate_additional_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Расчет дополнительных фичей, которые отсутствуют в базовых индикаторах"""
+        """Расчет дополнительных фичей с правильным именованием колонок"""
         try:
+            # Создаем копию, чтобы не изменять исходный DataFrame
+            df = df.copy()
+            
             # Price changes
-            df['price_change_1h'] = df['price'].pct_change(4) * 100  # 15min * 4 = 1h
-            df['price_change_2h'] = df['price'].pct_change(8) * 100
-            df['price_change_6h'] = df['price'].pct_change(24) * 100
-            df['price_change_12h'] = df['price'].pct_change(48) * 100
+            df['price_change_1h'] = df['price'].pct_change(4).fillna(0) * 100
+            df['price_change_2h'] = df['price'].pct_change(8).fillna(0) * 100
+            df['price_change_6h'] = df['price'].pct_change(24).fillna(0) * 100
+            df['price_change_12h'] = df['price'].pct_change(48).fillna(0) * 100
             
             # Volume metrics
-            df['volume_score'] = df['volume'] / df['volume'].rolling(6).mean() * 100
-            df['volume_change'] = df['volume'].pct_change() * 100
+            df['volume_score'] = (df['volume'] / df['volume'].rolling(6).mean().replace(0, 1)).fillna(0) * 100
+            df['volume_change'] = df['volume'].pct_change().fillna(0) * 100
             
             # ATR normalized
-            df['atr_normalized'] = df['atr'] / df['price'] * 100
+            df['atr_normalized'] = (df['atr'] / df['price'].replace(0, 1)).fillna(0) * 100
             
             # On-Balance Volume (OBV)
-            df['obv'] = (np.sign(df['price'].diff()) * df['volume']).cumsum()
+            df['obv'] = (np.sign(df['price'].diff().fillna(0)) * df['volume']).cumsum()
             
-            # Support/Resistance levels (переименовываем уже существующие колонки)
-            df = df.rename(columns={
-                'support': 'support_level',
-                'resistance': 'resistance_level'
-            })
+            # Убедимся, что support/resistance существуют под любым именем
+            if 'support' in df.columns and 'support_level' not in df.columns:
+                df['support_level'] = df['support']
+            if 'resistance' in df.columns and 'resistance_level' not in df.columns:
+                df['resistance_level'] = df['resistance']
+                
+            # Если все еще нет, создадим простые уровни
+            if 'support_level' not in df.columns:
+                df['support_level'] = df['low'].rolling(20).min().fillna(df['price'].min())
+            if 'resistance_level' not in df.columns:
+                df['resistance_level'] = df['high'].rolling(20).max().fillna(df['price'].max())
             
-            return df.replace([np.inf, -np.inf], np.nan).fillna(0)
+            return df.replace([np.inf, -np.inf], 0)
         except Exception as e:
             logger.error(f"Error calculating additional features: {e}")
             return df
@@ -356,31 +365,29 @@ class TradingBot:
         return []
 
     def prepare_features(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
-        """Подготовка фичей для модели с правильными именами"""
+        """Подготовка фичей с надежной обработкой ошибок"""
         try:
             model_features = self.get_model_features(is_short)
             if not model_features:
                 logger.error("No model features available")
                 return pd.DataFrame()
             
-            # Сначала рассчитываем все дополнительные фичи
+            # Рассчитываем все дополнительные фичи
             df = self.calculate_additional_features(df)
             
-            features = pd.DataFrame(index=df.index)
+            # Создаем DataFrame с нужными фичами
+            features = {}
             for feat in model_features:
                 if feat in df.columns:
-                    features[feat] = df[feat].fillna(0)
+                    features[feat] = df[feat].fillna(0).values  # Используем values для избежания проблем с индексами
                 else:
                     features[feat] = 0
-                    logger.warning(f"Feature {feat} not found in DataFrame, filled with 0")
+                    logger.warning(f"Feature {feat} not found, filled with 0")
             
-            # Убедимся, что порядок фичей соответствует ожиданиям модели
-            features = features[model_features]
+            # Создаем DataFrame с правильным порядком колонок
+            features_df = pd.DataFrame(features, index=[df.index[-1]], columns=model_features)
             
-            # Добавим имена фичей для избежания предупреждений sklearn
-            features.columns = model_features
-            
-            return features.loc[-1:].replace([np.inf, -np.inf], np.nan).fillna(0)
+            return features_df.replace([np.inf, -np.inf], 0)
         
         except Exception as e:
             logger.error(f"Error preparing features: {e}")
@@ -425,44 +432,40 @@ class TradingBot:
             return None
 
     def check_model_signal(self, df: pd.DataFrame, symbol: str, is_short: bool) -> Optional[Dict[str, Any]]:
-        """Проверка сигнала для конкретной модели с улучшенной обработкой"""
+        """Проверка сигнала с улучшенной обработкой ошибок"""
         try:
             model_data = self.short_model_data if is_short else self.long_model_data
             if not model_data:
-                logger.warning(f"No model data available for {'SHORT' if is_short else 'LONG'}")
+                logger.warning(f"No model data for {'SHORT' if is_short else 'LONG'}")
                 return None
             
             model = model_data['models'].get('combined')
             scaler = model_data['scalers'].get('combined')
             
             if model is None or scaler is None:
-                logger.warning(f"Model or scaler not found for {'SHORT' if is_short else 'LONG'}")
+                logger.warning(f"No model or scaler for {'SHORT' if is_short else 'LONG'}")
                 return None
             
-            # Подготовка фичей с правильными именами
             features = self.prepare_features(df, is_short)
             if features.empty:
-                logger.warning(f"Empty features for {'SHORT' if is_short else 'LONG'} {symbol}")
+                logger.warning(f"Empty features for {symbol}")
                 return None
             
             try:
-                # Масштабирование фичей
                 features_scaled = scaler.transform(features)
-                
-                # Преобразуем в DataFrame с правильными именами фичей
-                features_scaled = pd.DataFrame(features_scaled, columns=features.columns)
-                
-                # Предсказание
                 proba = model.predict_proba(features_scaled)[0][1]
             except Exception as e:
-                logger.error(f"Model prediction failed for {'SHORT' if is_short else 'LONG'} {symbol}: {e}")
+                logger.error(f"Model prediction failed for {symbol}: {e}")
                 return None
             
-            # Проверка условий сигнала
             last_row = df.iloc[-1]
             threshold = 0.4 if is_short else 0.35
             if symbol in LOW_RECALL_SYMBOLS:
                 threshold = 0.5 if is_short else 0.316
+            
+            # Универсальный доступ к support/resistance независимо от имени колонки
+            support = last_row.get('support_level', last_row.get('support', 0))
+            resistance = last_row.get('resistance_level', last_row.get('resistance', 0))
             
             if is_short:
                 valid_signal = (
@@ -487,14 +490,14 @@ class TradingBot:
                     'macd': last_row['macd'],
                     'adx': last_row['adx'],
                     'atr': last_row['atr'],
-                    'support': last_row.get('support', last_row.get('support_level', 0)),
-                    'resistance': last_row.get('resistance', last_row.get('resistance_level', 0)),
+                    'support': support,
+                    'resistance': resistance,
                     'model_evaluated': True
                 }
             
             return None
         except Exception as e:
-            logger.error(f"Error in check_model_signal for {'SHORT' if is_short else 'LONG'} {symbol}: {e}")
+            logger.error(f"Error checking signal for {symbol}: {e}")
             return None
 
     async def send_signal_message(self, symbol: str, signal: Dict[str, Any], df: pd.DataFrame):
