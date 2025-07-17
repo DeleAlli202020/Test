@@ -240,6 +240,36 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error in ADX calculation: {e}")
             return pd.Series(0, index=high.index), pd.Series(0, index=high.index), pd.Series(0, index=high.index)
+        
+    def calculate_additional_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Расчет дополнительных фичей, которые отсутствуют в базовых индикаторах"""
+        try:
+            # Price changes
+            df['price_change_1h'] = df['price'].pct_change(4) * 100  # 15min * 4 = 1h
+            df['price_change_2h'] = df['price'].pct_change(8) * 100
+            df['price_change_6h'] = df['price'].pct_change(24) * 100
+            df['price_change_12h'] = df['price'].pct_change(48) * 100
+            
+            # Volume metrics
+            df['volume_score'] = df['volume'] / df['volume'].rolling(6).mean() * 100
+            df['volume_change'] = df['volume'].pct_change() * 100
+            
+            # ATR normalized
+            df['atr_normalized'] = df['atr'] / df['price'] * 100
+            
+            # On-Balance Volume (OBV)
+            df['obv'] = (np.sign(df['price'].diff()) * df['volume']).cumsum()
+            
+            # Support/Resistance levels (переименовываем уже существующие колонки)
+            df = df.rename(columns={
+                'support': 'support_level',
+                'resistance': 'resistance_level'
+            })
+            
+            return df.replace([np.inf, -np.inf], np.nan).fillna(0)
+        except Exception as e:
+            logger.error(f"Error calculating additional features: {e}")
+            return df
 
     def calculate_indicators(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
         """Расчет индикаторов для модели"""
@@ -326,12 +356,15 @@ class TradingBot:
         return []
 
     def prepare_features(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
-        """Подготовка фичей для модели"""
+        """Подготовка фичей для модели с правильными именами"""
         try:
             model_features = self.get_model_features(is_short)
             if not model_features:
                 logger.error("No model features available")
                 return pd.DataFrame()
+            
+            # Сначала рассчитываем все дополнительные фичи
+            df = self.calculate_additional_features(df)
             
             features = pd.DataFrame(index=df.index)
             for feat in model_features:
@@ -340,6 +373,12 @@ class TradingBot:
                 else:
                     features[feat] = 0
                     logger.warning(f"Feature {feat} not found in DataFrame, filled with 0")
+            
+            # Убедимся, что порядок фичей соответствует ожиданиям модели
+            features = features[model_features]
+            
+            # Добавим имена фичей для избежания предупреждений sklearn
+            features.columns = model_features
             
             return features.loc[-1:].replace([np.inf, -np.inf], np.nan).fillna(0)
         
@@ -385,8 +424,8 @@ class TradingBot:
             logger.error(f"Error checking signal for {symbol}: {e}")
             return None
 
-    async def check_model_signal(self, df: pd.DataFrame, symbol: str, is_short: bool) -> Optional[Dict[str, Any]]:
-        """Проверка сигнала для конкретной модели"""
+    def check_model_signal(self, df: pd.DataFrame, symbol: str, is_short: bool) -> Optional[Dict[str, Any]]:
+        """Проверка сигнала для конкретной модели с улучшенной обработкой"""
         try:
             model_data = self.short_model_data if is_short else self.long_model_data
             if not model_data:
@@ -400,24 +439,23 @@ class TradingBot:
                 logger.warning(f"Model or scaler not found for {'SHORT' if is_short else 'LONG'}")
                 return None
             
-            # Подготовка фичей
+            # Подготовка фичей с правильными именами
             features = self.prepare_features(df, is_short)
             if features.empty:
                 logger.warning(f"Empty features for {'SHORT' if is_short else 'LONG'} {symbol}")
                 return None
             
-            # Масштабирование фичей
             try:
+                # Масштабирование фичей
                 features_scaled = scaler.transform(features)
-            except Exception as e:
-                logger.error(f"Feature scaling failed for {'SHORT' if is_short else 'LONG'} {symbol}: {e}")
-                return None
-            
-            # Предсказание
-            try:
+                
+                # Преобразуем в DataFrame с правильными именами фичей
+                features_scaled = pd.DataFrame(features_scaled, columns=features.columns)
+                
+                # Предсказание
                 proba = model.predict_proba(features_scaled)[0][1]
             except Exception as e:
-                logger.error(f"Prediction failed for {'SHORT' if is_short else 'LONG'} {symbol}: {e}")
+                logger.error(f"Model prediction failed for {'SHORT' if is_short else 'LONG'} {symbol}: {e}")
                 return None
             
             # Проверка условий сигнала
@@ -432,16 +470,14 @@ class TradingBot:
                     (last_row['macd'] < 0) &
                     (last_row['adx'] > 15) &
                     ((last_row['ema_cross'] == 1) | (last_row['volume_spike'] == 1)) &
-                    (last_row['bear_volume'] > df['volume'].rolling(20).mean().iloc[-1])
-                )
+                    (last_row['bear_volume'] > df['volume'].rolling(20).mean().iloc[-1]))
             else:
                 valid_signal = (
                     (25 <= last_row['rsi'] <= 75) &
                     (last_row['macd'] > -0.5) &
                     (last_row['adx'] > 15) &
                     ((last_row['ema_cross'] == 1) | (last_row['volume_spike'] == 1)) &
-                    (last_row['bull_volume'] > df['volume'].rolling(20).mean().iloc[-1])
-                )
+                    (last_row['bull_volume'] > df['volume'].rolling(20).mean().iloc[-1]))
             
             if proba > threshold and valid_signal:
                 return {
@@ -451,8 +487,8 @@ class TradingBot:
                     'macd': last_row['macd'],
                     'adx': last_row['adx'],
                     'atr': last_row['atr'],
-                    'support': last_row['support'],
-                    'resistance': last_row['resistance'],
+                    'support': last_row.get('support', last_row.get('support_level', 0)),
+                    'resistance': last_row.get('resistance', last_row.get('resistance_level', 0)),
                     'model_evaluated': True
                 }
             
@@ -623,6 +659,7 @@ async def main():
         
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("status", status))
+        app.add_handler(CommandHandler("idea", check_all_symbols))
         
         # Запуск периодической проверки каждые 15 минут
         app.job_queue.run_repeating(
