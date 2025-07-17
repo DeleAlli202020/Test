@@ -38,10 +38,10 @@ load_dotenv(os.path.join(BASE_DIR, 'token.env'))
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', 0))
 ALLOWED_USERS_PATH = os.path.join(BASE_DIR, 'allowed_users.json')
-MODEL_PATH_LONG = r"d:\model_improved1.pkl"
-MODEL_PATH_SHORT = r"d:\short_model_improved.pkl"
-FEATURES_PATH_LONG = r"d:\features.pkl"
-FEATURES_PATH_SHORT = r"d:\short_features.pkl"
+MODEL_PATH_LONG = os.path.join(BASE_DIR, 'model_improved1.pkl')
+MODEL_PATH_SHORT = os.path.join(BASE_DIR, 'short_model_improved.pkl')
+FEATURES_PATH_LONG = os.path.join(BASE_DIR, 'features.pkl')
+FEATURES_PATH_SHORT = os.path.join(BASE_DIR, 'short_features.pkl')
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "ADAUSDT", "XRPUSDT", "SOLUSDT", "DOTUSDT", "DOGEUSDT", 
            "POLUSDT", "TRXUSDT", "TRUMPUSDT", "AVAXUSDT", "HBARUSDT", "NEARUSDT", "TONUSDT"]
 TIMEFRAME = "15m"
