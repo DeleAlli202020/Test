@@ -50,6 +50,18 @@ class TradingBot:
         self.subscribed_users = set(self.load_allowed_users())
         self.exchange = self.init_exchange()
         self.long_model, self.long_scaler, self.short_model, self.short_scaler = self.load_models()
+
+    def validate_data(df):
+        """Проверка качества данных"""
+        if df.empty:
+            return False
+        if len(df) < 20:
+            return False
+        if df['close'].isnull().any() or (df['close'] <= 0).any():
+            return False
+        if df['volume'].isnull().any() or (df['volume'] < 0).any():
+            return False
+        return True
         
     def init_exchange(self):
         """Инициализация биржи"""
