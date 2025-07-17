@@ -391,7 +391,7 @@ class TradingBot:
     def prepare_features(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
         """Подготовка фичей с проверкой наличия всех необходимых"""
         try:
-            # Получаем список требуемых фичей
+            # Получаем список требуемых фичей в правильном порядке
             required_features = self.get_model_features(is_short)
             if not required_features:
                 logger.error("No features list available")
@@ -407,7 +407,7 @@ class TradingBot:
             if df.empty:
                 return pd.DataFrame()
             
-            # Проверяем наличие всех фичей
+            # Проверяем наличие всех фичей и заполняем недостающие нулями
             missing = [f for f in required_features if f not in df.columns]
             if missing:
                 logger.warning(f"Missing features: {missing}, filling with 0")
@@ -417,10 +417,10 @@ class TradingBot:
             # Убедимся, что порядок фичей соответствует ожидаемому моделью
             features = df[required_features].iloc[-1:]
             
-            # Добавим названия фичей для избежания предупреждения
-            features.columns = required_features
+            # Создаем DataFrame с явно указанными feature names
+            features_df = pd.DataFrame(features.values, columns=required_features)
             
-            return features.replace([np.inf, -np.inf], 0)
+            return features_df.replace([np.inf, -np.inf], 0)
             
         except Exception as e:
             logger.error(f"Error preparing features: {e}")
@@ -470,14 +470,18 @@ class TradingBot:
                 return None
                 
             try:
-                # Преобразуем в numpy array и убедимся, что фичи в правильном порядке
-                features_array = features.values.reshape(1, -1)
-                features_scaled = scaler.transform(features_array)
+                # Получаем feature names из scaler или модели
+                feature_names = getattr(scaler, 'feature_names_in_', 
+                                    getattr(model, 'feature_name_', None))
                 
-                # Убедимся, что модель получит данные с правильными feature names
-                if hasattr(model, 'feature_name_'):
-                    features_scaled = pd.DataFrame(features_scaled, columns=model.feature_name_)
+                # Преобразуем данные с учетом feature names
+                if feature_names is not None:
+                    features = features[feature_names]
                 
+                # Масштабирование
+                features_scaled = scaler.transform(features)
+                
+                # Предсказание
                 proba = model.predict_proba(features_scaled)[0][1]
             except Exception as e:
                 logger.error(f"Prediction failed for {symbol}: {e}")
