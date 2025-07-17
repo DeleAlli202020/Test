@@ -64,6 +64,32 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Failed to initialize Binance API: {e}")
             raise
+    def load_allowed_users(self):
+        """Загрузка списка разрешенных пользователей"""
+        try:
+            if os.path.exists(ALLOWED_USERS_PATH):
+                with open(ALLOWED_USERS_PATH, 'r', encoding='utf-8') as f:
+                    users = json.load(f)
+                logger.info(f"Loaded {len(users)} allowed users")
+                return users
+            else:
+                logger.warning("Allowed users file not found, using default list")
+                return [809820681, 667191785, 453365207]
+        except Exception as e:
+            logger.error(f"Failed to load allowed users: {e}")
+            return [809820681, 667191785, 453365207]
+    
+    def save_allowed_users(self):
+        """Сохранение списка разрешенных пользователей"""
+        try:
+            os.makedirs(os.path.dirname(ALLOWED_USERS_PATH), exist_ok=True)
+            with open(ALLOWED_USERS_PATH, 'w', encoding='utf-8') as f:
+                json.dump(list(self.subscribed_users), f, indent=2, ensure_ascii=False)
+            logger.info(f"Successfully saved {len(self.subscribed_users)} allowed users")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save allowed users: {e}")
+            return False
 
     def load_models(self):
         """Загрузка моделей и скейлеров"""
