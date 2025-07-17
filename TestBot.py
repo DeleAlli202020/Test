@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 import json
 import nest_asyncio
 
-# Применение nest_asyncio для корректной работы в среде с существующими циклами событий
+# Применение nest_asyncio
 nest_asyncio.apply()
 
 # Настройка логирования
@@ -48,19 +48,10 @@ SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "ADAUSDT", "XRPUSDT", "SOLUSDT", "DO
 TIMEFRAME = "15m"
 MIN_RR = 3  # Минимальный Risk/Reward
 CHECK_INTERVAL = 15 * 60  # 15 минут в секундах
-INITIAL_BALANCE = 10000
-POSITION_SIZE = 0.15
-COMMISSION = 0.001
 LOW_RECALL_SYMBOLS = ["BTCUSDT", "BNBUSDT"]
 
 class TradingBot:
     def __init__(self):
-        self.balance = INITIAL_BALANCE
-        self.positions = {symbol: {'amount': 0, 'buy_price': 0, 'type': None} for symbol in SYMBOLS}
-        self.trades = []
-        self.equity = [INITIAL_BALANCE]
-        self.last_update_time = None
-        self.active_symbols = []
         self.subscribed_users = set(self.load_allowed_users())
         
         # Инициализация биржи
@@ -100,7 +91,7 @@ class TradingBot:
                 return users
             else:
                 logger.warning("Allowed users file not found, using default list")
-                return [809820681, 667191785, 453365207]  # Жестко заданные ID
+                return [809820681, 667191785, 453365207]
         except Exception as e:
             logger.error(f"Failed to load allowed users: {e}")
             return [809820681, 667191785, 453365207]
@@ -148,7 +139,7 @@ class TradingBot:
         return available_symbols
     
     async def fetch_current_data(self, symbol, limit=100):
-        """Получение актуальных данных с обработкой ошибок"""
+        """Получение актуальных данных"""
         max_retries = 5
         retry_delay = 5
         for attempt in range(max_retries):
@@ -197,6 +188,9 @@ class TradingBot:
         try:
             if df.empty or len(df) < 50:
                 return pd.DataFrame(), None
+            
+            # Сначала вычисляем технические индикаторы, включая ATR
+            df = self.calculate_technical_indicators(df)
             
             df['price_change_1h'] = df['price'].pct_change(4) * 100
             df['price_change_2h'] = df['price'].pct_change(8) * 100
@@ -260,48 +254,6 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Error in prepare_data_for_model: {e}")
             return pd.DataFrame(), None
-    
-    def calculate_metrics(self):
-        """Расчет метрик"""
-        if not self.trades or len(self.trades) < 2:
-            return {
-                'profit': 0,
-                'profit_pct': 0,
-                'win_rate': 0,
-                'max_drawdown': 0,
-                'sharpe_ratio': 0,
-                'num_trades': 0
-            }
-        
-        profit = self.equity[-1] - INITIAL_BALANCE
-        profit_pct = profit / INITIAL_BALANCE * 100
-        
-        trade_profits = []
-        for i in range(0, len(self.trades), 2):
-            if i + 1 < len(self.trades):
-                buy = self.trades[i]
-                sell = self.trades[i + 1]
-                trade_profit = (sell['price'] - buy['price'] if buy['type'] == 'BUY' else buy['price'] - sell['price']) * buy['amount'] * (1 - 2 * COMMISSION)
-                trade_profits.append(trade_profit)
-        
-        win_rate = len([p for p in trade_profits if p > 0]) / len(trade_profits) if trade_profits else 0
-        
-        equity_series = pd.Series(self.equity)
-        rolling_max = equity_series.cummax()
-        drawdown = (rolling_max - equity_series) / rolling_max
-        max_drawdown = drawdown.max()
-        
-        returns = equity_series.pct_change().dropna()
-        sharpe_ratio = np.sqrt(365*24*4) * returns.mean() / (returns.std() + 1e-10)
-        
-        return {
-            'profit': profit,
-            'profit_pct': profit_pct,
-            'win_rate': win_rate,
-            'max_drawdown': max_drawdown,
-            'sharpe_ratio': sharpe_ratio,
-            'num_trades': len(trade_profits)
-        }
     
     async def check_signal(self, symbol):
         """Проверка сигнала"""
@@ -393,117 +345,34 @@ class TradingBot:
                         rr1 = (current_price - tp1) / (sl - current_price) if sl != current_price else 0
                         rr2 = (current_price - tp2) / (sl - current_price) if sl != current_price else 0
                     
-                    position = self.positions[symbol]['amount']
-                    if rr1 >= MIN_RR and position == 0:
-                        amount = (self.balance * POSITION_SIZE) / current_price
-                        cost = amount * current_price * (1 + COMMISSION)
-                        if cost <= self.balance:
-                            self.balance -= cost
-                            self.positions[symbol] = {
-                                'amount': amount,
-                                'buy_price': current_price,
-                                'type': signal_type
-                            }
-                            self.trades.append({
-                                'symbol': symbol,
-                                'time': datetime.now(),
-                                'type': 'BUY' if signal_type == "LONG" else 'SELL',
-                                'price': current_price,
-                                'amount': amount,
-                                'balance': self.balance,
-                                'equity': self.balance + amount * current_price,
-                                'rsi': rsi,
-                                'macd': macd,
-                                'adx': adx
-                            })
-                            
-                            message = (
-                                f"**{symbol.replace('USDT', '/USDT')} — {signal_type} СИГНАЛ**\n"
-                                f"🕒 **Время:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} (UTC)\n"
-                                f"💰 **Цена входа:** {current_price:.4f} USDT\n"
-                                f"📊 **Объем:** {amount:.6f}\n\n"
-                                f"#### 📈 Технические индикаторы:\n"
-                                f"- **RSI:** {rsi:.1f} ({'перекуплен' if rsi > 70 else 'перепродан' if rsi < 30 else 'нейтральный'})\n"
-                                f"- **MACD:** {macd:.4f} ({'бычий импульс' if macd > 0 else 'медвежий импульс'})\n"
-                                f"- **ADX:** {adx:.1f} ({'сильный тренд' if adx > 25 else 'слабый/умеренный тренд'})\n"
-                                f"- **Волатильность (ATR):** {atr:.4f} ({'высокая' if atr > current_price * 0.01 else 'ниже среднего'})\n\n"
-                                f"#### 📊 Вероятностные метрики:\n"
-                                f"- **Тип сделки:** {signal_type}\n"
-                                f"- **Вероятность:** {signal_proba*100:.1f}%\n"
-                                f"- **Risk/Reward (TP1):** 1:{rr1:.1f}\n"
-                                f"- **Risk/Reward (TP2):** 1:{rr2:.1f}\n"
-                                f"- **Историческая успешность:** {62 + signal_proba*20:.1f}%\n\n"
-                                f"#### 🔍 Ключевые уровни:\n"
-                                f"- **Поддержка:** {support:.4f} ({(support - current_price)/current_price*100:.1f}%)\n"
-                                f"- **Сопротивление:** {resistance:.4f} ({(resistance - current_price)/current_price*100:.1f}%)\n"
-                                f"- **TP1:** {tp1:.4f} ({(tp1 - current_price)/current_price*100:.1f}%)\n"
-                                f"- **TP2:** {tp2:.4f} ({(tp2 - current_price)/current_price*100:.1f}%)\n"
-                                f"- **SL:** {sl:.4f} ({(sl - current_price)/current_price*100:.1f}%)\n\n"
-                                f"#### ⚠️ Риски:\n"
-                                f"- {'Низкий ADX' if adx < 20 else 'Высокий ADX'} → {'возможен флэт или ложный пробой' if adx < 20 else 'тренд может быть сильным'}\n"
-                                f"- Объемы: {'ниже среднего' if (bull_volume if signal_type == 'LONG' else bear_volume) < volume_mean else 'выше среднего'}"
-                            )
-                            await self.broadcast_message(message)
-                            logger.info(f"Opened {signal_type} position for {symbol}: Price={current_price:.4f}, Amount={amount:.6f}")
-                    
-                    # Логика выхода
-                    elif position > 0:
-                        buy_price = self.positions[symbol]['buy_price']
-                        price_change = (current_price - buy_price) / buy_price * 100 if self.positions[symbol]['type'] == "LONG" else (buy_price - current_price) / buy_price * 100
-                        stop_condition = price_change <= -1.0
-                        take_profit_condition = price_change >= (3 if signal_type == "LONG" else 2)
-                        exit_signal = (signal_type == "LONG" and not long_valid) or (signal_type == "SHORT" and not short_valid)
-                        
-                        if stop_condition or take_profit_condition or exit_signal:
-                            revenue = position * current_price * (1 - COMMISSION)
-                            self.balance += revenue
-                            exit_reason = (
-                                "🛑 Stop Loss" if stop_condition else
-                                "🎯 Take Profit" if take_profit_condition else
-                                "📉 Сигнал выхода"
-                            )
-                            self.trades.append({
-                                'symbol': symbol,
-                                'time': datetime.now(),
-                                'type': 'SELL' if self.positions[symbol]['type'] == "LONG" else 'BUY',
-                                'price': current_price,
-                                'amount': position,
-                                'balance': self.balance,
-                                'equity': self.balance,
-                                'rsi': rsi,
-                                'macd': macd,
-                                'adx': adx,
-                                'profit_pct': price_change,
-                                'stop_triggered': stop_condition,
-                                'tp_triggered': take_profit_condition
-                            })
-                            
-                            sell_msg = (
-                                f"**{symbol.replace('USDT', '/USDT')} — ЗАКРЫТИЕ {self.positions[symbol]['type']}**\n"
-                                f"💰 **Цена выхода:** {current_price:.4f} USDT\n"
-                                f"📊 **Объем:** {position:.6f}\n"
-                                f"📈 **PnL:** {price_change:.2f}%\n"
-                                f"📊 **Причина:** {exit_reason}\n"
-                                f"🕒 **Время:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} (UTC)"
-                            )
-                            await self.broadcast_message(sell_msg)
-                            logger.info(f"Closed {self.positions[symbol]['type']} position for {symbol}: Price={current_price:.4f}, PnL={price_change:.2f}%")
-                            
-                            self.positions[symbol] = {'amount': 0, 'buy_price': 0, 'type': None}
-                            
-                            try:
-                                trades_df = pd.DataFrame(self.trades)
-                                trades_df.to_csv("d:\\forward_trades.csv", index=False)
-                            except Exception as e:
-                                logger.error(f"Error saving trades: {e}")
-                                await self.notify_admin(f"Ошибка сохранения сделок: {e}")
-                            
-                            # Обновление equity
-                            total_equity = self.balance
-                            for sym, pos in self.positions.items():
-                                if pos['amount'] > 0:
-                                    total_equity += pos['amount'] * current_price
-                            self.equity.append(total_equity)
+                    if rr1 >= MIN_RR:
+                        message = (
+                            f"**{symbol.replace('USDT', '/USDT')} — Анализ сигнала**\n"
+                            f"🕒 **Время:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} (UTC)\n"
+                            f"📊 **Текущая цена:** {current_price:.4f} USDT\n\n"
+                            f"#### 📈 Технические индикаторы:\n"
+                            f"- **RSI:** {rsi:.1f} ({'перекуплен' if rsi > 70 else 'перепродан' if rsi < 30 else 'нейтральный'})\n"
+                            f"- **MACD:** {macd:.4f} ({'бычий импульс' if macd > 0 else 'медвежий импульс'})\n"
+                            f"- **ADX:** {adx:.1f} ({'сильный тренд' if adx > 25 else 'слабый/умеренный тренд'})\n"
+                            f"- **Волатильность (ATR):** {atr:.4f} ({'высокая' if atr > current_price * 0.01 else 'ниже среднего'})\n\n"
+                            f"#### 📊 Вероятностные метрики:\n"
+                            f"- **Тип сделки:** {signal_type}\n"
+                            f"- **Вероятность (модель):** {signal_proba*100:.1f}%\n"
+                            f"- **Risk/Reward (TP1):** 1:{rr1:.1f}\n"
+                            f"- **Risk/Reward (TP2):** 1:{rr2:.1f}\n"
+                            f"- **Историческая успешность:** {62 + signal_proba*20:.1f}% (оценка на основе модели)\n\n"
+                            f"#### 🔍 Ключевые уровни:\n"
+                            f"- **Ближайшая поддержка:** {support:.4f} ({(support - current_price)/current_price*100:.1f}%)\n"
+                            f"- **Ближайшее сопротивление:** {resistance:.4f} ({(resistance - current_price)/current_price*100:.1f}%)\n"
+                            f"- **TP1:** {tp1:.4f} ({(tp1 - current_price)/current_price*100:.1f}%)\n"
+                            f"- **TP2:** {tp2:.4f} ({(tp2 - current_price)/current_price*100:.1f}%)\n"
+                            f"- **SL:** {sl:.4f} ({(sl - current_price)/current_price*100:.1f}%)\n\n"
+                            f"#### ⚠️ Риски:\n"
+                            f"- {'Низкий ADX' if adx < 20 else 'Высокий ADX'} → {'возможен флэт или ложный пробой' if adx < 20 else 'тренд может быть сильным'}\n"
+                            f"- Объемы: {'ниже среднего' if (bull_volume if signal_type == 'LONG' else bear_volume) < volume_mean else 'выше среднего'}"
+                        )
+                        await self.broadcast_message(message)
+                        logger.info(f"Sent {signal_type} signal for {symbol}: Probability={signal_proba:.4f}, RR1={rr1:.1f}")
         except Exception as e:
             logger.error(f"Error in check_signal for {symbol}: {e}")
             await self.notify_admin(f"Ошибка обработки {symbol}: {e}")
@@ -541,31 +410,15 @@ class TradingBot:
     async def check_signals(self, context: ContextTypes.DEFAULT_TYPE):
         """Периодическая проверка сигналов"""
         logger.info("Checking signals for all symbols")
-        self.active_symbols = await self.check_symbol_availability()
-        if not self.active_symbols:
+        active_symbols = await self.check_symbol_availability()
+        if not active_symbols:
             error_msg = "❌ Нет доступных символов для торговли"
             logger.error(error_msg)
             await self.notify_admin(error_msg)
             return
         
-        for symbol in self.active_symbols:
+        for symbol in active_symbols:
             await self.check_signal(symbol)
-        
-        # Отправка статуса
-        metrics = self.calculate_metrics()
-        status_msg = (
-            f"🔄 **Обновление статуса**\n\n"
-            f"💰 **Баланс:** {self.balance:.2f} USDT\n"
-            f"📊 **Эквити:** {self.equity[-1]:.2f} USDT\n"
-            f"📈 **Прибыль:** ${metrics['profit']:.2f} ({metrics['profit_pct']:.2f}%)\n"
-            f"🎯 **Винрейт:** {metrics['win_rate']:.1%}\n"
-            f"📉 **Макс. просадка:** {metrics['max_drawdown']:.1%}\n"
-            f"⚖️ **Шарп:** {metrics['sharpe_ratio']:.2f}\n"
-            f"🔢 **Сделок:** {metrics['num_trades']}\n"
-            f"📈 **Активные позиции:** {sum(1 for pos in self.positions.values() if pos['amount'] > 0)}\n"
-            f"🕒 **Время:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} (UTC)"
-        )
-        await self.broadcast_message(status_msg)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
@@ -578,8 +431,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         "🚀 Добро пожаловать в торговый бот!\n\n"
-        "Вы будете получать сигналы и обновления по торговле.\n"
-        "Используйте /status для текущего статуса.",
+        "Вы будете получать сигналы по торговле.\n"
+        "Используйте /status для проверки статуса.",
         parse_mode='Markdown'
     )
 
@@ -588,17 +441,11 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     logger.info(f"Status command from user {user_id}")
     
-    metrics = trading_bot.calculate_metrics()
     status_msg = (
-        f"📊 **Текущий статус**\n\n"
-        f"💰 **Баланс:** {trading_bot.balance:.2f} USDT\n"
-        f"📈 **Эквити:** {trading_bot.equity[-1]:.2f} USDT\n"
-        f"📊 **Прибыль:** ${metrics['profit']:.2f} ({metrics['profit_pct']:.2f}%)\n"
-        f"🎯 **Винрейт:** {metrics['win_rate']:.1%}\n"
-        f"📉 **Макс. просадка:** {metrics['max_drawdown']:.1%}\n"
-        f"⚖️ **Шарп:** {metrics['sharpe_ratio']:.2f}\n"
-        f"🔢 **Сделок:** {metrics['num_trades']}\n"
-        f"🕒 **Время:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} (UTC)"
+        f"📊 **Статус бота**\n\n"
+        f"🔄 Бот активен, проверка сигналов каждые 15 минут\n"
+        f"📈 Активные символы: {', '.join(SYMBOLS)}\n"
+        f"🕒 Последнее обновление: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} (UTC)"
     )
     await update.message.reply_text(status_msg, parse_mode='Markdown')
 
