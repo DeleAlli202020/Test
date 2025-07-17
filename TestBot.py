@@ -204,12 +204,12 @@ class TradingBot:
             df['super_trend_lower'] = hl2 - (3 * atr)
             df['super_trend'] = 1  # 1 для бычьего, -1 для медвежьего
             for i in range(1, len(df)):
-                if df['close'].iloc[i-1] > df['super_trend_upper'].iloc[i-1]:
-                    df['super_trend'].iloc[i] = 1
-                elif df['close'].iloc[i-1] < df['super_trend_lower'].iloc[i-1]:
-                    df['super_trend'].iloc[i] = -1
+                if df['close'].loc[i-1] > df['super_trend_upper'].loc[i-1]:
+                    df['super_trend'].loc[i] = 1
+                elif df['close'].loc[i-1] < df['super_trend_lower'].loc[i-1]:
+                    df['super_trend'].loc[i] = -1
                 else:
-                    df['super_trend'].iloc[i] = df['super_trend'].iloc[i-1]
+                    df['super_trend'].loc[i] = df['super_trend'].loc[i-1]
             
             # VWAP Angle (упрощенная реализация)
             df['vwap_angle'] = df['vwap'].diff(5) / 5 * 100
@@ -241,8 +241,8 @@ class TradingBot:
             # Подготовка данных для моделей
             df_long = self.calculate_indicators(df, is_short=False)
             df_short = self.calculate_indicators(df, is_short=True)
-            current_price = df['price'].iloc[-1]
-            atr = df['atr'].iloc[-1]
+            current_price = df['price'].loc[-1]
+            atr = df['atr'].loc[-1]
 
             # Проверка LONG сигнала
             long_signal = await self.check_long_signal(df_long, symbol)
@@ -283,13 +283,13 @@ class TradingBot:
                 return None
 
             # Фильтрация по условиям LONG
-            last_row = df.iloc[-1]
+            last_row = df.loc[-1]
             valid_signal = (
                 (25 <= last_row['rsi'] <= 75) &
                 (last_row['macd'] > -0.5) &
                 (last_row['adx'] > 15) &
                 ((last_row['ema_cross'] == 1) | (last_row['volume_spike'] == 1)) &
-                (last_row['bull_volume'] > df['volume'].rolling(20).mean().iloc[-1]))
+                (last_row['bull_volume'] > df['volume'].rolling(20).mean().loc[-1]))
             
             if not valid_signal:
                 return None
@@ -334,13 +334,13 @@ class TradingBot:
                 return None
 
             # Фильтрация по условиям SHORT
-            last_row = df.iloc[-1]
+            last_row = df.loc[-1]
             valid_signal = (
                 (last_row['rsi'] >= 60) &
                 (last_row['macd'] < 0) &
                 (last_row['adx'] > 15) &
                 ((last_row['ema_cross'] == 1) | (last_row['volume_spike'] == 1)) &
-                (last_row['bear_volume'] > df['volume'].rolling(20).mean().iloc[-1]))
+                (last_row['bear_volume'] > df['volume'].rolling(20).mean().loc[-1]))
             
             if not valid_signal:
                 return None
@@ -412,7 +412,7 @@ class TradingBot:
             features['sentiment'] = df['sentiment'].fillna(50)
             features['smart_money_score'] = df['smart_money_score'].fillna(50)
             
-            return features.iloc[-1:].replace([np.inf, -np.inf], np.nan).fillna(0)
+            return features.loc[-1:].replace([np.inf, -np.inf], np.nan).fillna(0)
         except Exception as e:
             logger.error(f"Error preparing features: {e}")
             return pd.DataFrame()
