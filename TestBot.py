@@ -10,12 +10,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 import ccxt.async_support as ccxt
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, ADXIndicator
-from ta.volatility import AverageTrueRange
+from ta.volatility import AverageTrueRange, BollingerBands
 import sys
 from dotenv import load_dotenv
 import json
 import nest_asyncio
-from ta.volatility import BollingerBands
+from typing import Optional, Dict, Any
 
 nest_asyncio.apply()
 
@@ -49,21 +49,59 @@ class TradingBot:
     def __init__(self):
         self.subscribed_users = set(self.load_allowed_users())
         self.exchange = self.init_exchange()
-        self.long_model, self.long_scaler, self.short_model, self.short_scaler = self.load_models()
+        self.long_model_data = self.load_model_data(MODEL_PATH_LONG)
+        self.short_model_data = self.load_model_data(MODEL_PATH_SHORT)
+        self.bot = None
 
     @staticmethod
-    def validate_data(df):
-        """Проверка качества данных"""
+    def load_model_data(model_path: str) -> Optional[Dict[str, Any]]:
+        """Загрузка данных модели с обработкой ошибок"""
+        try:
+            if not os.path.exists(model_path):
+                logger.error(f"Model file not found: {model_path}")
+                return None
+            
+            model_data = joblib.load(model_path)
+            if not all(key in model_data for key in ['models', 'scalers', 'active_features']):
+                logger.error(f"Invalid model data structure in {model_path}")
+                return None
+                
+            logger.info(f"Successfully loaded model data from {model_path}")
+            return model_data
+        except Exception as e:
+            logger.error(f"Failed to load model data from {model_path}: {e}")
+            return None
+
+    @staticmethod
+    def validate_data(df: pd.DataFrame) -> bool:
+        """Комплексная проверка качества данных"""
         if df.empty:
+            logger.warning("Empty DataFrame")
             return False
+            
+        required_columns = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required_columns):
+            logger.warning(f"Missing required columns: {required_columns}")
+            return False
+            
         if len(df) < 20:
+            logger.warning(f"Insufficient data length: {len(df)}")
             return False
+            
         if df['close'].isnull().any() or (df['close'] <= 0).any():
+            logger.warning("Invalid close prices (NaN or <= 0)")
             return False
-        if df['volume'].isnull().any() or (df['volume'] < 0).any():
+            
+        if (df['high'] < df['low']).any():
+            logger.warning("High prices lower than low prices")
             return False
+            
+        if (df['volume'] < 0).any():
+            logger.warning("Negative volume values")
+            return False
+            
         return True
-        
+
     def init_exchange(self):
         """Инициализация биржи"""
         try:
@@ -135,36 +173,19 @@ class TradingBot:
                 logger.error(f"Unexpected error checking {symbol}: {e}")
         return available_symbols
 
-    def load_models(self):
-        """Загрузка моделей и скейлеров"""
-        try:
-            long_data = joblib.load(MODEL_PATH_LONG)
-            short_data = joblib.load(MODEL_PATH_SHORT)
-            
-            long_model = long_data['models'].get('combined')
-            long_scaler = long_data['scalers'].get('combined')
-            short_model = short_data['models'].get('combined')
-            short_scaler = short_data['scalers'].get('combined')
-            
-            logger.info("Models and scalers loaded successfully")
-            return long_model, long_scaler, short_model, short_scaler
-        except Exception as e:
-            logger.error(f"Failed to load models: {e}")
-            raise
-
-    async def fetch_ohlcv_data(self, symbol, limit=200):
+    async def fetch_ohlcv_data(self, symbol: str, limit: int = 200) -> pd.DataFrame:
         """Получение данных с обработкой ошибок"""
         for attempt in range(3):
             try:
                 ohlcv = await self.exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=limit)
                 if not ohlcv:
+                    logger.warning(f"No OHLCV data received for {symbol} on attempt {attempt+1}")
                     continue
                     
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                 df['price'] = df['close'].astype(float)
                 
-                # Проверка качества данных
                 if not TradingBot.validate_data(df):
                     logger.warning(f"Invalid data for {symbol} on attempt {attempt+1}")
                     continue
@@ -178,8 +199,7 @@ class TradingBot:
         logger.error(f"All attempts failed for {symbol}")
         return pd.DataFrame()
 
-    # В методе calculate_indicators (для обоих файлов):
-    def calculate_adx(self, high, low, close, window=14):
+    def calculate_adx(self, high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14):
         """Надежный расчет ADX с обработкой ошибок"""
         try:
             # Расчет True Range
@@ -221,7 +241,7 @@ class TradingBot:
             logger.error(f"Error in ADX calculation: {e}")
             return pd.Series(0, index=high.index), pd.Series(0, index=high.index), pd.Series(0, index=high.index)
 
-    def calculate_indicators(self, df, is_short=False):
+    def calculate_indicators(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
         """Расчет индикаторов для модели"""
         try:
             # Базовые индикаторы (общие для обеих моделей)
@@ -259,7 +279,7 @@ class TradingBot:
             df['bb_lower'] = bb.bollinger_lband().fillna(0)
             df['bb_width'] = bb.bollinger_wband().fillna(0)
             
-            # SuperTrend (исправленная версия)
+            # SuperTrend
             atr = df['atr']
             hl2 = (df['high'] + df['low']) / 2
             df['super_trend_upper'] = hl2 + (3 * atr)
@@ -275,29 +295,19 @@ class TradingBot:
                 else:
                     df.loc[i, 'super_trend'] = df.loc[prev_i, 'super_trend']
             
-            # Добавление недостающих фичей
+            # Дополнительные фичи
             df['vwap_angle'] = df['vwap'].diff(5) / 5 * 100
             df['smart_money_score'] = (df['rsi'] * 0.4 + (100 - df['rsi']) * 0.3 + df['adx'] * 0.3).clip(0, 100)
             df['sentiment'] = 50  # Заглушка
             df['price_to_resistance'] = ((df['price'] - df['resistance']) / df['price']) * 100
             df['atr_change'] = df['atr'].pct_change() * 100
             
-            # Убедимся, что все фичи присутствуют
-            required_features = [
-                'price_change_1h', 'price_change_2h', 'price_change_6h', 'price_change_12h',
-                'volume_score', 'volume_change', 'atr_normalized', 'obv',
-                'bb_upper', 'bb_lower', 'bb_width', 'support_level', 'resistance_level'
-            ]
-            
-            for feat in required_features:
+            # Заполнение недостающих фичей
+            model_features = self.get_model_features(is_short)
+            for feat in model_features:
                 if feat not in df.columns:
-                    df[feat] = 0  # Заполняем нулями если фича отсутствует
-                    
-            # Переименуем колонки для совместимости
-            df = df.rename(columns={
-                'support': 'support_level',
-                'resistance': 'resistance_level'
-            })
+                    df[feat] = 0
+                    logger.warning(f"Missing feature {feat}, filled with 0")
             
             return df.replace([np.inf, -np.inf], np.nan).fillna(0)
         
@@ -305,171 +315,31 @@ class TradingBot:
             logger.error(f"Error calculating indicators: {e}")
             return df
 
-    async def check_signal(self, symbol):
-        """Проверка сигналов для символа"""
-        try:
-            df = await self.fetch_ohlcv_data(symbol)
-            if df.empty:
-                return
+    def get_model_features(self, is_short: bool) -> list:
+        """Получение списка фичей для соответствующей модели"""
+        model_data = self.short_model_data if is_short else self.long_model_data
+        if model_data and 'active_features' in model_data:
+            if 'combined' in model_data['active_features']:
+                return model_data['active_features']['combined']
+            elif model_data['active_features']:
+                return next(iter(model_data['active_features'].values()))
+        return []
 
-            # Подготовка данных для моделей
-            df_long = self.calculate_indicators(df, is_short=False)
-            df_short = self.calculate_indicators(df, is_short=True)
-            current_price = df['price'].loc[-1]
-            atr = df['atr'].loc[-1]
-
-            # Проверка LONG сигнала
-            long_signal = await self.check_long_signal(df_long, symbol)
-            
-            # Проверка SHORT сигнала
-            short_signal = await self.check_short_signal(df_short, symbol)
-
-            # Определение лучшего сигнала (если есть оба, выбираем с большей вероятностью)
-            best_signal = None
-            if long_signal and short_signal:
-                if long_signal['probability'] > short_signal['probability']:
-                    best_signal = long_signal
-                else:
-                    best_signal = short_signal
-            elif long_signal:
-                best_signal = long_signal
-            elif short_signal:
-                best_signal = short_signal
-
-            if best_signal:
-                await self.send_signal_message(symbol, best_signal, current_price, atr, df)
-                
-        except Exception as e:
-            logger.error(f"Error checking signal for {symbol}: {e}")
-
-    async def check_long_signal(self, df, symbol):
-        """Проверка LONG сигнала"""
-        try:
-            if self.long_model is None:
-                    return None
-            
-            # Проверка наличия всех фичей
-            required_features = set(self.long_model.feature_names_in_)
-            available_features = set(df.columns)
-            missing_features = required_features - available_features
-            if missing_features:
-                logger.error(f"Missing features for LONG {symbol}: {missing_features}")
-                return None
-
-            # Фильтрация по условиям LONG
-            last_row = df.loc[-1]
-            valid_signal = (
-                (25 <= last_row['rsi'] <= 75) &
-                (last_row['macd'] > -0.5) &
-                (last_row['adx'] > 15) &
-                ((last_row['ema_cross'] == 1) | (last_row['volume_spike'] == 1)) &
-                (last_row['bull_volume'] > df['volume'].rolling(20).mean().loc[-1]))
-            
-            if not valid_signal:
-                return None
-
-            # Подготовка фичей и предсказание
-            features = self.prepare_features(df, is_short=False)
-            if features.empty:
-                return None
-
-            features_scaled = self.long_scaler.transform(features)
-            proba = self.long_model.predict_proba(features_scaled)[0][1]
-            threshold = 0.316 if symbol in LOW_RECALL_SYMBOLS else 0.35
-
-            if proba > threshold:
-                return {
-                    'type': 'LONG',
-                    'probability': proba,
-                    'rsi': last_row['rsi'],
-                    'macd': last_row['macd'],
-                    'adx': last_row['adx'],
-                    'atr': last_row['atr'],
-                    'support': last_row['support'],
-                    'resistance': last_row['resistance']
-                }
-            return None
-        except Exception as e:
-            logger.error(f"Error checking LONG signal for {symbol}: {e}")
-            return None
-
-    async def check_short_signal(self, df, symbol):
-        """Проверка SHORT сигнала"""
-        try:
-            if self.short_model is None:
-                    return None
-            
-            # Проверка наличия всех фичей
-            required_features = set(self.short_model.feature_names_in_)
-            available_features = set(df.columns)
-            missing_features = required_features - available_features
-            if missing_features:
-                logger.error(f"Missing features for LONG {symbol}: {missing_features}")
-                return None
-
-            # Фильтрация по условиям SHORT
-            last_row = df.loc[-1]
-            valid_signal = (
-                (last_row['rsi'] >= 60) &
-                (last_row['macd'] < 0) &
-                (last_row['adx'] > 15) &
-                ((last_row['ema_cross'] == 1) | (last_row['volume_spike'] == 1)) &
-                (last_row['bear_volume'] > df['volume'].rolling(20).mean().loc[-1]))
-            
-            if not valid_signal:
-                return None
-
-            # Подготовка фичей и предсказание
-            features = self.prepare_features(df, is_short=True)
-            if features.empty:
-                return None
-
-            features_scaled = self.short_scaler.transform(features)
-            proba = self.short_model.predict_proba(features_scaled)[0][1]
-            threshold = 0.4 if symbol in LOW_RECALL_SYMBOLS else 0.5
-
-            if proba > threshold:
-                return {
-                    'type': 'SHORT',
-                    'probability': proba,
-                    'rsi': last_row['rsi'],
-                    'macd': last_row['macd'],
-                    'adx': last_row['adx'],
-                    'atr': last_row['atr'],
-                    'support': last_row['support'],
-                    'resistance': last_row['resistance']
-                }
-            return None
-        except Exception as e:
-            logger.error(f"Error checking SHORT signal for {symbol}: {e}")
-            return None
-
-    def prepare_features(self, df, is_short=False):
+    def prepare_features(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
         """Подготовка фичей для модели"""
         try:
+            model_features = self.get_model_features(is_short)
+            if not model_features:
+                logger.error("No model features available")
+                return pd.DataFrame()
+            
             features = pd.DataFrame(index=df.index)
-            
-            # Общие фичи для обеих моделей
-            common_features = [
-                'price_change_1h', 'price_change_2h', 'price_change_6h', 'price_change_12h',
-                'volume_score', 'volume_change', 'atr_normalized', 'rsi', 'macd',
-                'adx', 'ema_cross', 'volume_spike', 'super_trend', 'vwap_signal',
-                'vwap_angle', 'bb_upper', 'bb_lower', 'bb_width', 'support_level',
-                'resistance_level', 'price_to_resistance', 'atr_change'
-            ]
-            
-            for feat in common_features:
+            for feat in model_features:
                 if feat in df.columns:
                     features[feat] = df[feat].fillna(0)
                 else:
-                    features[feat] = 0  # Заполняем нулями если фича отсутствует
-                    logger.warning(f"Missing feature {feat}, filling with zeros")
-            
-            # Специфичные фичи
-            if is_short:
-                features['bear_volume'] = df['bear_volume'].fillna(0)
-            else:
-                features['bull_volume'] = df['bull_volume'].fillna(0)
+                    features[feat] = 0
+                    logger.warning(f"Feature {feat} not found in DataFrame, filled with 0")
             
             return features.loc[-1:].replace([np.inf, -np.inf], np.nan).fillna(0)
         
@@ -477,9 +347,126 @@ class TradingBot:
             logger.error(f"Error preparing features: {e}")
             return pd.DataFrame()
 
-    async def send_signal_message(self, symbol, signal, current_price, atr, df):
+    async def check_signal(self, symbol: str):
+        """Проверка сигналов с улучшенной обработкой ошибок"""
+        try:
+            # Получаем данные
+            df = await self.fetch_ohlcv_data(symbol, limit=100)
+            
+            # Валидация данных
+            if len(df) < 50:
+                logger.warning(f"Not enough data for {symbol} ({len(df)} candles)")
+                return None
+                
+            if not TradingBot.validate_data(df):
+                logger.warning(f"Invalid data for {symbol}")
+                return None
+            
+            # Расчёт индикаторов
+            df_long = self.calculate_indicators(df, is_short=False)
+            df_short = self.calculate_indicators(df, is_short=True)
+            
+            if df_long.empty or df_short.empty:
+                logger.error(f"Empty DataFrame after indicators calculation for {symbol}")
+                return None
+            
+            # Проверка сигналов
+            long_signal = await self.check_model_signal(df_long, symbol, is_short=False)
+            short_signal = await self.check_model_signal(df_short, symbol, is_short=True)
+            
+            # Возвращаем первый найденный сигнал (лонг имеет приоритет)
+            if long_signal:
+                return long_signal
+            elif short_signal:
+                return short_signal
+            return None
+                
+        except Exception as e:
+            logger.error(f"Error checking signal for {symbol}: {e}")
+            return None
+
+    async def check_model_signal(self, df: pd.DataFrame, symbol: str, is_short: bool) -> Optional[Dict[str, Any]]:
+        """Проверка сигнала для конкретной модели"""
+        try:
+            model_data = self.short_model_data if is_short else self.long_model_data
+            if not model_data:
+                logger.warning(f"No model data available for {'SHORT' if is_short else 'LONG'}")
+                return None
+            
+            model = model_data['models'].get('combined')
+            scaler = model_data['scalers'].get('combined')
+            
+            if model is None or scaler is None:
+                logger.warning(f"Model or scaler not found for {'SHORT' if is_short else 'LONG'}")
+                return None
+            
+            # Подготовка фичей
+            features = self.prepare_features(df, is_short)
+            if features.empty:
+                logger.warning(f"Empty features for {'SHORT' if is_short else 'LONG'} {symbol}")
+                return None
+            
+            # Масштабирование фичей
+            try:
+                features_scaled = scaler.transform(features)
+            except Exception as e:
+                logger.error(f"Feature scaling failed for {'SHORT' if is_short else 'LONG'} {symbol}: {e}")
+                return None
+            
+            # Предсказание
+            try:
+                proba = model.predict_proba(features_scaled)[0][1]
+            except Exception as e:
+                logger.error(f"Prediction failed for {'SHORT' if is_short else 'LONG'} {symbol}: {e}")
+                return None
+            
+            # Проверка условий сигнала
+            last_row = df.iloc[-1]
+            threshold = 0.4 if is_short else 0.35
+            if symbol in LOW_RECALL_SYMBOLS:
+                threshold = 0.5 if is_short else 0.316
+            
+            if is_short:
+                valid_signal = (
+                    (last_row['rsi'] >= 60) &
+                    (last_row['macd'] < 0) &
+                    (last_row['adx'] > 15) &
+                    ((last_row['ema_cross'] == 1) | (last_row['volume_spike'] == 1)) &
+                    (last_row['bear_volume'] > df['volume'].rolling(20).mean().iloc[-1])
+                )
+            else:
+                valid_signal = (
+                    (25 <= last_row['rsi'] <= 75) &
+                    (last_row['macd'] > -0.5) &
+                    (last_row['adx'] > 15) &
+                    ((last_row['ema_cross'] == 1) | (last_row['volume_spike'] == 1)) &
+                    (last_row['bull_volume'] > df['volume'].rolling(20).mean().iloc[-1])
+                )
+            
+            if proba > threshold and valid_signal:
+                return {
+                    'type': 'SHORT' if is_short else 'LONG',
+                    'probability': proba,
+                    'rsi': last_row['rsi'],
+                    'macd': last_row['macd'],
+                    'adx': last_row['adx'],
+                    'atr': last_row['atr'],
+                    'support': last_row['support'],
+                    'resistance': last_row['resistance'],
+                    'model_evaluated': True
+                }
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error in check_model_signal for {'SHORT' if is_short else 'LONG'} {symbol}: {e}")
+            return None
+
+    async def send_signal_message(self, symbol: str, signal: Dict[str, Any], df: pd.DataFrame):
         """Отправка сообщения о сигнале"""
         try:
+            current_price = df['price'].iloc[-1]
+            atr = signal['atr']
+            
             # Расчет уровней TP/SL с Risk/Reward >= 3
             if signal['type'] == 'LONG':
                 sl = current_price - atr * 1.5
@@ -543,8 +530,8 @@ class TradingBot:
                 f"- SL: {sl:.4f}\n\n"
                 
                 f"#### ⚠️ Риски:\n"
-            
             )
+            
             # Добавление предупреждений о рисках
             if signal['adx'] < 25:
                 message += "- Слабый тренд → возможны ложные пробои\n"
@@ -555,14 +542,20 @@ class TradingBot:
             if atr < current_price * 0.01:
                 message += "- Низкая волатильность → малый потенциал движения\n"
             
+            # Добавляем пометку о том, оценивала ли модель сделку
+            if not signal.get('model_evaluated', True):
+                message += "\n⚠️ **Внимание**: Эта сделка не была оценена моделью из-за технических проблем. " \
+                          "Используйте дополнительные методы анализа перед входом в сделку.\n"
+            
             await self.broadcast_message(message)
             logger.info(f"Sent {signal['type']} signal for {symbol}")
         except Exception as e:
             logger.error(f"Error sending signal message: {e}")
 
-    async def broadcast_message(self, message):
+    async def broadcast_message(self, message: str):
         """Отправка сообщения подписчикам"""
-        if not hasattr(self, 'bot'):
+        if not hasattr(self, 'bot') or not self.bot:
+            logger.error("Bot instance not available for broadcasting")
             return
             
         for user_id in self.subscribed_users:
@@ -592,10 +585,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /status"""
+    long_loaded = trading_bot.long_model_data is not None
+    short_loaded = trading_bot.short_model_data is not None
+    
     status_msg = (
         "🤖 **Bot Status**\n\n"
         f"🔄 Active symbols: {len(SYMBOLS)}\n"
-        f"📊 Models loaded: {'✅' if trading_bot.long_model and trading_bot.short_model else '❌'}\n"
+        f"📊 LONG model loaded: {'✅' if long_loaded else '❌'}\n"
+        f"📊 SHORT model loaded: {'✅' if short_loaded else '❌'}\n"
         f"👥 Subscribers: {len(trading_bot.subscribed_users)}\n"
         f"🕒 Last update: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
@@ -605,7 +602,14 @@ async def check_all_symbols(context: ContextTypes.DEFAULT_TYPE):
     """Проверка всех символов на сигналы"""
     logger.info("Starting periodic check for all symbols")
     for symbol in SYMBOLS:
-        await trading_bot.check_signal(symbol)
+        try:
+            signal = await trading_bot.check_signal(symbol)
+            if signal:
+                df = await trading_bot.fetch_ohlcv_data(symbol, limit=100)
+                if not df.empty:
+                    await trading_bot.send_signal_message(symbol, signal, df)
+        except Exception as e:
+            logger.error(f"Error processing symbol {symbol}: {e}")
     logger.info("Completed periodic check for all symbols")
 
 async def main():
