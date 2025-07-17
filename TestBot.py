@@ -90,7 +90,7 @@ class TradingBot:
             logger.warning(f"Missing required columns: {required_columns}")
             return False
             
-        if len(df) < 20:
+        if len(df) < 100:
             logger.warning(f"Insufficient data length: {len(df)}")
             return False
             
@@ -284,6 +284,9 @@ class TradingBot:
             
     def calculate_additional_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Расчет всех дополнительных фичей с проверкой данных"""
+        if 'atr' not in df.columns:
+            logger.error("ATR не рассчитан! Сначала вызовите calculate_indicators")
+            return pd.DataFrame()
         try:
             if len(df) < 48:
                 logger.warning("Not enough data for full feature calculation")
@@ -295,10 +298,17 @@ class TradingBot:
             # Расчет всех фичей с проверкой на достаточность данных
             try:
                 # Price changes
-                df['price_change_1h'] = df['price'].pct_change(4).fillna(0) * 100 if len(df) > 4 else 0
-                df['price_change_2h'] = df['price'].pct_change(8).fillna(0) * 100 if len(df) > 8 else 0
-                df['price_change_6h'] = df['price'].pct_change(24).fillna(0) * 100 if len(df) > 24 else 0
-                df['price_change_12h'] = df['price'].pct_change(48).fillna(0) * 100 if len(df) > 48 else 0
+                changes = {
+                    '1h': 4,
+                    '2h': 8, 
+                    '6h': 24,
+                    '12h': 48
+                }
+                for tf, period in changes.items():
+                    if len(df) > period:
+                        df[f'price_change_{tf}'] = df['price'].pct_change(period) * 100
+                    else:
+                        df[f'price_change_{tf}'] = np.nan  # Лучше NaN чем 0!
                 
                 # Volume metrics
                 if len(df) >= 6:
@@ -347,7 +357,12 @@ class TradingBot:
             df['macd_diff'] = macd.macd_diff().fillna(0)
             
             df['adx'], df['dip'], df['din'] = self.calculate_adx(df['high'], df['low'], df['close'])
-            df['atr'] = AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range().fillna(0)
+            df['atr'] = AverageTrueRange(
+                high=df['high'],
+                low=df['low'],
+                close=df['close'],
+                window=14
+            ).average_true_range()
             
             # EMA Cross (разные для лонг/шорт)
             df['ema_20'] = df['price'].ewm(span=20, adjust=False).mean()
