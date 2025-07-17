@@ -51,6 +51,7 @@ class TradingBot:
         self.exchange = self.init_exchange()
         self.long_model, self.long_scaler, self.short_model, self.short_scaler = self.load_models()
 
+    @staticmethod
     def validate_data(df):
         """Проверка качества данных"""
         if df.empty:
@@ -164,7 +165,7 @@ class TradingBot:
                 df['price'] = df['close'].astype(float)
                 
                 # Проверка качества данных
-                if not self.validate_data(df):
+                if not TradingBot.validate_data(df):
                     logger.warning(f"Invalid data for {symbol} on attempt {attempt+1}")
                     continue
                     
