@@ -248,22 +248,31 @@ class TradingBot:
             logger.error(f"Error in ADX calculation: {e}")
             return pd.Series(0, index=high.index), pd.Series(0, index=high.index), pd.Series(0, index=high.index)
         
+    def init_feature_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Инициализирует все необходимые колонки фичей"""
+        required_features = [
+            'price_change_1h', 'price_change_2h', 'price_change_6h', 'price_change_12h',
+            'volume_score', 'volume_change', 'atr_normalized', 'obv',
+            'support_level', 'resistance_level'
+        ]
+        
+        for feature in required_features:
+            if feature not in df.columns:
+                df[feature] = 0.0
+                
+        return df
+            
     def calculate_additional_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Расчет всех необходимых фичей"""
+        """Расчет всех необходимых фичей с полной инициализацией"""
         try:
+            # Инициализируем все колонки
+            df = self.init_feature_columns(df.copy())
+            
             if len(df) < 48:
                 logger.warning("Not enough data for feature calculation")
-                return pd.DataFrame()
-
-            df = df.copy()
-            
-            # Рассчитываем базовые индикаторы если они ещё не рассчитаны
-            if 'atr' not in df.columns:
-                df = self.calculate_indicators(df)
-                if df.empty:
-                    return pd.DataFrame()
-            
-            # Расчет изменений цены (убедимся, что есть достаточно данных)
+                return df
+                
+            # Расчет изменений цены
             periods = {
                 'price_change_1h': 4,
                 'price_change_2h': 8,
@@ -272,38 +281,36 @@ class TradingBot:
             }
             
             for name, period in periods.items():
-                if len(df) >= period:
+                if len(df) > period:
                     df[name] = df['price'].pct_change(period).fillna(0) * 100
                 else:
-                    df[name] = 0
+                    df[name] = 0.0
             
             # Объемные показатели
             if len(df) >= 6:
-                df['volume_score'] = df['volume'] / df['volume'].rolling(6).mean().replace(0, 1) * 100
+                vol_mean = df['volume'].rolling(6).mean().replace(0, 1)
+                df['volume_score'] = (df['volume'] / vol_mean * 100).fillna(0)
                 df['volume_change'] = df['volume'].pct_change().fillna(0) * 100
-            else:
-                df['volume_score'] = 0
-                df['volume_change'] = 0
             
-            # Нормализованный ATR
-            df['atr_normalized'] = df['atr'] / df['price'].replace(0, 1) * 100
+            # Нормализованный ATR (убедитесь, что atr уже рассчитан)
+            if 'atr' in df.columns:
+                df['atr_normalized'] = (df['atr'] / df['price'].replace(0, 1)) * 100
             
             # On-Balance Volume
-            df['obv'] = (np.sign(df['price'].diff()) * df['volume']).cumsum().fillna(0)
+            price_diff = df['price'].diff().fillna(0)
+            df['obv'] = (np.sign(price_diff) * df['volume']).cumsum()
             
             # Уровни поддержки/сопротивления
             if len(df) >= 20:
                 df['support_level'] = df['low'].rolling(20).min().fillna(df['low'].min())
                 df['resistance_level'] = df['high'].rolling(20).max().fillna(df['high'].max())
-            else:
-                df['support_level'] = df['low'].min()
-                df['resistance_level'] = df['high'].max()
             
             return df.replace([np.inf, -np.inf], 0)
             
         except Exception as e:
             logger.error(f"Error calculating features: {e}")
-            return pd.DataFrame()
+            return self.init_feature_columns(df.copy())
+
     def calculate_indicators(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
         """Расчет индикаторов для модели"""
         try:
@@ -389,9 +396,9 @@ class TradingBot:
         return []
 
     def prepare_features(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
-        """Подготовка фичей с проверкой наличия всех необходимых"""
+        """Подготовка фичей с гарантией правильного порядка"""
         try:
-            # Получаем список требуемых фичей в правильном порядке
+            # Получаем список требуемых фичей
             required_features = self.get_model_features(is_short)
             if not required_features:
                 logger.error("No features list available")
@@ -407,20 +414,20 @@ class TradingBot:
             if df.empty:
                 return pd.DataFrame()
             
-            # Проверяем наличие всех фичей и заполняем недостающие нулями
-            missing = [f for f in required_features if f not in df.columns]
-            if missing:
-                logger.warning(f"Missing features: {missing}, filling with 0")
-                for f in missing:
-                    df[f] = 0
+            # Создаем DataFrame с правильными feature names
+            features = pd.DataFrame(index=[0])
             
-            # Убедимся, что порядок фичей соответствует ожидаемому моделью
-            features = df[required_features].iloc[-1:]
+            for feature in required_features:
+                if feature in df.columns:
+                    features[feature] = [df[feature].iloc[-1]]
+                else:
+                    logger.warning(f"Feature {feature} not found, filling with 0")
+                    features[feature] = [0.0]
             
-            # Создаем DataFrame с явно указанными feature names
-            features_df = pd.DataFrame(features.values, columns=required_features)
+            # Убедимся, что порядок колонок соответствует expected
+            features = features[required_features]
             
-            return features_df.replace([np.inf, -np.inf], 0)
+            return features.replace([np.inf, -np.inf], 0)
             
         except Exception as e:
             logger.error(f"Error preparing features: {e}")
@@ -471,8 +478,12 @@ class TradingBot:
                 
             try:
                 # Получаем feature names из scaler или модели
-                feature_names = getattr(scaler, 'feature_names_in_', 
-                                    getattr(model, 'feature_name_', None))
+                # Получаем feature names из scaler или модели
+                feature_names = (
+                    scaler.feature_names_in_ 
+                    if hasattr(scaler, 'feature_names_in_') 
+                    else getattr(model, 'feature_name_', None)
+                )
                 
                 # Преобразуем данные с учетом feature names
                 if feature_names is not None:
