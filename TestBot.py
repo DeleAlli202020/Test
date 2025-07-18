@@ -581,32 +581,66 @@ class TradingBot:
             }
         
     async def debug_symbol(self, symbol: str):
-        """Выводит полную диагностику по символу"""
-        df = await self.fetch_ohlcv_data(symbol, limit=100)
-        if df.empty:
-            return "Нет данных"
-        
-        df = self.calculate_indicators(df)
-        features = self.prepare_features(df)
-        
-        analysis = f"""
-        Анализ {symbol}:
-        - Последняя цена: {df['close'].iloc[-1]}
-        - RSI: {df['rsi'].iloc[-1]:.1f}
-        - MACD: {df['macd'].iloc[-1]:.4f}
-        - ADX: {df['adx'].iloc[-1]:.1f}
-        - ATR: {df['atr'].iloc[-1]:.2f}
-        - Объём: {df['volume'].iloc[-1]:.2f}
-        """
-        
-        if not features.empty:
-            analysis += "\nВероятность LONG: {:.1%}".format(
-                self.long_model_data['models']['combined'].predict_proba(
-                    self.long_model_data['scalers']['combined'].transform(features)
+        """Выводит полную диагностику по символу с анализом LONG/SHORT сигналов"""
+        try:
+            # Получаем и проверяем данные
+            df = await self.fetch_ohlcv_data(symbol, limit=100)
+            if df.empty:
+                return "❌ Нет данных для анализа"
+            
+            if not self.validate_data(df):
+                return "⚠️ Данные не прошли валидацию"
+
+            # Рассчитываем индикаторы
+            df = self.calculate_indicators(df)
+            
+            # Подготавливаем фичи
+            long_features = self.prepare_features(df, is_short=False)
+            short_features = self.prepare_features(df, is_short=True)
+            
+            # Базовый анализ
+            analysis = [
+                f"📊 Анализ {symbol} ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
+                f"💰 Цена: {df['close'].iloc[-1]:.4f}",
+                f"📈 RSI: {df['rsi'].iloc[-1]:.1f}",
+                f"📉 MACD: {df['macd'].iloc[-1]:.4f} (Signal: {df['macd_signal'].iloc[-1]:.4f})",
+                f"🌀 ADX: {df['adx'].iloc[-1]:.1f} (DI+: {df['dip'].iloc[-1]:.1f}, DI-: {df['din'].iloc[-1]:.1f})",
+                f"⚡ ATR: {df['atr'].iloc[-1]:.4f} ({df['atr_normalized'].iloc[-1]:.2f}%)",
+                f"📊 Объем: {df['volume'].iloc[-1]:.2f} (MA20: {df['volume'].rolling(20).mean().iloc[-1]:.2f})",
+                f"🔍 Support: {df['support_level'].iloc[-1]:.4f} | Resistance: {df['resistance_level'].iloc[-1]:.4f}"
+            ]
+
+            # Анализ LONG
+            if not long_features.empty and self.long_model_data:
+                long_prob = self.long_model_data['models']['combined'].predict_proba(
+                    self.long_model_data['scalers']['combined'].transform(long_features)
                 )[0][1]
-            )
-        
-        return analysis
+                analysis.append(f"\n🟢 LONG вероятность: {long_prob:.1%}")
+                analysis.append(f"Порог: {0.35 if symbol not in LOW_RECALL_SYMBOLS else 0.316}")
+                analysis.append(f"Сигнал: {'ДА' if long_prob > (0.35 if symbol not in LOW_RECALL_SYMBOLS else 0.316) else 'нет'}")
+
+            # Анализ SHORT
+            if not short_features.empty and self.short_model_data:
+                short_prob = self.short_model_data['models']['combined'].predict_proba(
+                    self.short_model_data['scalers']['combined'].transform(short_features)
+                )[0][1]
+                analysis.append(f"\n🔴 SHORT вероятность: {short_prob:.1%}")
+                analysis.append(f"Порог: {0.4 if symbol not in LOW_RECALL_SYMBOLS else 0.5}")
+                analysis.append(f"Сигнал: {'ДА' if short_prob > (0.4 if symbol not in LOW_RECALL_SYMBOLS else 0.5) else 'нет'}")
+
+            # Условия входа
+            conditions = [
+                f"\n📌 Условия входа:",
+                f"RSI {'> 70' if df['rsi'].iloc[-1] > 70 else '< 30' if df['rsi'].iloc[-1] < 30 else 'нейтральный'}",
+                f"MACD {'выше сигнала' if df['macd'].iloc[-1] > df['macd_signal'].iloc[-1] else 'ниже'}",
+                f"Тренд: {'сильный' if df['adx'].iloc[-1] > 25 else 'слабый'}"
+            ]
+            
+            return "\n".join(analysis + conditions)
+            
+        except Exception as e:
+            logger.error(f"Debug error: {e}")
+            return f"⚠️ Ошибка анализа: {str(e)}"
 
     async def send_signal_message(self, symbol: str, signal: Dict[str, Any], df: pd.DataFrame):
         """Отправка сообщения о сигнале"""
