@@ -564,6 +564,49 @@ class TradingBot:
         except Exception as e:
                 logger.error(f"Prediction failed for {symbol}: {e}")
                 return None
+        # Тестовый режим (уберите после проверки)
+        TEST_MODE = True
+        if TEST_MODE and symbol == "BTCUSDT":
+            logger.info("⚠️ ТЕСТОВЫЙ РЕЖИМ: Принудительный сигнал")
+            return {
+                'type': 'LONG',
+                'probability': 0.9,
+                'rsi': 30,
+                'macd': 1.5,
+                'adx': 35,
+                'atr': 150,
+                'support': df['close'].min(),
+                'resistance': df['close'].max(),
+                'model_evaluated': True
+            }
+        
+    async def debug_symbol(self, symbol: str):
+        """Выводит полную диагностику по символу"""
+        df = await self.fetch_ohlcv_data(symbol, limit=100)
+        if df.empty:
+            return "Нет данных"
+        
+        df = self.calculate_indicators(df)
+        features = self.prepare_features(df)
+        
+        analysis = f"""
+        Анализ {symbol}:
+        - Последняя цена: {df['close'].iloc[-1]}
+        - RSI: {df['rsi'].iloc[-1]:.1f}
+        - MACD: {df['macd'].iloc[-1]:.4f}
+        - ADX: {df['adx'].iloc[-1]:.1f}
+        - ATR: {df['atr'].iloc[-1]:.2f}
+        - Объём: {df['volume'].iloc[-1]:.2f}
+        """
+        
+        if not features.empty:
+            analysis += "\nВероятность LONG: {:.1%}".format(
+                self.long_model_data['models']['combined'].predict_proba(
+                    self.long_model_data['scalers']['combined'].transform(features)
+                )[0][1]
+            )
+        
+        return analysis
 
     async def send_signal_message(self, symbol: str, signal: Dict[str, Any], df: pd.DataFrame):
         """Отправка сообщения о сигнале"""
@@ -734,6 +777,10 @@ async def check_all_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info(f"Completed periodic check. Found {signals_found} signals")
 
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    report = await trading_bot.debug_symbol("BTCUSDT")
+    await update.message.reply_text(f"```\n{report}\n```", parse_mode='Markdown')
+
 async def main():
     """Основная функция"""
     global trading_bot
@@ -746,7 +793,7 @@ async def main():
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("status", status))
         app.add_handler(CommandHandler("idea", check_all_symbols))
-        
+        app.add_handler(CommandHandler("debug", debug))
         # Запуск периодической проверки каждые 15 минут
         app.job_queue.run_repeating(
             lambda ctx: check_all_symbols(None, ctx),  # Без Update объекта
