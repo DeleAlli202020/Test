@@ -257,15 +257,20 @@ class TradingBot:
             hl2 = (df['high'] + df['low']) / 2
             df['super_trend_upper'] = hl2 + (3 * df['atr'])
             df['super_trend_lower'] = hl2 - (3 * df['atr'])
-            df['super_trend'] = 1  # Initialize
+            
+            # Initialize super_trend column
+            super_trend_values = [1] * len(df)  # Start with array of 1s
             
             for i in range(1, len(df)):
                 if df['close'].iloc[i-1] > df['super_trend_upper'].iloc[i-1]:
-                    df['super_trend'].iloc[i] = 1
+                    super_trend_values[i] = 1
                 elif df['close'].iloc[i-1] < df['super_trend_lower'].iloc[i-1]:
-                    df['super_trend'].iloc[i] = -1
+                    super_trend_values[i] = -1
                 else:
-                    df['super_trend'].iloc[i] = df['super_trend'].iloc[i-1]
+                    super_trend_values[i] = super_trend_values[i-1]
+            
+            # Assign the calculated values to the DataFrame
+            df['super_trend'] = super_trend_values
             
             # Smart Money Score
             df['smart_money_score'] = (df['rsi'] * 0.4 + (100 - df['rsi']) * 0.3 + df['adx'] * 0.3).clip(0, 100)
@@ -275,16 +280,6 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Feature calculation failed: {str(e)}")
             return pd.DataFrame()
-    
-    def get_model_features(self, is_short: bool) -> list:
-        """Get feature list for the corresponding model (TestBot.py style)"""
-        model_data = self.short_model_data if is_short else self.long_model_data
-        if model_data and 'active_features' in model_data:
-            if 'combined' in model_data['active_features']:
-                return model_data['active_features']['combined']
-            elif model_data['active_features']:
-                return next(iter(model_data['active_features'].values()))
-        return []
     
     def prepare_features(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
         """Prepare features with guaranteed correct order and all features present"""
