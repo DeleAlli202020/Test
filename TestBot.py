@@ -181,7 +181,7 @@ class TradingBot:
         return True
     
     def calculate_indicators(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
-        """Feature engineering pipeline with TestBot.py style indicators"""
+        """Feature engineering pipeline with all required indicators"""
         try:
             # Core indicators
             df['rsi'] = RSIIndicator(df['close'], window=14).rsi().fillna(50)
@@ -221,15 +221,59 @@ class TradingBot:
             for hours, periods in [(1,4), (2,8), (6,24), (12,48)]:
                 df[f'price_change_{hours}h'] = df['price'].pct_change(periods).fillna(0) * 100
             
-            # Volume Analysis
-            df['volume_spike'] = (df['volume'] > df['volume'].rolling(50).mean() * 2).astype(int)
-            df['bull_volume'] = (df['close'] > df['open']) * df['volume']
-            df['bear_volume'] = (df['close'] < df['open']) * df['volume']
+            # Volume metrics
+            if len(df) >= 6:
+                vol_mean = df['volume'].rolling(6).mean().replace(0, 1)
+                df['volume_score'] = (df['volume'] / vol_mean * 100).fillna(0)
+                df['volume_change'] = df['volume'].pct_change().fillna(0) * 100
+            else:
+                df['volume_score'] = 0
+                df['volume_change'] = 0
+                
+            # ATR normalized
+            df['atr_normalized'] = (df['atr'] / df['price'].replace(0, 1) * 100).fillna(0)
+            df['atr_change'] = df['atr'].pct_change().fillna(0) * 100
+            
+            # VWAP and VWAP signal
+            typical_price = (df['high'] + df['low'] + df['close']) / 3
+            df['vwap'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
+            df['vwap_signal'] = (df['price'] - df['vwap']) / df['vwap'] * 100
+            
+            # OBV (On-Balance Volume)
+            price_diff = df['price'].diff().fillna(0)
+            df['obv'] = (np.sign(price_diff) * df['volume']).cumsum()
+            
+            # Support/Resistance levels
+            if len(df) >= 20:
+                df['support_level'] = df['low'].rolling(20).min().fillna(df['low'].min())
+                df['resistance_level'] = df['high'].rolling(20).max().fillna(df['high'].max())
+                df['price_to_resistance'] = ((df['price'] - df['resistance_level']) / df['price']) * 100
+            else:
+                df['support_level'] = df['low'].min()
+                df['resistance_level'] = df['high'].max()
+                df['price_to_resistance'] = 0
+                
+            # SuperTrend
+            hl2 = (df['high'] + df['low']) / 2
+            df['super_trend_upper'] = hl2 + (3 * df['atr'])
+            df['super_trend_lower'] = hl2 - (3 * df['atr'])
+            df['super_trend'] = 1  # Initialize
+            
+            for i in range(1, len(df)):
+                if df['close'].iloc[i-1] > df['super_trend_upper'].iloc[i-1]:
+                    df['super_trend'].iloc[i] = 1
+                elif df['close'].iloc[i-1] < df['super_trend_lower'].iloc[i-1]:
+                    df['super_trend'].iloc[i] = -1
+                else:
+                    df['super_trend'].iloc[i] = df['super_trend'].iloc[i-1]
+            
+            # Smart Money Score
+            df['smart_money_score'] = (df['rsi'] * 0.4 + (100 - df['rsi']) * 0.3 + df['adx'] * 0.3).clip(0, 100)
             
             return df.replace([np.inf, -np.inf], 0)
             
         except Exception as e:
-            logger.error(f"Feature calculation failed: {e}")
+            logger.error(f"Feature calculation failed: {str(e)}")
             return pd.DataFrame()
     
     def get_model_features(self, is_short: bool) -> list:
