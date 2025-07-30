@@ -506,12 +506,26 @@ async def main():
         )
         
         logger.info("Trading bot started")
-        await app.run_polling()
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
         
+        # Keep the application running
+        while True:
+            await asyncio.sleep(3600)  # Sleep for 1 hour
+            
+    except asyncio.CancelledError:
+        pass
     except Exception as e:
-        logger.critical(f"Fatal error: {e}")
+        logger.critical(f"Fatal error: {str(e)}")
     finally:
-        await trading_bot.exchange.close()
+        try:
+            await trading_bot.exchange.close()
+            if 'app' in locals():
+                await app.stop()
+                await app.shutdown()
+        except Exception as e:
+            logger.error(f"Error during shutdown: {str(e)}")
 
 if __name__ == "__main__":
     asyncio.run(main())
