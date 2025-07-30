@@ -280,6 +280,25 @@ class TradingBot:
         except Exception as e:
             logger.error(f"Feature calculation failed: {str(e)}")
             return pd.DataFrame()
+        
+    def get_model_features(self, is_short: bool) -> list:
+        """Get the list of features expected by the model"""
+        model_data = self.short_model_data if is_short else self.long_model_data
+        if not model_data:
+            return []
+        
+        # Try to get features from scaler first, then from model
+        if hasattr(model_data['scalers']['combined'], 'feature_names_in_'):
+            return list(model_data['scalers']['combined'].feature_names_in_)
+        elif hasattr(model_data['models']['combined'], 'feature_names_'):
+            return model_data['models']['combined'].feature_names_
+        else:
+            # Fallback to active_features if available
+            if 'active_features' in model_data and model_data['active_features']:
+                if isinstance(model_data['active_features'], dict):
+                    return list(model_data['active_features'].values())[0]
+                return model_data['active_features']
+            return []
     
     def prepare_features(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
         """Prepare features with guaranteed correct order and all features present"""
@@ -294,16 +313,31 @@ class TradingBot:
             df = self.calculate_indicators(df, is_short)
             if df.empty:
                 return pd.DataFrame()
-            
+                
             # Create final DataFrame with correct feature order
             final_features = pd.DataFrame(index=[0])
             
+            DEFAULT_VALUES = {
+                'price_change': 0.0,
+                'volume': 1.0,
+                'atr': df['close'].std(),
+                'rsi': 50.0,
+                'macd': 0.0,
+                'support': df['low'].min(),
+                'resistance': df['high'].max()
+            }
+
             for feature in expected_features:
                 if feature in df.columns:
                     final_features[feature] = [df[feature].iloc[-1]]
                 else:
-                    logger.warning(f"Missing feature: {feature}")
-                    final_features[feature] = [0]  # Safe default
+                    # Auto-select reasonable default value
+                    default_value = next(
+                        (val for key, val in DEFAULT_VALUES.items() if key in feature),
+                        0.0  # Fallback value
+                    )
+                    logger.warning(f"Feature {feature} not found, filling with {default_value}")
+                    final_features[feature] = [default_value]
             
             # Ensure features are in correct order
             final_features = final_features[expected_features]
@@ -311,7 +345,7 @@ class TradingBot:
             return final_features.replace([np.inf, -np.inf], 0)
             
         except Exception as e:
-            logger.error(f"Feature preparation failed: {e}")
+            logger.error(f"Feature preparation failed: {str(e)}")
             return pd.DataFrame()
     
     async def detect_signal(self, symbol: str) -> Optional[Signal]:
