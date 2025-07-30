@@ -41,7 +41,7 @@ warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 load_dotenv('config.env')
 
 class Config:
-    TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+    TELEGRAM_TOKEN = '7364285248:AAH8wzdSDGEd1PO53wi9LedFfblbi-e8G_Y'
     ADMIN_ID = int(os.getenv('ADMIN_ID', 0))
     ALLOWED_USERS_FILE = 'allowed_users.json'
     LONG_MODEL_PATH = 'model_improved1.pkl'
