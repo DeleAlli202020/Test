@@ -223,16 +223,16 @@ class TradingBot:
             return pd.Series(0, index=high.index), pd.Series(0, index=high.index), pd.Series(0, index=high.index)
 
     def calculate_indicators(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
-        """Feature engineering pipeline with robust calculations"""
+        """Complete feature engineering with all required indicators"""
         try:
             # Make a copy to avoid SettingWithCopyWarning
             df = df.copy()
             
-            # Price must be set first
+            # Ensure price column exists
             if 'price' not in df.columns:
                 df['price'] = df['close'].astype(float)
             
-            # Core indicators
+            # 1. Core Technical Indicators
             df['rsi'] = RSIIndicator(df['close'], window=14).rsi().fillna(50)
             macd = MACD(df['close'], window_slow=26, window_fast=12)
             df['macd'] = macd.macd().fillna(0)
@@ -242,46 +242,70 @@ class TradingBot:
             # Robust ADX calculation
             df['adx'], df['dip'], df['din'] = self.calculate_adx(df['high'], df['low'], df['close'])
             
-            # Volatility
+            # Volatility indicators
             df['atr'] = AverageTrueRange(
                 high=df['high'],
                 low=df['low'],
                 close=df['close'],
                 window=14
             ).average_true_range().fillna(0)
+            df['atr_normalized'] = (df['atr'] / df['price'].replace(0, 1)).fillna(0) * 100
+            df['atr_change'] = df['atr'].pct_change().fillna(0) * 100
             
-            # EMA Cross
+            # 2. Moving Averages and Crosses
             df['ema_20'] = df['price'].ewm(span=20, adjust=False).mean()
             df['ema_50'] = df['price'].ewm(span=50, adjust=False).mean()
-            df['ema_cross'] = (df['ema_20'] < df['ema_50']).astype(int) if is_short else (df['ema_20'] > df['ema_50']).astype(int)
+            df['ema_cross'] = (df['ema_20'] > df['ema_50']).astype(int)
             
-            # Bollinger Bands
+            # 3. Bollinger Bands
             bb = BollingerBands(df['close'], window=20, window_dev=2)
             df['bb_upper'] = bb.bollinger_hband().fillna(0)
             df['bb_lower'] = bb.bollinger_lband().fillna(0)
             df['bb_width'] = bb.bollinger_wband().fillna(0)
             
-            # Price changes
-            for hours, periods in [(1,4), (2,8), (6,24), (12,48)]:
-                df[f'price_change_{hours}h'] = df['price'].pct_change(periods).fillna(0) * 100
-            
-            # Volume metrics - fixed to handle cases with insufficient data
-            min_periods = min(6, len(df))  # Ensure we don't request more periods than available
-            if min_periods > 0:
-                vol_mean = df['volume'].rolling(min_periods, min_periods=1).mean().replace(0, 1)
-                df['volume_score'] = (df['volume'] / vol_mean * 100).fillna(100)  # Default to 100 if no volume data
-                df['volume_change'] = df['volume'].pct_change().fillna(0) * 100
-                df['volume_spike'] = (df['volume'] > vol_mean * 2).astype(int)
-            else:
-                df['volume_score'] = 100
-                df['volume_change'] = 0
-                df['volume_spike'] = 0
-            
-            # Volume directional indicators
+            # 4. Volume Indicators
+            min_periods = min(6, len(df))
+            vol_mean = df['volume'].rolling(min_periods, min_periods=1).mean().replace(0, 1)
+            df['volume_score'] = (df['volume'] / vol_mean * 100).fillna(100)
+            df['volume_change'] = df['volume'].pct_change().fillna(0) * 100
+            df['volume_spike'] = (df['volume'] > vol_mean * 2).astype(int)
             df['bull_volume'] = ((df['close'] > df['open']) * df['volume']).fillna(0)
             df['bear_volume'] = ((df['close'] < df['open']) * df['volume']).fillna(0)
             
-            # ... rest of your indicator calculations ...
+            # On-Balance Volume (OBV)
+            df['obv'] = (np.sign(df['price'].diff().fillna(0)) * df['volume']).cumsum()
+            
+            # 5. VWAP and Signals
+            typical_price = (df['high'] + df['low'] + df['close']) / 3
+            df['vwap'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
+            df['vwap_signal'] = ((df['price'] - df['vwap']) / df['vwap'].replace(0, 1)).fillna(0) * 100
+            
+            # 6. Support/Resistance Levels
+            window = min(20, len(df))
+            df['support_level'] = df['low'].rolling(window).min().fillna(df['low'].min())
+            df['resistance_level'] = df['high'].rolling(window).max().fillna(df['high'].max())
+            df['price_to_resistance'] = ((df['price'] - df['resistance_level']) / df['price'].replace(0, 1)).fillna(0) * 100
+            
+            # 7. SuperTrend
+            hl2 = (df['high'] + df['low']) / 2
+            df['super_trend_upper'] = hl2 + (3 * df['atr'])
+            df['super_trend_lower'] = hl2 - (3 * df['atr'])
+            super_trend = [1] * len(df)
+            for i in range(1, len(df)):
+                if df['close'].iloc[i-1] > df['super_trend_upper'].iloc[i-1]:
+                    super_trend[i] = 1
+                elif df['close'].iloc[i-1] < df['super_trend_lower'].iloc[i-1]:
+                    super_trend[i] = -1
+                else:
+                    super_trend[i] = super_trend[i-1]
+            df['super_trend'] = super_trend
+            
+            # 8. Composite Scores
+            df['smart_money_score'] = (df['rsi'] * 0.4 + (100 - df['rsi']) * 0.3 + df['adx'] * 0.3).clip(0, 100)
+            
+            # Price Changes
+            for hours, periods in [(1,4), (2,8), (6,24), (12,48)]:
+                df[f'price_change_{hours}h'] = df['price'].pct_change(periods).fillna(0) * 100
             
             return df.replace([np.inf, -np.inf], 0)
             
