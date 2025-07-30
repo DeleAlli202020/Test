@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import joblib
 from ccxt.async_support import binance
+from sqlalchemy.util import symbol
 from dotenv import load_dotenv
 from sklearn.base import BaseEstimator
 from sklearn.preprocessing import RobustScaler
@@ -418,6 +419,26 @@ async def check_markets(context: CallbackContext):
     else:
         logger.info("No trading signals found")
 
+async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка соединений"""
+    try:
+        # Проверка Binance
+        ticker = await trading_bot.exchange.fetch_ticker('BTCUSDT')
+        # Проверка моделей
+        long_loaded = bool(trading_bot.long_model_data)
+        short_loaded = bool(trading_bot.short_model_data)
+        
+        await update.message.reply_text(
+            f"Binance: ✅\n"
+            f"Long model: {'✅' if long_loaded else '❌'}\n"
+            f"Short model: {'✅' if short_loaded else '❌'}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+
+# В main() после других handler'ов:
+
+
 async def main():
     """Application entry point"""
     global trading_bot
@@ -430,6 +451,7 @@ async def main():
         
         # Register handlers
         app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("test", test))
         app.add_handler(CommandHandler("status", status))
         
         # Schedule periodic checks
