@@ -10,19 +10,18 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple, Set, Any
 
 import numpy as np
 import pandas as pd
 import joblib
 from ccxt.async_support import binance
-from sqlalchemy.util import symbol
 from dotenv import load_dotenv
 from sklearn.base import BaseEstimator
 from sklearn.preprocessing import RobustScaler
 from ta.momentum import RSIIndicator
 from ta.trend import MACD, ADXIndicator
-from ta.volatility import AverageTrueRange
+from ta.volatility import AverageTrueRange, BollingerBands
 from telegram import Update, Bot
 from telegram.ext import (
     Application,
@@ -30,6 +29,13 @@ from telegram.ext import (
     ContextTypes,
     CallbackContext,
 )
+import warnings
+from sklearn.exceptions import DataConversionWarning, UndefinedMetricWarning
+
+# Suppress warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+warnings.filterwarnings("ignore", category=DataConversionWarning)
+warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
 # Constants and Configuration
 load_dotenv('config.env')
@@ -69,13 +75,7 @@ logger = logging.getLogger('trading_bot')
 
 # Type Aliases
 FeatureVector = Dict[str, float]
-Signal = Dict[str, any]
-
-@dataclass
-class ModelBundle:
-    model: BaseEstimator
-    scaler: RobustScaler
-    features: List[str]
+Signal = Dict[str, Any]
 
 class TradingBot:
     """Core trading engine with institutional-grade reliability"""
@@ -83,8 +83,8 @@ class TradingBot:
     def __init__(self):
         self.users = self._load_users()
         self.exchange = self._init_exchange()
-        self.long_model = self._load_model(Config.LONG_MODEL_PATH)
-        self.short_model = self._load_model(Config.SHORT_MODEL_PATH)
+        self.long_model_data = self._load_model_data(Config.LONG_MODEL_PATH)
+        self.short_model_data = self._load_model_data(Config.SHORT_MODEL_PATH)
         self.telegram_bot = None
         self.last_signal_time = {}
         
@@ -122,23 +122,20 @@ class TradingBot:
             }
         })
     
-    def _load_model(self, path: str) -> Optional[ModelBundle]:
-        """Load trained model with validation"""
+    def _load_model_data(self, path: str) -> Optional[Dict[str, Any]]:
+        """Load trained model with validation (using TestBot.py format)"""
         try:
             if not os.path.exists(path):
                 logger.error(f"Model file missing: {path}")
                 return None
                 
-            data = joblib.load(path)
-            if not all(k in data for k in ['model', 'scaler', 'features']):
+            model_data = joblib.load(path)
+            if not all(k in model_data for k in ['models', 'scalers', 'active_features']):
                 logger.error(f"Invalid model format in {path}")
                 return None
                 
-            return ModelBundle(
-                model=data['model'],
-                scaler=data['scaler'],
-                features=data['features']
-            )
+            logger.info(f"Successfully loaded model data from {path}")
+            return model_data
         except Exception as e:
             logger.error(f"Model loading failed: {e}")
             return None
@@ -183,14 +180,15 @@ class TradingBot:
                 return False
         return True
     
-    def calculate_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Feature engineering pipeline"""
+    def calculate_indicators(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
+        """Feature engineering pipeline with TestBot.py style indicators"""
         try:
             # Core indicators
             df['rsi'] = RSIIndicator(df['close'], window=14).rsi().fillna(50)
-            macd = MACD(df['close'])
+            macd = MACD(df['close'], window_slow=26, window_fast=12)
             df['macd'] = macd.macd().fillna(0)
             df['macd_signal'] = macd.macd_signal().fillna(0)
+            df['macd_diff'] = macd.macd_diff().fillna(0)
             
             # Trend analysis
             df['adx'] = ADXIndicator(
@@ -208,9 +206,25 @@ class TradingBot:
                 window=14
             ).average_true_range().fillna(0)
             
+            # EMA Cross
+            df['ema_20'] = df['price'].ewm(span=20, adjust=False).mean()
+            df['ema_50'] = df['price'].ewm(span=50, adjust=False).mean()
+            df['ema_cross'] = (df['ema_20'] < df['ema_50']).astype(int) if is_short else (df['ema_20'] > df['ema_50']).astype(int)
+            
+            # Bollinger Bands
+            bb = BollingerBands(df['close'], window=20, window_dev=2)
+            df['bb_upper'] = bb.bollinger_hband().fillna(0)
+            df['bb_lower'] = bb.bollinger_lband().fillna(0)
+            df['bb_width'] = bb.bollinger_wband().fillna(0)
+            
             # Price changes
             for hours, periods in [(1,4), (2,8), (6,24), (12,48)]:
-                df[f'change_{hours}h'] = df['price'].pct_change(periods).fillna(0) * 100
+                df[f'price_change_{hours}h'] = df['price'].pct_change(periods).fillna(0) * 100
+            
+            # Volume Analysis
+            df['volume_spike'] = (df['volume'] > df['volume'].rolling(50).mean() * 2).astype(int)
+            df['bull_volume'] = (df['close'] > df['open']) * df['volume']
+            df['bear_volume'] = (df['close'] < df['open']) * df['volume']
             
             return df.replace([np.inf, -np.inf], 0)
             
@@ -218,46 +232,91 @@ class TradingBot:
             logger.error(f"Feature calculation failed: {e}")
             return pd.DataFrame()
     
+    def get_model_features(self, is_short: bool) -> list:
+        """Get feature list for the corresponding model (TestBot.py style)"""
+        model_data = self.short_model_data if is_short else self.long_model_data
+        if model_data and 'active_features' in model_data:
+            if 'combined' in model_data['active_features']:
+                return model_data['active_features']['combined']
+            elif model_data['active_features']:
+                return next(iter(model_data['active_features'].values()))
+        return []
+    
+    def prepare_features(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
+        """Prepare features with guaranteed correct order and all features present"""
+        try:
+            # Get expected features in correct order
+            expected_features = self.get_model_features(is_short)
+            if not expected_features:
+                logger.error("No expected features list available")
+                return pd.DataFrame()
+            
+            # Calculate all indicators
+            df = self.calculate_indicators(df, is_short)
+            if df.empty:
+                return pd.DataFrame()
+            
+            # Create final DataFrame with correct feature order
+            final_features = pd.DataFrame(index=[0])
+            
+            for feature in expected_features:
+                if feature in df.columns:
+                    final_features[feature] = [df[feature].iloc[-1]]
+                else:
+                    logger.warning(f"Missing feature: {feature}")
+                    final_features[feature] = [0]  # Safe default
+            
+            # Ensure features are in correct order
+            final_features = final_features[expected_features]
+            
+            return final_features.replace([np.inf, -np.inf], 0)
+            
+        except Exception as e:
+            logger.error(f"Feature preparation failed: {e}")
+            return pd.DataFrame()
+    
     async def detect_signal(self, symbol: str) -> Optional[Signal]:
         """Complete signal detection pipeline"""
         try:
             # Data acquisition
             df = await self.fetch_market_data(symbol)
-            if df is None:
+            if df is None or len(df) < 100:
                 return None
                 
-            # Feature engineering
-            df = self.calculate_features(df)
-            if df.empty:
-                return None
-                
-            # Model prediction
-            long_signal = self._evaluate_model(df, is_short=False)
-            short_signal = self._evaluate_model(df, is_short=True)
+            # Check LONG and SHORT signals
+            long_signal = await self._evaluate_model_signal(df, symbol, is_short=False)
+            short_signal = await self._evaluate_model_signal(df, symbol, is_short=True)
             
-            return long_signal or short_signal
+            return long_signal if long_signal else short_signal
             
         except Exception as e:
             logger.error(f"Signal detection failed for {symbol}: {e}")
             return None
     
-    def _evaluate_model(self, df: pd.DataFrame, is_short: bool) -> Optional[Signal]:
-        """Evaluate trading model with position-specific logic"""
-        model_data = self.short_model if is_short else self.long_model
+    async def _evaluate_model_signal(self, df: pd.DataFrame, symbol: str, is_short: bool) -> Optional[Signal]:
+        """Evaluate trading model with position-specific logic (TestBot.py style)"""
+        model_data = self.short_model_data if is_short else self.long_model_data
         if not model_data:
             return None
             
         try:
-            # Prepare feature vector
-            features = self._prepare_features(df, model_data.features)
+            model = model_data['models'].get('combined')
+            scaler = model_data['scalers'].get('combined')
+            
+            if model is None or scaler is None:
+                logger.warning(f"No model/scaler for {'SHORT' if is_short else 'LONG'}")
+                return None
+                
+            features = self.prepare_features(df, is_short)
             if features.empty:
+                logger.warning(f"Empty features for {symbol}")
                 return None
                 
             # Scale features
-            scaled = model_data.scaler.transform(features.values.reshape(1, -1))
+            features_scaled = scaler.transform(features.values.astype(np.float32))
             
             # Get prediction
-            proba = model_data.model.predict_proba(scaled)[0][1]
+            proba = model.predict_proba(features_scaled)[0][1]
             
             # Determine threshold
             threshold = Config.SHORT_THRESHOLD if is_short else Config.LONG_THRESHOLD
@@ -276,26 +335,15 @@ class TradingBot:
                     'adx': last['adx'],
                     'atr': last['atr'],
                     'time': datetime.utcnow(),
-                    'model': 'short' if is_short else 'long'
+                    'model': 'short' if is_short else 'long',
+                    'support': last.get('support_level', last['low']),
+                    'resistance': last.get('resistance_level', last['high'])
                 }
                 
         except Exception as e:
             logger.error(f"Model evaluation failed: {e}")
             
         return None
-    
-    def _prepare_features(self, df: pd.DataFrame, required: List[str]) -> pd.DataFrame:
-        """Ensure correct feature vector format"""
-        features = pd.DataFrame(index=[0])
-        
-        for feature in required:
-            if feature in df.columns:
-                features[feature] = [df[feature].iloc[-1]]
-            else:
-                logger.warning(f"Missing feature: {feature}")
-                features[feature] = [0]  # Safe default
-                
-        return features[required]  # Ensure correct order
     
     def _check_conditions(self, last: pd.Series, is_short: bool) -> bool:
         """Validate additional trading conditions"""
@@ -375,32 +423,6 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"Failed to send to user {user_id}: {e}")
 
-# Telegram Handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
-    user_id = update.effective_user.id
-    trading_bot.users.add(user_id)
-    
-    await update.message.reply_text(
-        "🚀 *Crypto Trading Bot Activated*\n\n"
-        "You will now receive trading signals.\n"
-        "Use /status to check system health.",
-        parse_mode='Markdown'
-    )
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /status command"""
-    status_msg = (
-        "🤖 *System Status*\n\n"
-        f"• Models: {'✅' if trading_bot.long_model else '❌'} Long / "
-        f"{'✅' if trading_bot.short_model else '❌'} Short\n"
-        f"• Exchange: {'✅ Connected' if trading_bot.exchange else '❌ Disconnected'}\n"
-        f"• Monitoring: {len(Config.ASSETS)} assets\n"
-        f"• Last check: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
-    )
-    
-    await update.message.reply_text(status_msg, parse_mode='Markdown')
-
 async def check_markets(context: CallbackContext):
     """Periodic market scanning"""
     logger.info("Starting market scan...")
@@ -419,12 +441,37 @@ async def check_markets(context: CallbackContext):
     else:
         logger.info("No trading signals found")
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
+    user_id = update.effective_user.id
+    trading_bot.users.add(user_id)
+    
+    await update.message.reply_text(
+        "🚀 *Crypto Trading Bot Activated*\n\n"
+        "You will now receive trading signals.\n"
+        "Use /status to check system health.",
+        parse_mode='Markdown'
+    )
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /status command"""
+    status_msg = (
+        "🤖 *System Status*\n\n"
+        f"• Models: {'✅' if trading_bot.long_model_data else '❌'} Long / "
+        f"{'✅' if trading_bot.short_model_data else '❌'} Short\n"
+        f"• Exchange: {'✅ Connected' if trading_bot.exchange else '❌ Disconnected'}\n"
+        f"• Monitoring: {len(Config.ASSETS)} assets\n"
+        f"• Last check: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC"
+    )
+    
+    await update.message.reply_text(status_msg, parse_mode='Markdown')
+
 async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверка соединений"""
+    """Connection test"""
     try:
-        # Проверка Binance
+        # Test Binance connection
         ticker = await trading_bot.exchange.fetch_ticker('BTCUSDT')
-        # Проверка моделей
+        # Test models
         long_loaded = bool(trading_bot.long_model_data)
         short_loaded = bool(trading_bot.short_model_data)
         
@@ -434,10 +481,7 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Short model: {'✅' if short_loaded else '❌'}"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
-
-# В main() после других handler'ов:
-
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
 async def main():
     """Application entry point"""
