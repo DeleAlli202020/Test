@@ -180,7 +180,7 @@ class TradingBot:
                 return False
         return True
     
-    def calculate_adx(self, high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14):
+    def calculate_adx(self, high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> tuple:
         """Robust ADX calculation with proper error handling"""
         try:
             # Calculate True Range
@@ -196,17 +196,19 @@ class TradingBot:
             plus_dm = np.where((up > down) & (up > 0), up, 0.0)
             minus_dm = np.where((down > up) & (down > 0), down, 0.0)
             
-            # Smoothing
-            alpha = 1/window
-            tr_smooth = tr.ewm(alpha=alpha, adjust=False).mean()
-            plus_dm_smooth = pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean()
-            minus_dm_smooth = pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean()
+            # Smoothing with proper window size
+            window = min(window, len(high) - 1) if len(high) > 1 else 1
+            alpha = 1/window if window > 0 else 1
             
-            # Calculate directional indicators
+            tr_smooth = tr.ewm(alpha=alpha, adjust=False, min_periods=window).mean()
+            plus_dm_smooth = pd.Series(plus_dm).ewm(alpha=alpha, adjust=False, min_periods=window).mean()
+            minus_dm_smooth = pd.Series(minus_dm).ewm(alpha=alpha, adjust=False, min_periods=window).mean()
+            
+            # Calculate directional indicators with zero division protection
             with np.errstate(divide='ignore', invalid='ignore'):
-                plus_di = 100 * (plus_dm_smooth / tr_smooth)
-                minus_di = 100 * (minus_dm_smooth / tr_smooth)
-                dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)  # Add small constant to avoid division by zero
+                plus_di = 100 * (plus_dm_smooth / (tr_smooth + 1e-10))
+                minus_di = 100 * (minus_dm_smooth / (tr_smooth + 1e-10))
+                dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)
             
             # Fill NaN values
             plus_di = plus_di.fillna(0)
@@ -214,13 +216,14 @@ class TradingBot:
             dx = dx.fillna(0)
             
             # Calculate ADX
-            adx = dx.ewm(alpha=alpha, adjust=False).mean().fillna(0)
+            adx = dx.ewm(alpha=alpha, adjust=False, min_periods=window).mean().fillna(0)
             
             return adx, plus_di, minus_di
         
         except Exception as e:
-            logger.error(f"Error in ADX calculation: {str(e)}")
-            return pd.Series(0, index=high.index), pd.Series(0, index=high.index), pd.Series(0, index=high.index)
+            logger.error(f"ADX calculation error: {str(e)}")
+            zero_series = pd.Series(0, index=high.index)
+            return zero_series, zero_series, zero_series
 
     def calculate_indicators(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
         """Complete feature engineering with all required indicators"""
@@ -240,7 +243,11 @@ class TradingBot:
             df['macd_diff'] = macd.macd_diff().fillna(0)
             
             # Robust ADX calculation
-            df['adx'], df['dip'], df['din'] = self.calculate_adx(df['high'], df['low'], df['close'])
+            df['adx'], df['dip'], df['din'] = self.calculate_adx(
+                df['high'],
+                df['low'],
+                df['close']
+            )
             
             # Volatility indicators
             df['atr'] = AverageTrueRange(
@@ -399,36 +406,34 @@ class TradingBot:
             return None
     
     async def _evaluate_model_signal(self, df: pd.DataFrame, symbol: str, is_short: bool) -> Optional[Signal]:
-        """Evaluate trading model with position-specific logic (TestBot.py style)"""
-        model_data = self.short_model_data if is_short else self.long_model_data
-        if not model_data:
-            return None
-            
+        """Model evaluation with robust ADX handling"""
         try:
+            model_data = self.short_model_data if is_short else self.long_model_data
+            if not model_data:
+                return None
+                
             model = model_data['models'].get('combined')
             scaler = model_data['scalers'].get('combined')
             
             if model is None or scaler is None:
-                logger.warning(f"No model/scaler for {'SHORT' if is_short else 'LONG'}")
                 return None
                 
             features = self.prepare_features(df, is_short)
             if features.empty:
-                logger.warning(f"Empty features for {symbol}")
                 return None
                 
-            # Scale features
+            # Ensure ADX is present and valid
+            if 'adx' not in features.columns:
+                logger.warning("ADX feature missing in prepared features")
+                features['adx'] = 0
+                
             features_scaled = scaler.transform(features.values.astype(np.float32))
-            
-            # Get prediction
             proba = model.predict_proba(features_scaled)[0][1]
             
-            # Determine threshold
             threshold = Config.SHORT_THRESHOLD if is_short else Config.LONG_THRESHOLD
             if symbol in Config.LOW_RECALL_ASSETS:
                 threshold *= Config.LOW_RECALL_MULTIPLIER
                 
-            # Check conditions
             last = df.iloc[-1]
             if proba > threshold and self._check_conditions(last, is_short):
                 return {
@@ -436,17 +441,15 @@ class TradingBot:
                     'type': 'SHORT' if is_short else 'LONG',
                     'probability': proba,
                     'price': last['close'],
-                    'rsi': last['rsi'],
-                    'adx': last['adx'],
-                    'atr': last['atr'],
+                    'rsi': last.get('rsi', 50),
+                    'adx': last.get('adx', 0),  # Default to 0 if ADX missing
+                    'atr': last.get('atr', 0),
                     'time': datetime.utcnow(),
-                    'model': 'short' if is_short else 'long',
-                    'support': last.get('support_level', last['low']),
-                    'resistance': last.get('resistance_level', last['high'])
+                    'model': 'short' if is_short else 'long'
                 }
                 
         except Exception as e:
-            logger.error(f"Model evaluation failed: {e}")
+            logger.error(f"Model evaluation failed for {symbol}: {str(e)}")
             
         return None
     
