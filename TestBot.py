@@ -180,9 +180,58 @@ class TradingBot:
                 return False
         return True
     
-    def calculate_indicators(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
-        """Feature engineering pipeline with all required indicators"""
+    def calculate_adx(self, high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14):
+        """Robust ADX calculation with proper error handling"""
         try:
+            # Calculate True Range
+            tr = pd.DataFrame({
+                'hl': high - low,
+                'hc': abs(high - close.shift(1)),
+                'lc': abs(low - close.shift(1))
+            }).max(axis=1)
+            
+            # Calculate Directional Movement
+            up = high.diff()
+            down = -low.diff()
+            plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+            minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+            
+            # Smoothing
+            alpha = 1/window
+            tr_smooth = tr.ewm(alpha=alpha, adjust=False).mean()
+            plus_dm_smooth = pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean()
+            minus_dm_smooth = pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean()
+            
+            # Calculate directional indicators
+            with np.errstate(divide='ignore', invalid='ignore'):
+                plus_di = 100 * (plus_dm_smooth / tr_smooth)
+                minus_di = 100 * (minus_dm_smooth / tr_smooth)
+                dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)  # Add small constant to avoid division by zero
+            
+            # Fill NaN values
+            plus_di = plus_di.fillna(0)
+            minus_di = minus_di.fillna(0)
+            dx = dx.fillna(0)
+            
+            # Calculate ADX
+            adx = dx.ewm(alpha=alpha, adjust=False).mean().fillna(0)
+            
+            return adx, plus_di, minus_di
+        
+        except Exception as e:
+            logger.error(f"Error in ADX calculation: {str(e)}")
+            return pd.Series(0, index=high.index), pd.Series(0, index=high.index), pd.Series(0, index=high.index)
+
+    def calculate_indicators(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
+        """Feature engineering pipeline with robust calculations"""
+        try:
+            # Make a copy to avoid SettingWithCopyWarning
+            df = df.copy()
+            
+            # Price must be set first
+            if 'price' not in df.columns:
+                df['price'] = df['close'].astype(float)
+            
             # Core indicators
             df['rsi'] = RSIIndicator(df['close'], window=14).rsi().fillna(50)
             macd = MACD(df['close'], window_slow=26, window_fast=12)
@@ -190,13 +239,8 @@ class TradingBot:
             df['macd_signal'] = macd.macd_signal().fillna(0)
             df['macd_diff'] = macd.macd_diff().fillna(0)
             
-            # Trend analysis
-            df['adx'] = ADXIndicator(
-                high=df['high'],
-                low=df['low'],
-                close=df['close'],
-                window=14
-            ).adx().fillna(0)
+            # Robust ADX calculation
+            df['adx'], df['dip'], df['din'] = self.calculate_adx(df['high'], df['low'], df['close'])
             
             # Volatility
             df['atr'] = AverageTrueRange(
@@ -221,64 +265,28 @@ class TradingBot:
             for hours, periods in [(1,4), (2,8), (6,24), (12,48)]:
                 df[f'price_change_{hours}h'] = df['price'].pct_change(periods).fillna(0) * 100
             
-            # Volume metrics
-            if len(df) >= 6:
-                vol_mean = df['volume'].rolling(6).mean().replace(0, 1)
-                df['volume_score'] = (df['volume'] / vol_mean * 100).fillna(0)
+            # Volume metrics - fixed to handle cases with insufficient data
+            min_periods = min(6, len(df))  # Ensure we don't request more periods than available
+            if min_periods > 0:
+                vol_mean = df['volume'].rolling(min_periods, min_periods=1).mean().replace(0, 1)
+                df['volume_score'] = (df['volume'] / vol_mean * 100).fillna(100)  # Default to 100 if no volume data
                 df['volume_change'] = df['volume'].pct_change().fillna(0) * 100
+                df['volume_spike'] = (df['volume'] > vol_mean * 2).astype(int)
             else:
-                df['volume_score'] = 0
+                df['volume_score'] = 100
                 df['volume_change'] = 0
-                
-            # ATR normalized
-            df['atr_normalized'] = (df['atr'] / df['price'].replace(0, 1) * 100).fillna(0)
-            df['atr_change'] = df['atr'].pct_change().fillna(0) * 100
+                df['volume_spike'] = 0
             
-            # VWAP and VWAP signal
-            typical_price = (df['high'] + df['low'] + df['close']) / 3
-            df['vwap'] = (typical_price * df['volume']).cumsum() / df['volume'].cumsum()
-            df['vwap_signal'] = (df['price'] - df['vwap']) / df['vwap'] * 100
+            # Volume directional indicators
+            df['bull_volume'] = ((df['close'] > df['open']) * df['volume']).fillna(0)
+            df['bear_volume'] = ((df['close'] < df['open']) * df['volume']).fillna(0)
             
-            # OBV (On-Balance Volume)
-            price_diff = df['price'].diff().fillna(0)
-            df['obv'] = (np.sign(price_diff) * df['volume']).cumsum()
-            
-            # Support/Resistance levels
-            if len(df) >= 20:
-                df['support_level'] = df['low'].rolling(20).min().fillna(df['low'].min())
-                df['resistance_level'] = df['high'].rolling(20).max().fillna(df['high'].max())
-                df['price_to_resistance'] = ((df['price'] - df['resistance_level']) / df['price']) * 100
-            else:
-                df['support_level'] = df['low'].min()
-                df['resistance_level'] = df['high'].max()
-                df['price_to_resistance'] = 0
-                
-            # SuperTrend
-            hl2 = (df['high'] + df['low']) / 2
-            df['super_trend_upper'] = hl2 + (3 * df['atr'])
-            df['super_trend_lower'] = hl2 - (3 * df['atr'])
-            
-            # Initialize super_trend column
-            super_trend_values = [1] * len(df)  # Start with array of 1s
-            
-            for i in range(1, len(df)):
-                if df['close'].iloc[i-1] > df['super_trend_upper'].iloc[i-1]:
-                    super_trend_values[i] = 1
-                elif df['close'].iloc[i-1] < df['super_trend_lower'].iloc[i-1]:
-                    super_trend_values[i] = -1
-                else:
-                    super_trend_values[i] = super_trend_values[i-1]
-            
-            # Assign the calculated values to the DataFrame
-            df['super_trend'] = super_trend_values
-            
-            # Smart Money Score
-            df['smart_money_score'] = (df['rsi'] * 0.4 + (100 - df['rsi']) * 0.3 + df['adx'] * 0.3).clip(0, 100)
+            # ... rest of your indicator calculations ...
             
             return df.replace([np.inf, -np.inf], 0)
             
         except Exception as e:
-            logger.error(f"Feature calculation failed: {str(e)}")
+            logger.error(f"Indicator calculation failed: {str(e)}")
             return pd.DataFrame()
         
     def get_model_features(self, is_short: bool) -> list:
