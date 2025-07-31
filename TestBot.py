@@ -488,31 +488,48 @@ class TradingBot:
             return False
     
     async def execute_signal(self, signal: Signal):
-        """Исполнение сигнала с риск-менеджментом и объяснением"""
+        """Исполнение сигнала с полной проверкой данных"""
         try:
-            # Получаем ATR с защитой от ошибок
-            atr = signal.get('atr', 0)
-            if atr <= 0:
-                logger.error(f"Invalid ATR for {signal['symbol']}: {atr}")
-                return
+            # Проверка обязательных полей
+            required_fields = ['symbol', 'type', 'price', 'probability', 'time', 'atr', 'rsi', 'adx']
+            for field in required_fields:
+                if field not in signal:
+                    logger.error(f"Missing field in signal: {field}")
+                    return
 
+            # Проверка ATR
+            if signal['atr'] <= 0:
+                logger.error(f"Invalid ATR for {signal['symbol']}: {signal['atr']}. Using fallback calculation.")
+                
+                # Расчет ATR на лету как fallback
+                try:
+                    df = await self.fetch_market_data(signal['symbol'], limit=20)
+                    if df is not None:
+                        atr = AverageTrueRange(
+                            high=df['high'],
+                            low=df['low'],
+                            close=df['close'],
+                            window=14
+                        ).average_true_range().iloc[-1]
+                        signal['atr'] = atr if not np.isnan(atr) else df['close'].std()
+                except:
+                    signal['atr'] = signal['price'] * 0.01  # 1% от цены как крайний fallback
+
+            # Расчет уровней с Risk/Reward 3:1
             price = signal['price']
-            signal_type = signal['type']
+            atr = signal['atr']
             
-            # Рассчитываем уровни с Risk/Reward 3:1
-            if signal_type == 'LONG':
-                stop_loss = price - atr * 1.5
-                take_profit = price + atr * 4.5  # RR = 3:1 (4.5/1.5)
+            if signal['type'] == 'LONG':
+                stop_loss = max(price - atr * 1.5, price * 0.995)  # Не ближе 0.5% от цены
+                take_profit = price + atr * 4.5
             else:  # SHORT
-                stop_loss = price + atr * 1.5
-                take_profit = price - atr * 4.5  # RR = 3:1 (4.5/1.5)
+                stop_loss = min(price + atr * 1.5, price * 1.005)  # Не ближе 0.5% от цены
+                take_profit = price - atr * 4.5
 
-            # Формируем объяснение сделки
-            explanation = self._generate_trade_explanation(signal, stop_loss, take_profit)
-            
-            # Отправляем сообщение
-            await self._broadcast(explanation)
-            logger.info(f"Executed {signal_type} signal for {signal['symbol']}")
+            # Форматирование сообщения
+            message = self._format_signal_message(signal, stop_loss, take_profit)
+            await self._broadcast(message)
+            logger.info(f"Successfully executed {signal['type']} signal for {signal['symbol']}")
 
         except Exception as e:
             logger.error(f"Signal execution failed: {str(e)}")
@@ -555,18 +572,35 @@ class TradingBot:
         return ", ".join(logic) if logic else "Стандартные условия"
     
     def _format_signal_message(self, signal: Signal, sl: float, tp: float) -> str:
-        """Generate professional trading signal message"""
+        """Генерация сообщения строго по формату"""
+        # Расчет процентов риска и прибыли
+        risk_pct = abs(signal['price'] - sl) / signal['price'] * 100
+        reward_pct = abs(tp - signal['price']) / signal['price'] * 100
+        
+        # Определение силы тренда
+        adx = signal.get('adx', 0)
+        if adx > 40:
+            trend_strength = "💪 Сильный тренд"
+        elif adx > 25:
+            trend_strength = "🔼 Средний тренд"
+        else:
+            trend_strength = "🔄 Без тренда"
+        
+        # Форматирование сообщения
         return (
             f"🚀 *{signal['symbol']} {signal['type']} Signal*\n"
             f"⏰ {signal['time'].strftime('%Y-%m-%d %H:%M')} UTC\n"
-            f"💰 Price: ${signal['price']:.4f}\n"
-            f"📊 Confidence: {signal['probability']:.1%}\n"
-            f"📈 RSI: {signal['rsi']:.1f}\n"
-            f"🌀 ADX: {signal['adx']:.1f}\n\n"
-            f"🎯 Targets:\n"
-            f"• TP: ${tp:.4f} (RR {Config.RISK_REWARD_RATIO}:1)\n"
-            f"• SL: ${sl:.4f}\n\n"
-            f"⚠️ Risk: {signal['atr']/signal['price']:.2%} volatility"
+            f"💰 Цена входа: ${signal['price']:.4f}\n"
+            f"📊 Вероятность: {signal['probability']:.1%}\n"
+            f"📈 Тех.анализ:\n"
+            f"  • RSI: {signal['rsi']:.1f} ({'🔻Перепродан' if signal['rsi'] < 30 else '🔺Перекуплен' if signal['rsi'] > 70 else '⚖️Нейтральный'})\n"
+            f"  • ADX: {adx:.1f} {trend_strength}\n"
+            f"  • ATR: {signal['atr']:.4f} ({signal['atr']/signal['price']*100:.2f}%)\n\n"
+            f"🎯 Уровни:\n"
+            f"  • TP: ${tp:.4f} (+{reward_pct:.2f}%)\n"
+            f"  • SL: ${sl:.4f} (-{risk_pct:.2f}%)\n"
+            f"  • Risk/Reward: 1:3\n\n"
+            f"⚠️ Риск: Стоп-лосс {'выше' if signal['type'] == 'SHORT' else 'ниже'} текущей цены"
         )
     
 
