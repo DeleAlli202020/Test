@@ -547,8 +547,8 @@ class TradingBot:
             }
             
             # Проверяем LONG и SHORT сигналы
-            long_result = await self.check_model_signal(df, symbol, False)
-            short_result = await self.check_model_signal(df, symbol, True)
+            long_result = await self._evaluate_model_signal(df, symbol, False)
+            short_result = await self._evaluate_model_signal(df, symbol, True)
             
             if long_result and long_result['probability'] > Config.LONG_THRESHOLD:
                 result['signal'] = long_result
