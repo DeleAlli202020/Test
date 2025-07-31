@@ -61,8 +61,8 @@ class Config:
     # Trading parameters
     RISK_REWARD_RATIO = 3.0
     LOW_RECALL_ASSETS = {"BTCUSDT", "BNBUSDT"}
-    LONG_THRESHOLD = 0.1
-    SHORT_THRESHOLD = 0.1
+    LONG_THRESHOLD = 0.4
+    SHORT_THRESHOLD = 0.35
     LOW_RECALL_MULTIPLIER = 1.2
 
 # Logging Configuration
@@ -435,6 +435,9 @@ class TradingBot:
     async def _evaluate_model_signal(self, df: pd.DataFrame, symbol: str, is_short: bool) -> Optional[Signal]:
         """Оценка сигнала модели с полным набором данных"""
         try:
+            if len(df) < 100:  # Минимум 100 баров для анализа
+                logger.warning(f"Insufficient data for {symbol}: {len(df)} bars")
+                return None
             model_data = self.short_model_data if is_short else self.long_model_data
             if not model_data:
                 return None
