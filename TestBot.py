@@ -454,24 +454,34 @@ class TradingBot:
         return None
     
     def _check_conditions(self, last: pd.Series, is_short: bool) -> bool:
-        """Validate additional trading conditions"""
-        # Trend filter
-        if last['adx'] < 15:  # Weak trend
-            return False
-            
-        # RSI filter
-        if is_short:
-            if last['rsi'] < 40:  # Not overbought enough
-                return False
-        else:
-            if last['rsi'] > 60:  # Not oversold enough
+        """Validate additional trading conditions with rolling fix"""
+        try:
+            # Trend filter with protection
+            adx = last.get('adx', 0)
+            if adx < 15:  # Weak trend
                 return False
                 
-        # Volume filter
-        if last['volume'] < last['volume'].rolling(20).mean().iloc[-1] * 0.7:
-            return False
+            # RSI filter with protection
+            rsi = last.get('rsi', 50)
+            if is_short:
+                if rsi < 40:  # Not overbought enough
+                    return False
+            else:
+                if rsi > 60:  # Not oversold enough
+                    return False
+                    
+            # Volume filter with rolling protection
+            volume = last.get('volume', 0)
+            volume_ma = last.get('volume_ma', volume * 2)  # Default to 2x if MA not available
             
-        return True
+            if volume < volume_ma * 0.7:
+                return False
+                
+            return True
+            
+        except Exception as e:
+            logger.error(f"Condition check error: {str(e)}")
+            return False
     
     async def execute_signal(self, signal: Signal):
         """Execute trading signal with risk management"""
@@ -518,63 +528,112 @@ class TradingBot:
 
 
     async def analyze_symbol(self, symbol: str) -> dict:
-        """Анализ символа с подробной диагностикой"""
+        """Анализ символа с защитой от ошибок rolling"""
         result = {
             'symbol': symbol,
             'signal': None,
             'reasons': [],
-            'indicators': {}
+            'indicators': {},
+            'volume_ok': True
         }
         
         try:
-            # Получаем данные
+            # Получаем данные с проверкой
             df = await self.fetch_market_data(symbol)
             if df is None or len(df) < 48:
                 result['reasons'].append("Недостаточно данных")
                 return result
             
+            # Добавляем скользящую среднюю объема заранее
+            df['volume_ma'] = df['volume'].rolling(min(20, len(df)), min_periods=1).mean()
+            
             # Рассчитываем индикаторы
             df = self.calculate_indicators(df)
+            last = df.iloc[-1]
             
-            # Сохраняем значения индикаторов для отчета
+            # Сохраняем значения индикаторов с защитой
             result['indicators'] = {
-                'price': df['close'].iloc[-1],
-                'rsi': round(df['rsi'].iloc[-1], 2),
-                'adx': round(df['adx'].iloc[-1], 2),
-                'volume': df['volume'].iloc[-1],
-                'trend': "Вверх" if df['adx'].iloc[-1] > 25 and df['dip'].iloc[-1] > df['din'].iloc[-1] else 
-                        "Вниз" if df['adx'].iloc[-1] > 25 else "Без тренда"
+                'price': last.get('close', 0),
+                'rsi': round(last.get('rsi', 50), 2),
+                'adx': round(last.get('adx', 0), 2),
+                'volume': last.get('volume', 0),
+                'volume_ma': last.get('volume_ma', 0),
+                'trend': self._get_trend_description(last)
             }
             
-            # Проверяем LONG и SHORT сигналы
-            long_result = await self._evaluate_model_signal(df, symbol, False)
-            short_result = await self._evaluate_model_signal(df, symbol, True)
+            # Проверка объема
+            volume_ok = last.get('volume', 0) >= last.get('volume_ma', 0) * 0.7
+            result['volume_ok'] = volume_ok
             
-            if long_result and long_result['probability'] > Config.LONG_THRESHOLD:
-                result['signal'] = long_result
-            elif short_result and short_result['probability'] > Config.SHORT_THRESHOLD:
-                result['signal'] = short_result
-            else:
-                # Анализируем причины отклонения
-                if long_result:
-                    result['reasons'].append(
-                        f"LONG: вероятность {long_result['probability']:.1%} < порога {Config.LONG_THRESHOLD:.1%}"
-                    )
-                if short_result:
-                    result['reasons'].append(
-                        f"SHORT: вероятность {short_result['probability']:.1%} < порога {Config.SHORT_THRESHOLD:.1%}"
-                    )
+            # Проверка сигналов
+            long_check = await self._check_signal(df, symbol, False)
+            short_check = await self._check_signal(df, symbol, True)
+            
+            if long_check['signal']:
+                result['signal'] = long_check['signal']
+            elif short_check['signal']:
+                result['signal'] = short_check['signal']
+            
+            # Собираем причины отклонения
+            result['reasons'] = long_check['reasons'] + short_check['reasons']
+            if not volume_ok:
+                result['reasons'].append("Объем ниже 70% от средней")
                 
-                # Проверка дополнительных условий
-                last = df.iloc[-1]
-                if last['adx'] < 15:
-                    result['reasons'].append("Слабый тренд (ADX < 15)")
-                if last['volume'] < last['volume'].rolling(20).mean().iloc[-1] * 0.7:
-                    result['reasons'].append("Объем ниже среднего")
-                    
         except Exception as e:
             logger.error(f"Ошибка анализа {symbol}: {str(e)}")
-            result['reasons'].append(f"Ошибка анализа: {str(e)}")
+            result['reasons'].append(f"Системная ошибка: {str(e)}")
+        
+        return result
+
+    def _get_trend_description(self, last: pd.Series) -> str:
+        """Определение тренда с защитой"""
+        try:
+            adx = last.get('adx', 0)
+            if adx < 15:
+                return "Без тренда"
+            return "Вверх" if last.get('dip', 0) > last.get('din', 0) else "Вниз"
+        except:
+            return "Неизвестно"
+    async def _check_signal(self, df: pd.DataFrame, symbol: str, is_short: bool) -> dict:
+        """Проверка конкретного типа сигнала"""
+        result = {'signal': None, 'reasons': []}
+        
+        try:
+            model_data = self.short_model_data if is_short else self.long_model_data
+            if not model_data:
+                result['reasons'].append(f"{'SHORT' if is_short else 'LONG'} модель не загружена")
+                return result
+                
+            features = self.prepare_features(df, is_short)
+            if features.empty:
+                result['reasons'].append("Не удалось подготовить фичи")
+                return result
+                
+            threshold = Config.SHORT_THRESHOLD if is_short else Config.LONG_THRESHOLD
+            if symbol in Config.LOW_RECALL_ASSETS:
+                threshold *= Config.LOW_RECALL_MULTIPLIER
+                
+            features_scaled = model_data['scalers']['combined'].transform(features.values.astype(np.float32))
+            proba = model_data['models']['combined'].predict_proba(features_scaled)[0][1]
+            
+            if proba > threshold and self._check_conditions(df.iloc[-1], is_short):
+                result['signal'] = {
+                    'symbol': symbol,
+                    'type': 'SHORT' if is_short else 'LONG',
+                    'probability': proba,
+                    'price': df['close'].iloc[-1],
+                    'rsi': df['rsi'].iloc[-1],
+                    'adx': df['adx'].iloc[-1],
+                    'time': datetime.utcnow()
+                }
+            else:
+                result['reasons'].append(
+                    f"{'SHORT' if is_short else 'LONG'}: {proba:.1%} < {threshold:.1%}"
+                )
+                
+        except Exception as e:
+            logger.error(f"Ошибка проверки сигнала {symbol}: {str(e)}")
+            result['reasons'].append("Ошибка проверки сигнала")
         
         return result
 async def broadcast_message(bot: Bot, message: str):
