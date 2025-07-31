@@ -226,6 +226,18 @@ class TradingBot:
             logger.error(f"ADX calculation error: {str(e)}")
             zero_series = pd.Series(0, index=high.index)
             return zero_series, zero_series, zero_series
+        
+    def calculate_atr(df, periods=14):
+        if df.empty or len(df) < periods:
+            return pd.Series(0, index=df.index)
+        high_low = df['high'].astype(float) - df['low'].astype(float)
+        high_close = np.abs(df['high'].astype(float) - df['close'].astype(float).shift(1))
+        low_close = np.abs(df['low'].astype(float) - df['close'].astype(float).shift(1))
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = ranges.max(axis=1)
+        atr = true_range.rolling(window=periods).mean()
+        min_atr = df['price'].iloc[-1] * 0.001 if not df.empty else 0.00001
+        return atr.fillna(min_atr)
 
     def calculate_indicators(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
         """Complete feature engineering with all required indicators"""
@@ -252,13 +264,7 @@ class TradingBot:
             )
             
             # Volatility indicators
-            if 'atr' not in df.columns:
-                df['atr'] = AverageTrueRange(
-                    high=df['high'],
-                    low=df['low'],
-                    close=df['close'],
-                    window=14
-                ).average_true_range().fillna(0)
+            df['atr']=self.calculate_atr(df)
 
             if 'volume_ma' not in df.columns:
                 df['volume_ma'] = df['volume'].rolling(min(20, len(df)), min_periods=1).mean().fillna(0)
