@@ -143,14 +143,15 @@ class TradingBot:
             logger.error(f"Model loading failed: {e}")
             return None
     
-    async def fetch_market_data(self, symbol: str) -> Optional[pd.DataFrame]:
-        """Fetch OHLCV data with retry logic"""
+    async def fetch_market_data(self, symbol: str, limit: int = None) -> Optional[pd.DataFrame]:
+        """Fetch OHLCV data with retry logic and optional limit"""
+        limit = limit or Config.DATA_POINTS  # Используем значение по умолчанию если limit не указан
         for attempt in range(3):
             try:
                 ohlcv = await self.exchange.fetch_ohlcv(
                     symbol=symbol,
                     timeframe=Config.TIMEFRAME,
-                    limit=Config.DATA_POINTS
+                    limit=limit
                 )
                 
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -166,6 +167,23 @@ class TradingBot:
                 
         logger.error(f"Data fetch failed for {symbol} after 3 attempts")
         return None
+
+    async def _broadcast(self, message: str):
+        """Send message to all authorized users"""
+        if not self.telegram_bot:
+            logger.error("Telegram bot not initialized")
+            return
+            
+        for user_id in self.users:
+            try:
+                await self.telegram_bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    parse_mode='Markdown'
+                )
+                await asyncio.sleep(0.1)  # Rate limit protection
+            except Exception as e:
+                logger.error(f"Failed to send message to {user_id}: {e}")
     
     def _validate_data(self, df: pd.DataFrame) -> bool:
         """Comprehensive data quality check"""
@@ -228,17 +246,6 @@ class TradingBot:
             zero_series = pd.Series(0, index=high.index)
             return zero_series, zero_series, zero_series
         
-    def calculate_atr(df, periods=14):
-        if df.empty or len(df) < periods:
-            return pd.Series(0, index=df.index)
-        high_low = df['high'].astype(float) - df['low'].astype(float)
-        high_close = np.abs(df['high'].astype(float) - df['close'].astype(float).shift(1))
-        low_close = np.abs(df['low'].astype(float) - df['close'].astype(float).shift(1))
-        ranges = pd.concat([high_low, high_close, low_close], axis=1)
-        true_range = ranges.max(axis=1)
-        atr = true_range.rolling(window=periods).mean()
-        min_atr = df['price'].iloc[-1] * 0.001 if not df.empty else 0.00001
-        return atr.fillna(min_atr)
 
     def calculate_indicators(self, df: pd.DataFrame, is_short: bool = False) -> pd.DataFrame:
         """Complete feature engineering with all required indicators"""
