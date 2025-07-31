@@ -821,7 +821,7 @@ def _analyze_signal(self, symbol: str, signal_type: str, probability: float,
     
     return analysis
 
-def _get_reason_advice(self, reason: str) -> str:
+async def _get_reason_advice(self, reason: str) -> str:
     """Конкретные рекомендации по причинам"""
     advice = {
         "Слабый тренд (ADX < 15)": "Ищите подтверждения на младших ТФ",
