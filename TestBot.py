@@ -714,6 +714,38 @@ class TradingBot:
             result['reasons'].append("Ошибка проверки сигнала")
         
         return result
+    def _analyze_signal(self, symbol: str, signal_type: str, probability: float, 
+                       rsi: float, adx: float, price: float) -> str:
+        """Генерация детального анализа сигнала"""
+        analysis = f"🚀 *{symbol} {signal_type}*\n"
+        analysis += f"▸ Вероятность: {probability:.1%}\n"
+        analysis += f"▸ Цена: ${price:.4f}\n"
+        
+        # Анализ RSI
+        if rsi < 30 and signal_type == 'LONG':
+            analysis += f"▸ RSI: {rsi:.1f} 🔻 (Сильная перепроданность)\n"
+        elif rsi > 70 and signal_type == 'SHORT':
+            analysis += f"▸ RSI: {rsi:.1f} 🔺 (Сильная перекупленность)\n"
+        else:
+            analysis += f"▸ RSI: {rsi:.1f} ⚖️ (Нейтральный)\n"
+        
+        # Анализ тренда
+        if adx > 40:
+            analysis += f"▸ ADX: {adx:.1f} 💪 (Сильный тренд)\n"
+        elif adx > 25:
+            analysis += f"▸ ADX: {adx:.1f} ↗️ (Умеренный тренд)\n"
+        else:
+            analysis += f"▸ ADX: {adx:.1f} ➡️ (Без тренда)\n"
+        
+        # Рекомендация
+        if probability > 0.8:
+            analysis += "✅ Сильный сигнал к действию"
+        elif probability > 0.6:
+            analysis += "🟡 Умеренный сигнал (требует подтверждения)"
+        else:
+            analysis += "🔴 Слабый сигнал (высокий риск)"
+        
+        return analysis
 async def broadcast_message(bot: Bot, message: str):
     """Отправка сообщений всем подписчикам"""
     for user_id in trading_bot.users:
@@ -734,17 +766,40 @@ async def send_scan_report(bot: Bot, signals: list, rejected: list):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
     
     if signals:
-        # Детальный отчет о сигналах
-        msg = f"📊 *Торговые сигналы {timestamp}*\n\n"
-        
+        # Детальный отчет о сигналах с TP/SL
         for signal in signals[:3]:  # Показываем топ-3 сигнала
             s = signal['signal']
-            analysis = _analyze_signal(s['symbol'], s['type'], s['probability'], 
-                                          s['rsi'], s['adx'], s['price'])
-            msg += analysis + "\n\n"
-        
-        msg += f"ℹ️ Всего сигналов: {len(signals)} | Подробнее: /detailed_report"
-        await broadcast_message(bot, msg)
+            # Рассчитываем TP/SL
+            price = s['price']
+            atr = s.get('atr', price * 0.01)
+            
+            if s['type'] == 'LONG':
+                sl = max(price - atr * 1.5, price * 0.995)
+                tp = price + atr * 4.5
+            else:  # SHORT
+                sl = min(price + atr * 1.5, price * 1.005)
+                tp = price - atr * 4.5
+                
+            risk_pct = abs(price - sl) / price * 100
+            reward_pct = abs(tp - price) / price * 100
+            
+            msg = (
+                f"🚀 *{s['symbol']} {s['type']} Signal*\n"
+                f"⏰ {s['time'].strftime('%Y-%m-%d %H:%M')} UTC\n"
+                f"💰 Цена: ${price:.4f}\n"
+                f"📊 Вероятность: {s['probability']:.1%}\n"
+                f"📈 Тех.анализ:\n"
+                f"  • RSI: {s['rsi']:.1f} ({'🔻Перепродан' if s['rsi'] < 30 else '🔺Перекуплен' if s['rsi'] > 70 else '⚖️Нейтральный'})\n"
+                f"  • ADX: {s['adx']:.1f} ({'💪Сильный тренд' if s['adx'] > 40 else '🔼Средний тренд' if s['adx'] > 25 else '🔄Без тренда'})\n"
+                f"  • ATR: {atr:.4f}\n\n"
+                f"🎯 Уровни:\n"
+                f"  • TP: ${tp:.4f} (+{reward_pct:.2f}%)\n"
+                f"  • SL: ${sl:.4f} (-{risk_pct:.2f}%)\n"
+                f"  • Risk/Reward: 1:3"
+            )
+            
+            await broadcast_message(bot, msg)
+            await asyncio.sleep(1)  # Задержка между сообщениями
     
     elif rejected:
         # Аналитический отчет с конкретными рекомендациями
@@ -759,7 +814,6 @@ async def send_scan_report(bot: Bot, signals: list, rejected: list):
         msg += "🔍 Основные причины отсутствия сигналов:\n"
         for reason, count in reasons.most_common(3):
             msg += f"\n• *{reason}* ({count} пар)\n"
-            msg += _get_reason_advice(reason)
         
         # Примеры с анализом
         sample = [r for r in rejected if r.get('indicators')][:2]
@@ -787,79 +841,6 @@ async def send_scan_report(bot: Bot, signals: list, rejected: list):
             "• Проверьте новостной фон"
         )
         await broadcast_message(bot, msg)
-
-def _analyze_signal(self, symbol: str, signal_type: str, probability: float, 
-                   rsi: float, adx: float, price: float) -> str:
-    """Генерация детального анализа сигнала"""
-    analysis = f"🚀 *{symbol} {signal_type}*\n"
-    analysis += f"▸ Вероятность: {probability:.1%}\n"
-    analysis += f"▸ Цена: {price:.4f}\n"
-    
-    # Анализ RSI
-    if rsi < 30 and signal_type == 'LONG':
-        analysis += f"▸ RSI: {rsi:.1f} 🔻 (Сильная перепроданность)\n"
-    elif rsi > 70 and signal_type == 'SHORT':
-        analysis += f"▸ RSI: {rsi:.1f} 🔺 (Сильная перекупленность)\n"
-    else:
-        analysis += f"▸ RSI: {rsi:.1f} ⚖️ (Нейтральный)\n"
-    
-    # Анализ тренда
-    if adx > 40:
-        analysis += f"▸ ADX: {adx:.1f} 💪 (Сильный тренд)\n"
-    elif adx > 25:
-        analysis += f"▸ ADX: {adx:.1f} ↗️ (Умеренный тренд)\n"
-    else:
-        analysis += f"▸ ADX: {adx:.1f} ➡️ (Без тренда)\n"
-    
-    # Рекомендация
-    if probability > 0.8:
-        analysis += "✅ Сильный сигнал к действию"
-    elif probability > 0.6:
-        analysis += "🟡 Умеренный сигнал (требует подтверждения)"
-    else:
-        analysis += "🔴 Слабый сигнал (высокий риск)"
-    
-    return analysis
-
-async def _get_reason_advice(self, reason: str) -> str:
-    """Конкретные рекомендации по причинам"""
-    advice = {
-        "Слабый тренд (ADX < 15)": "Ищите подтверждения на младших ТФ",
-        "Объем ниже среднего": "Ожидайте увеличения объема для подтверждения",
-        "LONG: вероятность < порога": "Рассмотрите SHORT или ожидайте лучшего входа",
-        "SHORT: вероятность < порога": "Рассмотрите LONG или ожидайте лучшего входа",
-        "Высокая волатильность": "Увеличьте стоп-лосс или пропустите вход"
-    }
-    return advice.get(reason, "Измените параметры сканирования или ожидайте лучших условий")
-    
-    # Отчет об отклоненных возможностях
-    if rejected and len(signals) == 0:
-        analysis_msg = "📊 *Анализ отклоненных сделок*\n\n"
-        analysis_msg += f"Проверено пар: {len(rejected)}\n"
-        analysis_msg += "Основные причины отклонения:\n"
-        
-        # Статистика по причинам
-        reasons = {}
-        for item in rejected:
-            for reason in item.get('reasons', []):
-                reasons[reason] = reasons.get(reason, 0) + 1
-        
-        # Топ-5 причин
-        for reason, count in sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:5]:
-            analysis_msg += f"• {reason}: {count} пар\n"
-        
-        # Примеры отклоненных пар
-        sample = [r for r in rejected if r.get('reasons')][:3]
-        if sample:
-            analysis_msg += "\nПримеры:\n"
-            for item in sample:
-                analysis_msg += f"{item['symbol']}: {', '.join(item['reasons'][:2])}\n"
-        
-        await broadcast_message(bot, analysis_msg)
-    
-    # Если вообще ничего не найдено
-    if not signals and not rejected:
-        await broadcast_message(bot, "🔍 Сканирование завершено. Рынок неактивен.")
 
 async def check_markets(context: CallbackContext):
     """Периодическая проверка рынков с подробным отчетом"""
