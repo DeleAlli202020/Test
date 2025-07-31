@@ -60,8 +60,8 @@ class Config:
     # Trading parameters
     RISK_REWARD_RATIO = 3.0
     LOW_RECALL_ASSETS = {"BTCUSDT", "BNBUSDT"}
-    LONG_THRESHOLD = 0.35
-    SHORT_THRESHOLD = 0.4
+    LONG_THRESHOLD = 0.4
+    SHORT_THRESHOLD = 0.35
     LOW_RECALL_MULTIPLIER = 1.2
 
 # Logging Configuration
@@ -447,6 +447,7 @@ class TradingBot:
                     'volume_ma': last.get('volume_ma', 0),
                     'time': datetime.utcnow()
                 }
+            logger.info(f"{symbol} SHORT: proba={proba:.2f}, RSI={last['rsi']}, ADX={last['adx']}, Volume={last['volume']}/{last['volume_ma']}")
                 
         except Exception as e:
             logger.error(f"Model evaluation failed for {symbol}: {str(e)}")
@@ -464,7 +465,7 @@ class TradingBot:
             # RSI filter with protection
             rsi = last.get('rsi', 50)
             if is_short:
-                if rsi < 40:  # Not overbought enough
+                if rsi < 50:  # Not overbought enough
                     return False
             else:
                 if rsi > 60:  # Not oversold enough
