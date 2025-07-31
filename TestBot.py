@@ -42,6 +42,8 @@ load_dotenv('config.env')
 
 class Config:
     TELEGRAM_TOKEN = '7364285248:AAH8wzdSDGEd1PO53wi9LedFfblbi-e8G_Y'
+    MIN_ATR_RATIO = 0.002  # Минимальный ATR/Price для валидности сигнала
+    MAX_ATR_RATIO = 0.05
     ADMIN_ID = int(os.getenv('ADMIN_ID', 0))
     ALLOWED_USERS_FILE = 'allowed_users.json'
     LONG_MODEL_PATH = 'model_improved1.pkl'
@@ -256,6 +258,10 @@ class TradingBot:
                 close=df['close'],
                 window=14
             ).average_true_range().fillna(0)
+
+            if 'volume_ma' not in df.columns:
+                df['volume_ma'] = df['volume'].rolling(min(20, len(df)), min_periods=1).mean().fillna(0)
+
             df['atr_normalized'] = (df['atr'] / df['price'].replace(0, 1)).fillna(0) * 100
             df['atr_change'] = df['atr'].pct_change().fillna(0) * 100
             
@@ -406,35 +412,28 @@ class TradingBot:
             return None
     
     async def _evaluate_model_signal(self, df: pd.DataFrame, symbol: str, is_short: bool) -> Optional[Signal]:
-        """Model evaluation with robust ADX handling"""
+        """Оценка сигнала модели с полным набором данных"""
         try:
             model_data = self.short_model_data if is_short else self.long_model_data
             if not model_data:
                 return None
                 
-            model = model_data['models'].get('combined')
-            scaler = model_data['scalers'].get('combined')
-            
-            if model is None or scaler is None:
-                return None
+            # Рассчитываем volume_ma если нет
+            if 'volume_ma' not in df.columns:
+                df['volume_ma'] = df['volume'].rolling(min(20, len(df)), min_periods=1).mean()
                 
             features = self.prepare_features(df, is_short)
             if features.empty:
                 return None
                 
-            # Ensure ADX is present and valid
-            if 'adx' not in features.columns:
-                logger.warning("ADX feature missing in prepared features")
-                features['adx'] = 0
-                
-            features_scaled = scaler.transform(features.values.astype(np.float32))
-            proba = model.predict_proba(features_scaled)[0][1]
+            last = df.iloc[-1]
+            features_scaled = model_data['scalers']['combined'].transform(features.values.astype(np.float32))
+            proba = model_data['models']['combined'].predict_proba(features_scaled)[0][1]
             
             threshold = Config.SHORT_THRESHOLD if is_short else Config.LONG_THRESHOLD
             if symbol in Config.LOW_RECALL_ASSETS:
                 threshold *= Config.LOW_RECALL_MULTIPLIER
                 
-            last = df.iloc[-1]
             if proba > threshold and self._check_conditions(last, is_short):
                 return {
                     'symbol': symbol,
@@ -442,10 +441,11 @@ class TradingBot:
                     'probability': proba,
                     'price': last['close'],
                     'rsi': last.get('rsi', 50),
-                    'adx': last.get('adx', 0),  # Default to 0 if ADX missing
+                    'adx': last.get('adx', 0),
                     'atr': last.get('atr', 0),
-                    'time': datetime.utcnow(),
-                    'model': 'short' if is_short else 'long'
+                    'volume': last.get('volume', 0),
+                    'volume_ma': last.get('volume_ma', 0),
+                    'time': datetime.utcnow()
                 }
                 
         except Exception as e:
@@ -469,6 +469,10 @@ class TradingBot:
             else:
                 if rsi > 60:  # Not oversold enough
                     return False
+                
+            atr_ratio = last.get('atr', 0) / last.get('close', 1)
+            if not (Config.MIN_ATR_RATIO <= atr_ratio <= Config.MAX_ATR_RATIO):
+                return False
                     
             # Volume filter with rolling protection
             volume = last.get('volume', 0)
@@ -484,31 +488,71 @@ class TradingBot:
             return False
     
     async def execute_signal(self, signal: Signal):
-        """Execute trading signal with risk management"""
+        """Исполнение сигнала с риск-менеджментом и объяснением"""
         try:
-            # Calculate position sizing
+            # Получаем ATR с защитой от ошибок
+            atr = signal.get('atr', 0)
+            if atr <= 0:
+                logger.error(f"Invalid ATR for {signal['symbol']}: {atr}")
+                return
+
             price = signal['price']
-            atr = signal['atr']
+            signal_type = signal['type']
             
-            if signal['type'] == 'LONG':
+            # Рассчитываем уровни с Risk/Reward 3:1
+            if signal_type == 'LONG':
                 stop_loss = price - atr * 1.5
-                take_profit = price + atr * (Config.RISK_REWARD_RATIO * 1.5)
-            else:
+                take_profit = price + atr * 4.5  # RR = 3:1 (4.5/1.5)
+            else:  # SHORT
                 stop_loss = price + atr * 1.5
-                take_profit = price - atr * (Config.RISK_REWARD_RATIO * 1.5)
-                
-            # Prepare message
-            message = self._format_signal_message(
-                signal, 
-                stop_loss, 
-                take_profit
-            )
+                take_profit = price - atr * 4.5  # RR = 3:1 (4.5/1.5)
+
+            # Формируем объяснение сделки
+            explanation = self._generate_trade_explanation(signal, stop_loss, take_profit)
             
-            await self.broadcast_message(message)
-            logger.info(f"Executed {signal['type']} signal for {signal['symbol']}")
-            
+            # Отправляем сообщение
+            await self._broadcast(explanation)
+            logger.info(f"Executed {signal_type} signal for {signal['symbol']}")
+
         except Exception as e:
-            logger.error(f"Signal execution failed: {e}")
+            logger.error(f"Signal execution failed: {str(e)}")
+
+    def _generate_trade_explanation(self, signal: Signal, sl: float, tp: float) -> str:
+        """Генерация подробного объяснения сделки"""
+        risk_percent = (abs(signal['price'] - sl)) / signal['price'] * 100
+        reward_percent = (abs(tp - signal['price'])) / signal['price'] * 100
+        
+        return (
+            f"🚀 *{signal['symbol']} {signal['type']} Signal*\n"
+            f"⏰ {signal['time'].strftime('%Y-%m-%d %H:%M')} UTC\n"
+            f"💰 Цена входа: ${signal['price']:.4f}\n"
+            f"📊 Вероятность: {signal['probability']:.1%}\n"
+            f"📈 Тех. показатели:\n"
+            f"  • RSI: {signal.get('rsi', 0):.1f} ({'перепродан' if signal.get('rsi', 0) < 30 else 'перекуплен' if signal.get('rsi', 0) > 70 else 'нейтральный'})\n"
+            f"  • ADX: {signal.get('adx', 0):.1f} ({'сильный тренд' if signal.get('adx', 0) > 25 else 'слабый тренд'})\n"
+            f"  • Волатильность (ATR): {signal.get('atr', 0):.4f}\n\n"
+            f"🎯 Уровни:\n"
+            f"  • TP: ${tp:.4f} (+{reward_percent:.2f}%)\n"
+            f"  • SL: ${sl:.4f} (-{risk_percent:.2f}%)\n"
+            f"  • Risk/Reward: 1:3\n\n"
+            f"📌 Логика: {self._get_trade_logic(signal)}"
+        )
+
+    def _get_trade_logic(self, signal: Signal) -> str:
+        """Генерация логики сделки"""
+        logic = []
+        if signal.get('rsi', 50) < 30 and signal['type'] == 'LONG':
+            logic.append("RSI в зоне перепроданности")
+        elif signal.get('rsi', 50) > 70 and signal['type'] == 'SHORT':
+            logic.append("RSI в зоне перекупленности")
+        
+        if signal.get('adx', 0) > 25:
+            logic.append("Сильный тренд")
+        
+        if signal.get('volume', 0) > signal.get('volume_ma', 0):
+            logic.append("Высокий объем")
+        
+        return ", ".join(logic) if logic else "Стандартные условия"
     
     def _format_signal_message(self, signal: Signal, sl: float, tp: float) -> str:
         """Generate professional trading signal message"""
