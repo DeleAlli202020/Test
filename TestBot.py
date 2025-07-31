@@ -252,12 +252,13 @@ class TradingBot:
             )
             
             # Volatility indicators
-            df['atr'] = AverageTrueRange(
-                high=df['high'],
-                low=df['low'],
-                close=df['close'],
-                window=14
-            ).average_true_range().fillna(0)
+            if 'atr' not in df.columns:
+                df['atr'] = AverageTrueRange(
+                    high=df['high'],
+                    low=df['low'],
+                    close=df['close'],
+                    window=14
+                ).average_true_range().fillna(0)
 
             if 'volume_ma' not in df.columns:
                 df['volume_ma'] = df['volume'].rolling(min(20, len(df)), min_periods=1).mean().fillna(0)
@@ -526,6 +527,7 @@ class TradingBot:
                     signal['atr'] = signal['price'] * 0.01  # 1% от цены как крайний fallback
 
             # Расчет уровней с Risk/Reward 3:1
+            signal['atr'] = signal.get('atr') or signal['price'] * 0.01
             price = signal['price']
             atr = signal['atr']
             
