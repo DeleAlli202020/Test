@@ -494,7 +494,7 @@ class TradingBot:
                 take_profit
             )
             
-            await self._broadcast(message)
+            await self.broadcast_message(message)
             logger.info(f"Executed {signal['type']} signal for {signal['symbol']}")
             
         except Exception as e:
@@ -515,39 +515,155 @@ class TradingBot:
             f"⚠️ Risk: {signal['atr']/signal['price']:.2%} volatility"
         )
     
-    async def _broadcast(self, message: str):
-        """Send message to all subscribed users"""
-        if not self.telegram_bot:
-            logger.error("Telegram bot not initialized")
-            return
-            
-        for user_id in self.users:
-            try:
-                await self.telegram_bot.send_message(
-                    chat_id=user_id,
-                    text=message,
-                    parse_mode='Markdown'
+
+
+async def analyze_symbol(self, symbol: str) -> dict:
+    """Анализ символа с подробной диагностикой"""
+    result = {
+        'symbol': symbol,
+        'signal': None,
+        'reasons': [],
+        'indicators': {}
+    }
+    
+    try:
+        # Получаем данные
+        df = await self.fetch_market_data(symbol)
+        if df is None or len(df) < 48:
+            result['reasons'].append("Недостаточно данных")
+            return result
+        
+        # Рассчитываем индикаторы
+        df = self.calculate_indicators(df)
+        
+        # Сохраняем значения индикаторов для отчета
+        result['indicators'] = {
+            'price': df['close'].iloc[-1],
+            'rsi': round(df['rsi'].iloc[-1], 2),
+            'adx': round(df['adx'].iloc[-1], 2),
+            'volume': df['volume'].iloc[-1],
+            'trend': "Вверх" if df['adx'].iloc[-1] > 25 and df['dip'].iloc[-1] > df['din'].iloc[-1] else 
+                    "Вниз" if df['adx'].iloc[-1] > 25 else "Без тренда"
+        }
+        
+        # Проверяем LONG и SHORT сигналы
+        long_result = await self.check_model_signal(df, symbol, False)
+        short_result = await self.check_model_signal(df, symbol, True)
+        
+        if long_result and long_result['probability'] > Config.LONG_THRESHOLD:
+            result['signal'] = long_result
+        elif short_result and short_result['probability'] > Config.SHORT_THRESHOLD:
+            result['signal'] = short_result
+        else:
+            # Анализируем причины отклонения
+            if long_result:
+                result['reasons'].append(
+                    f"LONG: вероятность {long_result['probability']:.1%} < порога {Config.LONG_THRESHOLD:.1%}"
                 )
-            except Exception as e:
-                logger.error(f"Failed to send to user {user_id}: {e}")
+            if short_result:
+                result['reasons'].append(
+                    f"SHORT: вероятность {short_result['probability']:.1%} < порога {Config.SHORT_THRESHOLD:.1%}"
+                )
+            
+            # Проверка дополнительных условий
+            last = df.iloc[-1]
+            if last['adx'] < 15:
+                result['reasons'].append("Слабый тренд (ADX < 15)")
+            if last['volume'] < last['volume'].rolling(20).mean().iloc[-1] * 0.7:
+                result['reasons'].append("Объем ниже среднего")
+                
+    except Exception as e:
+        logger.error(f"Ошибка анализа {symbol}: {str(e)}")
+        result['reasons'].append(f"Ошибка анализа: {str(e)}")
+    
+    return result
+async def broadcast_message(bot: Bot, message: str):
+    """Отправка сообщений всем подписчикам"""
+    for user_id in trading_bot.users:
+        try:
+            # Разбиваем длинные сообщения
+            if len(message) > 4000:
+                parts = [message[i:i+4000] for i in range(0, len(message), 4000)]
+                for part in parts:
+                    await bot.send_message(chat_id=user_id, text=part, parse_mode='Markdown')
+                    await asyncio.sleep(0.5)
+            else:
+                await bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"Ошибка отправки сообщения пользователю {user_id}: {str(e)}")
+            
+async def send_scan_report(bot: Bot, signals: list, rejected: list):
+    """Отправка подробного отчета о сканировании"""
+    # Отчет о найденных сигналах
+    if signals:
+        message = "🔍 *Результаты сканирования рынков*\n\n"
+        message += f"🕒 Время: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        message += f"📊 Найдено сигналов: {len(signals)}\n\n"
+        
+        for signal in signals[:5]:  # Ограничим количество в сообщении
+            s = signal['signal']
+            message += (
+                f"🚀 *{s['symbol']} {s['type']}*\n"
+                f"• Вероятность: {s['probability']:.1%}\n"
+                f"• Цена: {s['price']:.4f}\n"
+                f"• RSI: {s['rsi']:.1f}\n"
+                f"• ADX: {s['adx']:.1f}\n\n"
+            )
+        
+        await broadcast_message(bot, message)
+    
+    # Отчет об отклоненных возможностях
+    if rejected and len(signals) == 0:
+        analysis_msg = "📊 *Анализ отклоненных сделок*\n\n"
+        analysis_msg += f"Проверено пар: {len(rejected)}\n"
+        analysis_msg += "Основные причины отклонения:\n"
+        
+        # Статистика по причинам
+        reasons = {}
+        for item in rejected:
+            for reason in item.get('reasons', []):
+                reasons[reason] = reasons.get(reason, 0) + 1
+        
+        # Топ-5 причин
+        for reason, count in sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:5]:
+            analysis_msg += f"• {reason}: {count} пар\n"
+        
+        # Примеры отклоненных пар
+        sample = [r for r in rejected if r.get('reasons')][:3]
+        if sample:
+            analysis_msg += "\nПримеры:\n"
+            for item in sample:
+                analysis_msg += f"{item['symbol']}: {', '.join(item['reasons'][:2])}\n"
+        
+        await broadcast_message(bot, analysis_msg)
+    
+    # Если вообще ничего не найдено
+    if not signals and not rejected:
+        await broadcast_message(bot, "🔍 Сканирование завершено. Рынок неактивен.")
 
 async def check_markets(context: CallbackContext):
-    """Periodic market scanning"""
-    logger.info("Starting market scan...")
+    """Периодическая проверка рынков с подробным отчетом"""
+    logger.info("Начинаю сканирование рынков...")
     signals = []
+    rejected_signals = []
     
     for symbol in Config.ASSETS:
         try:
-            if signal := await trading_bot.detect_signal(symbol):
-                signals.append(signal)
+            result = await trading_bot.analyze_symbol(symbol)
+            if result['signal']:
+                signals.append(result)
+            else:
+                rejected_signals.append(result)
         except Exception as e:
-            logger.error(f"Error processing {symbol}: {e}")
+            logger.error(f"Ошибка анализа {symbol}: {str(e)}")
     
+    # Отправляем уведомление о результатах
+    await send_scan_report(context.bot, signals, rejected_signals)
+    
+    # Исполняем найденные сигналы
     if signals:
         for signal in signals:
-            await trading_bot.execute_signal(signal)
-    else:
-        logger.info("No trading signals found")
+            await trading_bot.execute_signal(signal['signal'])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
