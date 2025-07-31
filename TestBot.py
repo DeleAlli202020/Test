@@ -61,8 +61,8 @@ class Config:
     # Trading parameters
     RISK_REWARD_RATIO = 3.0
     LOW_RECALL_ASSETS = {"BTCUSDT", "BNBUSDT"}
-    LONG_THRESHOLD = 0.4
-    SHORT_THRESHOLD = 0.35
+    LONG_THRESHOLD = 0.1
+    SHORT_THRESHOLD = 0.1
     LOW_RECALL_MULTIPLIER = 1.2
 
 # Logging Configuration
