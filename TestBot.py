@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import joblib
 from ccxt.async_support import binance
+from sqlalchemy.util import symbol
 from dotenv import load_dotenv
 from sklearn.base import BaseEstimator
 from sklearn.preprocessing import RobustScaler
@@ -264,7 +265,13 @@ class TradingBot:
             )
             
             # Volatility indicators
-            df['atr']=self.calculate_atr(df)
+            if 'atr' not in df.columns:
+                df['atr'] = AverageTrueRange(
+                    high=df['high'],
+                    low=df['low'],
+                    close=df['close'],
+                    window=14
+                ).average_true_range().fillna(0)
 
             if 'volume_ma' not in df.columns:
                 df['volume_ma'] = df['volume'].rolling(min(20, len(df)), min_periods=1).mean().fillna(0)
@@ -425,6 +432,13 @@ class TradingBot:
             if not model_data:
                 return None
                 
+            if 'atr' not in last:
+                last['atr'] = AverageTrueRange(
+                    high=df['high'],
+                    low=df['low'],
+                    close=df['close'],
+                    window=14
+                ).average_true_range().iloc[-1]
             # Рассчитываем volume_ma если нет
             if 'volume_ma' not in df.columns:
                 df['volume_ma'] = df['volume'].rolling(min(20, len(df)), min_periods=1).mean()
@@ -507,6 +521,12 @@ class TradingBot:
     async def execute_signal(self, signal: Signal):
         """Исполнение сигнала с полной проверкой данных"""
         try:
+            if symbol in self.last_signal_time:
+                time_diff = (datetime.utcnow() - self.last_signal_time[symbol]).total_seconds()
+                if time_diff < 3600:  # Не чаще 1 часа
+                    logger.info(f"Ignoring {symbol} - signal too recent")
+                    return
+            self.last_signal_time[symbol] = datetime.utcnow()
             # Проверка обязательных полей
             required_fields = ['symbol', 'type', 'price', 'probability', 'time', 'atr', 'rsi', 'adx']
             for field in required_fields:
@@ -547,6 +567,8 @@ class TradingBot:
             # Форматирование сообщения
             message = self._format_signal_message(signal, stop_loss, take_profit)
             await self._broadcast(message)
+            logger.debug(f"Signal keys: {signal.keys()}")
+            logger.debug(f"Signal data: {signal}")
             logger.info(f"Successfully executed {signal['type']} signal for {signal['symbol']}")
 
         except Exception as e:
