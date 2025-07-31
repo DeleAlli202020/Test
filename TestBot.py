@@ -517,66 +517,66 @@ class TradingBot:
     
 
 
-async def analyze_symbol(self, symbol: str) -> dict:
-    """Анализ символа с подробной диагностикой"""
-    result = {
-        'symbol': symbol,
-        'signal': None,
-        'reasons': [],
-        'indicators': {}
-    }
-    
-    try:
-        # Получаем данные
-        df = await self.fetch_market_data(symbol)
-        if df is None or len(df) < 48:
-            result['reasons'].append("Недостаточно данных")
-            return result
-        
-        # Рассчитываем индикаторы
-        df = self.calculate_indicators(df)
-        
-        # Сохраняем значения индикаторов для отчета
-        result['indicators'] = {
-            'price': df['close'].iloc[-1],
-            'rsi': round(df['rsi'].iloc[-1], 2),
-            'adx': round(df['adx'].iloc[-1], 2),
-            'volume': df['volume'].iloc[-1],
-            'trend': "Вверх" if df['adx'].iloc[-1] > 25 and df['dip'].iloc[-1] > df['din'].iloc[-1] else 
-                    "Вниз" if df['adx'].iloc[-1] > 25 else "Без тренда"
+    async def analyze_symbol(self, symbol: str) -> dict:
+        """Анализ символа с подробной диагностикой"""
+        result = {
+            'symbol': symbol,
+            'signal': None,
+            'reasons': [],
+            'indicators': {}
         }
         
-        # Проверяем LONG и SHORT сигналы
-        long_result = await self.check_model_signal(df, symbol, False)
-        short_result = await self.check_model_signal(df, symbol, True)
-        
-        if long_result and long_result['probability'] > Config.LONG_THRESHOLD:
-            result['signal'] = long_result
-        elif short_result and short_result['probability'] > Config.SHORT_THRESHOLD:
-            result['signal'] = short_result
-        else:
-            # Анализируем причины отклонения
-            if long_result:
-                result['reasons'].append(
-                    f"LONG: вероятность {long_result['probability']:.1%} < порога {Config.LONG_THRESHOLD:.1%}"
-                )
-            if short_result:
-                result['reasons'].append(
-                    f"SHORT: вероятность {short_result['probability']:.1%} < порога {Config.SHORT_THRESHOLD:.1%}"
-                )
+        try:
+            # Получаем данные
+            df = await self.fetch_market_data(symbol)
+            if df is None or len(df) < 48:
+                result['reasons'].append("Недостаточно данных")
+                return result
             
-            # Проверка дополнительных условий
-            last = df.iloc[-1]
-            if last['adx'] < 15:
-                result['reasons'].append("Слабый тренд (ADX < 15)")
-            if last['volume'] < last['volume'].rolling(20).mean().iloc[-1] * 0.7:
-                result['reasons'].append("Объем ниже среднего")
+            # Рассчитываем индикаторы
+            df = self.calculate_indicators(df)
+            
+            # Сохраняем значения индикаторов для отчета
+            result['indicators'] = {
+                'price': df['close'].iloc[-1],
+                'rsi': round(df['rsi'].iloc[-1], 2),
+                'adx': round(df['adx'].iloc[-1], 2),
+                'volume': df['volume'].iloc[-1],
+                'trend': "Вверх" if df['adx'].iloc[-1] > 25 and df['dip'].iloc[-1] > df['din'].iloc[-1] else 
+                        "Вниз" if df['adx'].iloc[-1] > 25 else "Без тренда"
+            }
+            
+            # Проверяем LONG и SHORT сигналы
+            long_result = await self.check_model_signal(df, symbol, False)
+            short_result = await self.check_model_signal(df, symbol, True)
+            
+            if long_result and long_result['probability'] > Config.LONG_THRESHOLD:
+                result['signal'] = long_result
+            elif short_result and short_result['probability'] > Config.SHORT_THRESHOLD:
+                result['signal'] = short_result
+            else:
+                # Анализируем причины отклонения
+                if long_result:
+                    result['reasons'].append(
+                        f"LONG: вероятность {long_result['probability']:.1%} < порога {Config.LONG_THRESHOLD:.1%}"
+                    )
+                if short_result:
+                    result['reasons'].append(
+                        f"SHORT: вероятность {short_result['probability']:.1%} < порога {Config.SHORT_THRESHOLD:.1%}"
+                    )
                 
-    except Exception as e:
-        logger.error(f"Ошибка анализа {symbol}: {str(e)}")
-        result['reasons'].append(f"Ошибка анализа: {str(e)}")
-    
-    return result
+                # Проверка дополнительных условий
+                last = df.iloc[-1]
+                if last['adx'] < 15:
+                    result['reasons'].append("Слабый тренд (ADX < 15)")
+                if last['volume'] < last['volume'].rolling(20).mean().iloc[-1] * 0.7:
+                    result['reasons'].append("Объем ниже среднего")
+                    
+        except Exception as e:
+            logger.error(f"Ошибка анализа {symbol}: {str(e)}")
+            result['reasons'].append(f"Ошибка анализа: {str(e)}")
+        
+        return result
 async def broadcast_message(bot: Bot, message: str):
     """Отправка сообщений всем подписчикам"""
     for user_id in trading_bot.users:
