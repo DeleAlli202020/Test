@@ -442,16 +442,25 @@ class TradingBot:
                     'price': last['close'],
                     'rsi': last.get('rsi', 50),
                     'adx': last.get('adx', 0),
-                    'atr': last.get('atr', 0),
+                    'atr': last.get('atr', last['close'] * 0.01),
                     'volume': last.get('volume', 0),
                     'volume_ma': last.get('volume_ma', 0),
                     'time': datetime.utcnow()
                 }
-            logger.info(f"{symbol} SHORT: proba={proba:.2f}, RSI={last['rsi']}, ADX={last['adx']}, Volume={last['volume']}/{last['volume_ma']}")
-                
+            logger.info(
+                f"{symbol} {'SHORT' if is_short else 'LONG'}: "
+                f"Proba={proba:.1%}, RSI={last['rsi']:.1f}, "
+                f"ADX={last['adx']:.1f}, ATR={last.get('atr', 'N/A')}"
+            )
+                            
         except Exception as e:
             logger.error(f"Model evaluation failed for {symbol}: {str(e)}")
-            
+        
+            logger.info(
+                f"{symbol} {'SHORT' if is_short else 'LONG'}: "
+                f"Proba={proba:.1%}, RSI={last['rsi']:.1f}, "
+                f"ADX={last['adx']:.1f}, ATR={last.get('atr', 'N/A')}"
+            )
         return None
     
     def _check_conditions(self, last: pd.Series, is_short: bool) -> bool:
